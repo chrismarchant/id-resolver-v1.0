@@ -1,23 +1,25 @@
 /**
- * Vertical slice: HTTP API -> forked child -> mock Enrich server -> PostgreSQL.
+ * Vertical slice for the website route: POST /v1/entrances (entrance.v1) ->
+ * in-process runner -> pipeline -> mock Enrich server -> PostgreSQL.
  * Everything is real except the provider, which is the in-repo mock server.
+ * Every response is checked against the acknowledgement-only contract (D2).
  */
+import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { buildChildRuntimeConfig, createChildManager } from "../../src/supervisor/child-manager.js";
+import { buildPipelineConfig, createRunner } from "../../src/runtime/runner.js";
+import { createProvider } from "../../src/provider/index.js";
+import type { Config } from "../../src/config/index.js";
 import { startMockEnrichServer, SPECIAL_IPS, type MockServerHandle } from "../../src/provider/mock-server.js";
 import { createTestDb, resetTestDb } from "../helpers/db.js";
 import { testConfig, TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
-import { compiledChildModulePath } from "../helpers/child.js";
-import { dumpDatabaseText, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
+import { dumpDatabaseText, entranceResponseProblems, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
 import type { Db } from "../../src/db/index.js";
-import type { ChildManager } from "../../src/contracts/child-manager.js";
+import type { Runner } from "../../src/contracts/runtime.js";
 import { usagePeriodKey } from "../../src/contracts/db.js";
 
-// Real children run as the compiled artefact (see test/helpers/global-setup.ts).
-const CHILD = compiledChildModulePath();
 const QUALIFIED_IP = "203.0.113.10";
 const EXCLUDED_IP = "203.0.113.11";
 const NO_DOMAIN_IP = "203.0.113.13";
@@ -32,12 +34,15 @@ const ALL_TEST_IPS = [
   ...Array.from({ length: 6 }, (_, i) => `203.0.113.${20 + i}`),
   ...Object.values(SPECIAL_IPS),
 ];
+/** Company data the mock provider returns; none of it may ever reach a response (D2). */
+const COMPANY_NEEDLES = ["example.com", "Example Ltd", "example.edu", "Example University", "example.org", "Example Org", "example-isp.net", "Example Broadband"];
+const ENTRANCE_KEYS = ["recorded", "source", "status", "version"];
 
 describe("end-to-end vertical slice", () => {
   let db: Db;
   let mock: MockServerHandle;
   let app: FastifyInstance;
-  let manager: ChildManager;
+  let manager: Runner;
   let logger: ReturnType<typeof createMemoryLogger>;
   // The mock server and logger live for the whole file; tests reason about deltas.
   const baseline = new Map<string, number>();
@@ -47,18 +52,47 @@ describe("end-to-end vertical slice", () => {
   const auth = { authorization: `Bearer ${TEST_AUTH_TOKEN}`, "content-type": "application/json" };
   const scope = { installationId: "inst-test", websiteId: "site-test", periodKey: usagePeriodKey("month", new Date()) };
 
-  async function resolve(ip: string, requestId?: string) {
-    const r = await app.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip, ...(requestId ? { request_id: requestId } : {}) } });
+  const newEntranceId = () => randomBytes(12).toString("base64url");
+  const entranceBody = (ip: string, over: Record<string, unknown> = {}) => ({
+    contract: "entrance.v1",
+    website_id: "site-test",
+    ip,
+    entrance_id: newEntranceId(),
+    occurred_at: new Date().toISOString(),
+    page_key: "/pricing",
+    acquisition: "search",
+    eligibility: "tsa-1",
+    ...over,
+  });
+  /** Every 200 response must be exactly the acknowledgement, with no company data or echoed input. */
+  async function enter(ip: string, over: Record<string, unknown> = {}, target?: FastifyInstance) {
+    const r = await (target ?? app).inject({ method: "POST", url: "/v1/entrances", headers: auth, payload: entranceBody(ip, over) });
+    if (r.statusCode === 200) {
+      expect(Object.keys(r.json()).sort()).toEqual(ENTRANCE_KEYS);
+      expect(entranceResponseProblems(r.body, [...ALL_TEST_IPS.flatMap(ipVariants), ...COMPANY_NEEDLES])).toEqual([]);
+    }
     return { status: r.statusCode, body: r.json() as Record<string, unknown>, raw: r.body };
+  }
+  const resolve = (ip: string) => enter(ip);
+
+  /** The runner exactly as src/main.ts builds it, over the shared test pool. */
+  function runnerFor(config: Config): Runner {
+    const pipeline = buildPipelineConfig(config);
+    return createRunner({
+      config: pipeline,
+      deps: { cache: db.cache, usage: db.usage, controls: db.controls, companies: db.companies, activity: db.activity, provider: createProvider(pipeline.provider) },
+      logger,
+      capacity: config.MAX_CONCURRENT_JOBS,
+    });
   }
 
   beforeAll(async () => {
-    db = await createTestDb({ max: 4 });
+    db = await createTestDb({ max: 12 });
     mock = await startMockEnrichServer({ slowMs: 5_000 });
     logger = createMemoryLogger();
     const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "50" });
-    manager = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    app = await buildServer({ config, logger, childManager: manager, ping: () => db.ping() });
+    manager = runnerFor(config);
+    app = await buildServer({ config, logger, runner: manager, ping: () => db.ping() });
     await app.ready();
   });
 
@@ -75,21 +109,14 @@ describe("end-to-end vertical slice", () => {
     await db.close();
   });
 
-  it("resolves a qualified company through a real child and persists only sanitised data", async () => {
-    const first = await resolve(QUALIFIED_IP, "e2e-1");
+  it("identifies a qualified company in-process, acknowledges it without company data, and persists only sanitised data", async () => {
+    const first = await resolve(QUALIFIED_IP);
     expect(first.status).toBe(200);
-    expect(first.body).toMatchObject({
-      version: "1",
-      status: "qualified",
-      source: "provider",
-      request_id: "e2e-1",
-      company: { domain: "example.com", organisation_name: "Example Ltd", qualification: { category: "COM", source: "provider_usage_type" } },
-    });
+    expect(first.body).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
     expect(hits(QUALIFIED_IP)).toBe(1);
 
     const second = await resolve(QUALIFIED_IP);
-    expect(second.body["status"]).toBe("qualified");
-    expect(second.body["source"]).toBe("cache");
+    expect(second.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
     expect(hits(QUALIFIED_IP)).toBe(1);
 
     const snapshot = await db.usage.snapshot(scope);
@@ -125,7 +152,7 @@ describe("end-to-end vertical slice", () => {
     for (const r of results) {
       expect(r.status).toBe(200);
       expect(["excluded", "pending"]).toContain(r.body["status"]);
-      expect(r.body["company"]).toBeNull();
+      expect(r.body["recorded"]).toBe(false);
     }
     expect(hits(EXCLUDED_IP)).toBe(1);
     expect(results.some((r) => r.body["status"] === "excluded")).toBe(true);
@@ -166,14 +193,14 @@ describe("end-to-end vertical slice", () => {
   it("persists the uncertain outcome even when the request deadline, not the provider timeout, is the binding limit", async () => {
     // Deadline 1300 ms with a 1 s provider timeout: the deadline-derived budget (deadline minus the 550 ms commit reserve) governs.
     const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", REQUEST_DEADLINE_MS: "1300", ENRICH_TIMEOUT_MS: "1000", LEASE_MS: "3000", SHUTDOWN_GRACE_MS: "2000" });
-    const m3 = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    const app3 = await buildServer({ config, logger, childManager: m3, ping: () => db.ping() });
-    const r1 = await app3.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: SPECIAL_IPS.slow } });
-    expect(r1.json().status).toBe("uncertain");
+    const m3 = runnerFor(config);
+    const app3 = await buildServer({ config, logger, runner: m3, ping: () => db.ping() });
+    const r1 = await enter(SPECIAL_IPS.slow, {}, app3);
+    expect(r1.body).toEqual({ version: "1", status: "uncertain", source: "provider", recorded: false });
     const rows = await db.pool.query<{ status: string }>("SELECT status FROM ip_resolution_cache");
     expect(rows.rows.map((r) => r.status)).toEqual(["uncertain"]);
-    const r2 = await app3.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: SPECIAL_IPS.slow } });
-    expect(r2.json()).toMatchObject({ status: "uncertain", source: "cache" });
+    const r2 = await enter(SPECIAL_IPS.slow, {}, app3);
+    expect(r2.body).toMatchObject({ status: "uncertain", source: "cache" });
     expect(hits(SPECIAL_IPS.slow)).toBe(1);
     await app3.close();
     await m3.shutdown(1_000);
@@ -184,7 +211,7 @@ describe("end-to-end vertical slice", () => {
       const r = await resolve(ip);
       expect(r.status, ip).toBe(200);
       expect(r.body["status"], ip).toBe("unavailable");
-      expect(r.body["company"]).toBeNull();
+      expect(r.body["recorded"]).toBe(false);
       const again = await resolve(ip);
       expect(again.body["status"], ip).toBe("unavailable");
       expect(hits(ip), ip).toBe(1);
@@ -204,20 +231,20 @@ describe("end-to-end vertical slice", () => {
   });
 
   it("honours the call cap under concurrency and keeps serving the cache", async () => {
-    const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "2", MAX_CONCURRENT_CHILDREN: "6" });
-    const m2 = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    const app2 = await buildServer({ config, logger, childManager: m2, ping: () => db.ping() });
+    const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "2", MAX_CONCURRENT_JOBS: "6" });
+    const m2 = runnerFor(config);
+    const app2 = await buildServer({ config, logger, runner: m2, ping: () => db.ping() });
     const ips = ["203.0.113.10", "203.0.113.11", "203.0.113.12", "203.0.113.13", "203.0.113.14"];
-    const results = await Promise.all(ips.map((ip) => app2.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip } })));
-    const statuses = results.map((r) => r.json().status as string);
+    const results = await Promise.all(ips.map((ip) => enter(ip, {}, app2)));
+    const statuses = results.map((r) => r.body["status"] as string);
     expect(statuses.filter((s) => s === "disabled").length).toBe(3);
     const snapshot = await db.usage.snapshot(scope);
     expect(snapshot.provider_attempts).toBe(2);
     expect(ips.reduce((n, ip) => n + hits(ip), 0)).toBe(2);
     // Cache still served when the cap is exhausted.
     const servedIp = ips.find((ip, i) => statuses[i] !== "disabled")!;
-    const cached = await app2.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: servedIp } });
-    expect(cached.json().source).toBe("cache");
+    const cached = await enter(servedIp, {}, app2);
+    expect(cached.body["source"]).toBe("cache");
     // The released reservations leave no live lease behind.
     const pending = await db.pool.query("SELECT count(*)::int AS n FROM ip_resolution_cache WHERE status = 'pending'");
     expect(pending.rows[0].n).toBe(0);
@@ -237,17 +264,18 @@ describe("end-to-end vertical slice", () => {
     await db.controls.setEnrichmentEnabled("inst-test", true, "e2e");
   });
 
-  it("children terminate and are reaped; concurrency stays bounded", async () => {
-    await Promise.all(Array.from({ length: 6 }, (_, i) => resolve(`203.0.113.${20 + i}`)));
+  it("jobs settle and free their slots; concurrency stays bounded; excess load gets 503 overloaded", async () => {
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => enter(`203.0.113.${20 + i}`)));
+    for (const r of results) expect([200, 503]).toContain(r.status);
+    for (const r of results.filter((x) => x.status === 503)) expect(r.body).toEqual({ version: "1", error: "overloaded" });
     await new Promise((r) => setTimeout(r, 200));
     expect(manager.activeCount()).toBe(0);
-    const spawned = logs().filter((e) => e["event"] === "child_spawned").map((e) => e["active_children"] as number);
-    expect(Math.max(...spawned)).toBeLessThanOrEqual(4);
-    const exits = logs().filter((e) => e["event"] === "child_exit").length;
-    expect(exits).toBeGreaterThan(0);
+    const started = logs().filter((e) => e["event"] === "job_started").map((e) => e["active_jobs"] as number);
+    expect(started.length).toBeGreaterThan(0);
+    expect(Math.max(...started)).toBeLessThanOrEqual(4);
   });
 
-  it("leaks no test IP, secret or provider-only field into logs, database or responses", async () => {
+  it("leaks no test IP, secret, company data or provider-only field into logs, database or responses", async () => {
     const responses: string[] = [];
     for (const ip of [QUALIFIED_IP, EXCLUDED_IP, NO_DOMAIN_IP, "2001:db8::10", SPECIAL_IPS.serverError]) {
       responses.push((await resolve(ip)).raw);
@@ -267,8 +295,9 @@ describe("end-to-end vertical slice", () => {
     expect(findLeaks(logText, needles)).toEqual([]);
     const dbText = await dumpDatabaseText(db.pool);
     expect(findLeaks(dbText, needles)).toEqual([]);
-    expect(findLeaks(responses.join("\n"), needles)).toEqual([]);
-    expect(logText).toContain("child_result");
+    expect(findLeaks(responses.join("\n"), [...needles, ...COMPANY_NEEDLES])).toEqual([]);
+    for (const raw of responses) expect(entranceResponseProblems(raw, needles)).toEqual([]);
+    expect(logText).toContain("job_finished");
     // Fingerprints never appear in responses or logs.
     const fps = await db.pool.query<{ hex: string }>("SELECT encode(ip_fingerprint, 'hex') AS hex FROM ip_resolution_cache");
     for (const { hex } of fps.rows) {
@@ -280,48 +309,62 @@ describe("end-to-end vertical slice", () => {
   describe("durable company activity", () => {
     const REF = (n: number) => `e2e-ref-${String(n).padStart(16, "0")}`;
     const observationRows = () =>
-      db.pool.query<{ company_id: string; source: string; observation_ref: string; previously_seen: boolean }>(
-        `SELECT o.company_id, o.source, o.observation_ref, r.previously_seen FROM company_observations o
+      db.pool.query<{ company_id: string; source: string; observation_ref: string; previously_seen: boolean; page_key: string | null; acquisition: string | null; entrance_contract: string | null; eligibility: string | null }>(
+        `SELECT o.company_id, o.source, o.observation_ref, r.previously_seen, o.page_key, o.acquisition, o.entrance_contract, o.eligibility
+         FROM company_observations o
          JOIN company_observation_refs r USING (installation_id, website_id, observation_ref) ORDER BY o.id`,
       );
-    async function resolveRef(ip: string, observationRef?: string) {
-      const r = await app.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip, ...(observationRef ? { observation_ref: observationRef } : {}) } });
-      return { status: r.statusCode, body: r.json() as Record<string, unknown>, raw: r.body };
-    }
+    const resolveRef = (ip: string, entranceId: string, over: Record<string, unknown> = {}) => enter(ip, { entrance_id: entranceId, ...over });
 
-    it("records the provider result, then a cache hit, with no second provider attempt and the backward-compatible fields", async () => {
-      const first = await resolveRef(QUALIFIED_IP, REF(1));
+    it("records the provider result, then a cache hit, with no second provider attempt; each observation carries its entrance context", async () => {
+      const first = await resolveRef(QUALIFIED_IP, REF(1), { page_key: "/pricing", acquisition: "search", eligibility: "tsa-1" });
       expect(first.status).toBe(200);
-      expect(first.body).toMatchObject({ status: "qualified", source: "provider", previously_seen_company: false, activity_recorded: true, observation_ref: REF(1) });
-      const companyId = first.body["company_id"];
-      expect(typeof companyId).toBe("number");
-      const second = await resolveRef(QUALIFIED_IP, REF(2));
-      expect(second.body).toMatchObject({ status: "qualified", source: "cache", company_id: companyId, previously_seen_company: true, activity_recorded: true, observation_ref: REF(2) });
+      expect(first.body).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
+      const second = await resolveRef(QUALIFIED_IP, REF(2), { page_key: "/about/team", acquisition: "direct", eligibility: "tsa-2.1" });
+      expect(second.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
       expect(hits(QUALIFIED_IP)).toBe(1);
       const rows = await observationRows();
+      const companyId = rows.rows[0]!.company_id;
       expect(rows.rows).toEqual([
-        { company_id: String(companyId), source: "provider", observation_ref: REF(1), previously_seen: false },
-        { company_id: String(companyId), source: "cache", observation_ref: REF(2), previously_seen: true },
+        { company_id: companyId, source: "provider", observation_ref: REF(1), previously_seen: false, page_key: "/pricing", acquisition: "search", entrance_contract: "entrance.v1", eligibility: "tsa-1" },
+        { company_id: companyId, source: "cache", observation_ref: REF(2), previously_seen: true, page_key: "/about/team", acquisition: "direct", entrance_contract: "entrance.v1", eligibility: "tsa-2.1" },
       ]);
-      const company = await db.pool.query<{ last_seen_at: Date; first_seen_at: Date }>("SELECT first_seen_at, last_seen_at FROM companies WHERE id = $1", [companyId]);
+      const company = await db.pool.query<{ last_seen_at: Date; first_seen_at: Date; domain: string }>("SELECT domain, first_seen_at, last_seen_at FROM companies WHERE id = $1", [companyId]);
+      expect(company.rows[0]!.domain).toBe("example.com");
       expect(company.rows[0]!.last_seen_at.getTime()).toBeGreaterThanOrEqual(company.rows[0]!.first_seen_at.getTime());
       const stats = await db.pool.query<{ observation_count: string }>("SELECT observation_count FROM company_scope_stats WHERE company_id = $1", [companyId]);
       expect(stats.rows[0]!.observation_count).toBe("2");
-      // A generated reference when the caller omits one: another observation, 22-char base64url.
-      const third = await resolveRef(QUALIFIED_IP);
-      expect(third.body["observation_ref"]).toMatch(/^[A-Za-z0-9_-]{22}$/);
-      expect((await observationRows()).rows).toHaveLength(3);
+      // The commit-safe feed position is set by the inserting transaction (0005).
+      const txids = await db.pool.query<{ ok: boolean }>("SELECT bool_and(txid IS NOT NULL) AS ok FROM company_observations");
+      expect(txids.rows[0]!.ok).toBe(true);
       const snapshot = await db.usage.snapshot(scope);
       expect(snapshot.provider_attempts).toBe(1);
     });
 
-    it("pending followers sharing the caller's reference insert exactly one observation", async () => {
+    it("the entrance_id is the idempotency key: a retried entrance records no second observation and still acknowledges recorded=true", async () => {
+      const first = await resolveRef(QUALIFIED_IP, REF(3));
+      expect(first.body).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
+      for (let i = 0; i < 3; i += 1) {
+        const retry = await resolveRef(QUALIFIED_IP, REF(3), { page_key: "/retried-page" });
+        expect(retry.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
+      }
+      const rows = await observationRows();
+      expect(rows.rows).toHaveLength(1);
+      // The original observation (and its context) is kept unchanged.
+      expect(rows.rows[0]).toMatchObject({ observation_ref: REF(3), page_key: "/pricing" });
+      const stats = await db.pool.query<{ observation_count: string }>("SELECT observation_count FROM company_scope_stats");
+      expect(stats.rows[0]!.observation_count).toBe("1");
+      // A new entrance_id from the same visitor address is a new observation.
+      await resolveRef(QUALIFIED_IP, REF(4));
+      expect((await observationRows()).rows).toHaveLength(2);
+    });
+
+    it("pending followers sharing the caller's entrance_id insert exactly one observation", async () => {
       const results = await Promise.all(Array.from({ length: 4 }, () => resolveRef(QUALIFIED_IP, REF(7))));
       for (const r of results) {
         expect(r.status).toBe(200);
         expect(["qualified", "pending"]).toContain(r.body["status"]);
-        if (r.body["status"] === "qualified") expect(r.body).toMatchObject({ activity_recorded: true, observation_ref: REF(7) });
-        else expect(r.body["company_id"]).toBeUndefined();
+        expect(r.body["recorded"]).toBe(r.body["status"] === "qualified");
       }
       expect(hits(QUALIFIED_IP)).toBe(1);
       expect(results.some((r) => r.body["status"] === "qualified")).toBe(true);
@@ -334,30 +377,30 @@ describe("end-to-end vertical slice", () => {
       await resolveRef(EXCLUDED_IP, REF(1));
       await resolveRef(EXCLUDED_IP, REF(2));
       await resolveRef(NO_DOMAIN_IP, REF(3));
-      await resolveRef("10.1.2.3", REF(4));
+      const ineligible = await resolveRef("10.1.2.3", REF(4));
+      expect(ineligible.body).toEqual({ version: "1", status: "ineligible", source: "none", recorded: false });
       const r = await resolveRef(EXCLUDED_IP, REF(5));
-      expect(r.body["status"]).toBe("excluded");
-      expect(r.body["company_id"]).toBeUndefined();
-      expect(r.body["activity_recorded"]).toBeUndefined();
+      expect(r.body).toEqual({ version: "1", status: "excluded", source: "cache", recorded: false });
       expect((await observationRows()).rows).toEqual([]);
       expect((await db.pool.query("SELECT count(*)::int AS n FROM companies")).rows[0].n).toBe(0);
       expect((await db.pool.query("SELECT count(*)::int AS n FROM company_scope_stats")).rows[0].n).toBe(0);
     });
 
     it("a different address resolving to the same domain reuses the company id and keeps the records across cache pruning", async () => {
-      const a = await resolveRef(QUALIFIED_IP, REF(1));
-      const b = await resolveRef("::ffff:203.0.113.10", REF(2)); // same canonical address: cache hit
-      expect(b.body["company_id"]).toBe(a.body["company_id"]);
+      await resolveRef(QUALIFIED_IP, REF(1));
+      await resolveRef("::ffff:203.0.113.10", REF(2)); // same canonical address: cache hit
       await db.pool.query("UPDATE ip_resolution_cache SET expires_at = now() - interval '1 second'");
       expect(await db.cache.pruneExpired(100)).toBe(1);
       const c = await resolveRef(QUALIFIED_IP, REF(3)); // provider again (cache gone), same company
-      expect(c.body).toMatchObject({ status: "qualified", source: "provider", company_id: a.body["company_id"], previously_seen_company: true });
+      expect(c.body).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
       expect(hits(QUALIFIED_IP)).toBe(2);
-      expect((await observationRows()).rows.map((x) => x.previously_seen)).toEqual([false, true, true]);
+      const rows = (await observationRows()).rows;
+      expect(new Set(rows.map((x) => x.company_id)).size).toBe(1);
+      expect(rows.map((x) => x.previously_seen)).toEqual([false, true, true]);
       expect((await db.pool.query("SELECT count(*)::int AS n FROM companies")).rows[0].n).toBe(1);
     });
 
-    it("delayed usage accounting in a real child cannot consume the activity or response budget (Warp P2-3)", async () => {
+    it("delayed usage accounting in the runner cannot consume the activity or response budget (Warp P2-3)", async () => {
       const first = await resolveRef(QUALIFIED_IP, REF(1)); // provider path: creates the usage row and the cache row
       expect(first.body["status"]).toBe("qualified");
       const locker = await db.pool.connect();
@@ -368,26 +411,28 @@ describe("end-to-end vertical slice", () => {
         const t0 = Date.now();
         const r = await resolveRef(QUALIFIED_IP, REF(2)); // every counter write now blocks behind the lock
         expect(Date.now() - t0).toBeLessThan(2_000); // REQUEST_DEADLINE_MS in the test config
-        expect(r.body).toMatchObject({ status: "qualified", source: "cache", previously_seen_company: true, activity_recorded: true, observation_ref: REF(2) });
+        expect(r.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
         expect(hits(QUALIFIED_IP)).toBe(1);
-        expect((await observationRows()).rows).toHaveLength(2);
-        // The child's own `db_error{usage_counter_timeout}` lines go to its stdout (unit `pipeline` asserts them);
-        // what this test establishes is the real child's timing, result and exit under a blocked counter.
+        const rows = (await observationRows()).rows;
+        expect(rows).toHaveLength(2);
+        expect(rows[1]).toMatchObject({ observation_ref: REF(2), previously_seen: true });
+        // In-process, the pipeline's own log lines are visible here too.
+        expect(logs().some((e) => e["event"] === "db_error" && e["category"] === "usage_counter_timeout")).toBe(true);
       } finally {
         await locker.query("ROLLBACK").catch(() => undefined);
         locker.release();
       }
-      // The child finishes (tracked deferred accounting, bounded close) and is reaped.
+      // The job settles and frees its slot; the delayed counters are tracked as background writes.
       const until = Date.now() + 4_000;
       while (manager.activeCount() > 0 && Date.now() < until) await new Promise((res) => setTimeout(res, 50));
       expect(manager.activeCount()).toBe(0);
     });
 
-    it("the observation history carries no IP, fingerprint, header or provider field", async () => {
+    it("the observation history carries no IP, fingerprint, header, query string or provider field", async () => {
       await resolveRef(QUALIFIED_IP, REF(1));
       await resolveRef(QUALIFIED_IP, REF(2));
       const dump = (await db.pool.query("SELECT row_to_json(o)::text AS t FROM company_observations o UNION ALL SELECT row_to_json(s)::text FROM company_scope_stats s UNION ALL SELECT row_to_json(r)::text FROM company_observation_refs r")).rows.map((r: { t: string }) => r.t).join("\n");
-      expect(findLeaks(dump, [...ALL_TEST_IPS.flatMap(ipVariants), ...FORBIDDEN_PROVIDER_FIELDS, "user-agent", "authorization"])).toEqual([]);
+      expect(findLeaks(dump, [...ALL_TEST_IPS.flatMap(ipVariants), ...FORBIDDEN_PROVIDER_FIELDS, "user-agent", "authorization", "?", "utm_", "referrer"])).toEqual([]);
       const fps = await db.pool.query<{ hex: string }>("SELECT encode(ip_fingerprint, 'hex') AS hex FROM ip_resolution_cache");
       for (const { hex } of fps.rows) expect(dump).not.toContain(hex);
     });

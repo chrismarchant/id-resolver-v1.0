@@ -229,6 +229,71 @@ describe("activity repository", () => {
     expect((await counts(db)).observations).toBe(0);
   });
 
+  describe("entrance context (entrance.v1, migration 0005)", () => {
+    const CONTEXT = { pageKey: "/pricing", acquisition: "search", entranceContract: "entrance.v1", eligibility: "tsa-1" } as const;
+    const contextRows = () =>
+      db.pool.query<{ observation_ref: string; page_key: string | null; acquisition: string | null; entrance_contract: string | null; eligibility: string | null }>(
+        "SELECT observation_ref, page_key, acquisition, entrance_contract, eligibility FROM company_observations ORDER BY id",
+      );
+
+    it("persists page_key, acquisition, entrance_contract and eligibility with the observation; absent context stays NULL", async () => {
+      const companyId = await resolveCompany(db, testKey("a"), "example.com");
+      await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(1), source: "provider", observedAt: at(0), context: CONTEXT });
+      await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(2), source: "cache", observedAt: at(1), context: { ...CONTEXT, pageKey: "/caf\u00e9/\u{1F600}", acquisition: "unknown", eligibility: "tsa-2.0" } });
+      await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(3), source: "cache", observedAt: at(2) });
+      expect((await contextRows()).rows).toEqual([
+        { observation_ref: ref(1), page_key: "/pricing", acquisition: "search", entrance_contract: "entrance.v1", eligibility: "tsa-1" },
+        { observation_ref: ref(2), page_key: "/caf\u00e9/\u{1F600}", acquisition: "unknown", entrance_contract: "entrance.v1", eligibility: "tsa-2.0" },
+        { observation_ref: ref(3), page_key: null, acquisition: null, entrance_contract: null, eligibility: null },
+      ]);
+    });
+
+    it("a repeated entrance reference keeps the first observation's context unchanged", async () => {
+      const companyId = await resolveCompany(db, testKey("a"), "example.com");
+      await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(1), source: "provider", observedAt: at(0), context: CONTEXT });
+      const again = await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(1), source: "cache", observedAt: at(1), context: { ...CONTEXT, pageKey: "/other" } });
+      expect(again).toMatchObject({ kind: "duplicate", sameCompany: true });
+      expect((await contextRows()).rows).toEqual([{ observation_ref: ref(1), page_key: "/pricing", acquisition: "search", entrance_contract: "entrance.v1", eligibility: "tsa-1" }]);
+    });
+
+    it("accepts every value the API accepts at its boundaries (the JS rules are no looser than the CHECK constraints)", async () => {
+      const companyId = await resolveCompany(db, testKey("a"), "example.com");
+      const values = ["/", `/${"a".repeat(255)}`, `/${"\u00e9".repeat(255)}`, "/%E2%82%AC/a-b_c.d~e!$&'()*+,;=:@", "/\u4e2d\u6587/\u{1F600}"];
+      let n = 0;
+      for (const pageKey of values) {
+        n += 1;
+        const r = await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(100 + n), source: "cache", observedAt: at(n), context: { ...CONTEXT, pageKey, eligibility: n % 2 ? "t".repeat(32) : "0.a-b" } });
+        expect(r.kind, pageKey).toBe("recorded");
+      }
+      for (const acquisition of ["direct", "search", "social", "email", "paid", "referral", "internal", "unknown"] as const) {
+        n += 1;
+        const r = await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(100 + n), source: "cache", observedAt: at(n), context: { ...CONTEXT, acquisition } });
+        expect(r.kind, acquisition).toBe("recorded");
+      }
+    });
+
+    it("rejects an invalid context before any SQL runs and writes nothing", async () => {
+      const companyId = await resolveCompany(db, testKey("a"), "example.com");
+      const bad = [
+        { ...CONTEXT, pageKey: "pricing" },
+        { ...CONTEXT, pageKey: "/pricing?x=1" },
+        { ...CONTEXT, pageKey: "/a#b" },
+        { ...CONTEXT, pageKey: "/a b" },
+        { ...CONTEXT, pageKey: "/a\u0001" },
+        { ...CONTEXT, pageKey: `/${"a".repeat(256)}` },
+        { ...CONTEXT, acquisition: "newsletter" as "search" },
+        { ...CONTEXT, entranceContract: "Entrance.v1" },
+        { ...CONTEXT, entranceContract: "entrance" },
+        { ...CONTEXT, eligibility: "TSA" },
+        { ...CONTEXT, eligibility: "t".repeat(33) },
+      ];
+      for (const context of bad) {
+        await expect(db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(1), source: "cache", observedAt: at(0), context }), JSON.stringify(context)).rejects.toMatchObject({ code: "INVALID_CONTEXT" });
+      }
+      expect(await counts(db)).toMatchObject({ observations: 0, refs: 0 });
+    });
+  });
+
   it("deleting a company cascades to its observations and stats (manual deletion procedure)", async () => {
     const companyId = await resolveCompany(db, testKey("a"), "example.com");
     await db.activity.recordObservation({ scope: SCOPE, companyId, observationRef: ref(1), source: "cache", observedAt: at(0) });

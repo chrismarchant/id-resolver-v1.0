@@ -3,11 +3,17 @@
  * usage reservation -> provider (bounded timeout) -> qualify -> fenced commit
  * -> durable company activity (qualified outcomes only, within the deadline).
  *
+ * Runs in the service process under the runner (src/runtime/runner.ts). The
+ * runner aborts `job.signal` at the request deadline: the pipeline then stops
+ * at its next checkpoint, an in-flight provider call is aborted, and the
+ * activity write is never started, so nothing is recorded after the caller
+ * has been answered. A result the provider already returned is still
+ * committed to the cache (fenced), so a paid answer is not lost.
+ *
  * Dependencies are injected so the orchestration is testable with fakes.
  * The outcome never carries free text: only allowlisted statuses/reasons.
  * The raw IP and error messages never leave this function and are never logged.
  */
-import type { CompanyContext } from "../contracts/api.js";
 import type {
   ActivityRepository,
   CacheCompany,
@@ -24,7 +30,7 @@ import type {
   UsageScope,
 } from "../contracts/db.js";
 import { usagePeriodKey } from "../contracts/db.js";
-import type { ChildActivity, ChildJobMessage, ChildOutcome, ChildOutcomeReason, ChildRuntimeConfig } from "../contracts/ipc.js";
+import type { ObservationActivity, OutcomeReason, PipelineConfig, ResolutionJob, ResolutionOutcome } from "../contracts/runtime.js";
 import type { ProviderAdapter, ProviderOutcome } from "../contracts/provider.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../ip/fingerprint.js";
@@ -41,9 +47,10 @@ export interface PipelineDeps {
   logger: Logger;
   sleep?: (ms: number) => Promise<void>;
   /**
-   * Receives accounting operations that exceeded their budget and are still
-   * running, so the caller (the child entry point) can wait for them, bounded,
-   * before it closes the pool: nothing runs untracked in the background.
+   * Receives database operations that exceeded their budget and are still
+   * running (delayed accounting, an activity write past the deadline), so the
+   * runner can track them and drain them, bounded, at shutdown: nothing runs
+   * untracked in the background.
    */
   onDeferred?: (op: Promise<void>) => void;
 }
@@ -60,12 +67,13 @@ export const LEASE_COMMIT_BUDGET_MS = 300;
  * Reserved before the request deadline so the fenced commit (one round trip)
  * and the durable activity write (one short transaction on the same
  * connection pool, a few milliseconds on a co-located database) complete
- * before the child is killed. 450 ms was the pre-activity reserve.
+ * before the runner answers the caller at the deadline. 450 ms was the
+ * pre-activity reserve.
  */
 export const DEADLINE_COMMIT_BUDGET_MS = 550;
 /** The activity write is skipped (reported as not recorded) when less than this remains before the deadline. */
 export const ACTIVITY_MIN_REMAINING_MS = 150;
-/** Kept between the activity write's own timeout and the request deadline so the result still reaches the supervisor. */
+/** Kept between the activity write's own timeout and the request deadline so the result still reaches the caller in time. */
 export const ACTIVITY_DEADLINE_MARGIN_MS = 50;
 /**
  * Best-effort accounting (usage counters, credit estimates) gets at most this
@@ -81,6 +89,7 @@ export const MIN_PROVIDER_TIMEOUT_MS = 200;
 /** Margin kept before the request deadline when waiting for another worker. */
 export const PENDING_MARGIN_MS = 100;
 const MAX_ERROR_TTL_MS = 60 * 60 * 1000;
+const noop = () => undefined;
 /** Enrich charges 100 credits per call that returns a domain. */
 const ESTIMATED_CREDITS_PER_DOMAIN = 100;
 
@@ -88,6 +97,8 @@ const ESTIMATED_CREDITS_PER_DOMAIN = 100;
 class RepositoryError extends Error {}
 /** The activity write did not finish within the request deadline. */
 class ActivityTimeoutError extends Error {}
+/** The runner aborted the job at its deadline. */
+class DeadlineAbortError extends Error {}
 
 async function repo<T>(fn: () => Promise<T>): Promise<T> {
   try {
@@ -97,27 +108,21 @@ async function repo<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-const outcome = (status: ChildOutcome["status"], reason: ChildOutcomeReason, source: ChildOutcome["source"] = "none"): ChildOutcome => ({
+const outcome = (status: ResolutionOutcome["status"], reason: OutcomeReason, source: ResolutionOutcome["source"] = "none"): ResolutionOutcome => ({
   status,
-  company: null,
   source,
   reason,
 });
 
-function companyContext(c: CacheCompany, checkedAt: Date): CompanyContext {
-  return {
-    domain: c.domain,
-    organisation_name: c.organisationName,
-    qualification: { category: c.qualificationCategory, source: "provider_usage_type" },
-    resolved_at: checkedAt.toISOString(),
-  };
-}
-
-export function outcomeFromCacheRow(row: CacheRow): ChildOutcome {
+/**
+ * Outcomes carry no company identity (D2): the company association lives in
+ * the cache row and the observation; the caller learns only the status.
+ */
+export function outcomeFromCacheRow(row: CacheRow): ResolutionOutcome {
   switch (row.status) {
     case "qualified":
       if (!row.company || row.companyId === null) return outcome("unknown", "cache_fresh", "cache");
-      return { status: "qualified", company: companyContext(row.company, row.checkedAt), source: "cache", reason: "cache_fresh" };
+      return outcome("qualified", "cache_fresh", "cache");
     case "provider_error":
       return outcome("unavailable", "cache_fresh", "cache");
     case "uncertain":
@@ -129,12 +134,12 @@ export function outcomeFromCacheRow(row: CacheRow): ChildOutcome {
 
 interface Plan {
   commit: Omit<CommitOutcome, "checkedAt">;
-  result: ChildOutcome;
+  result: ResolutionOutcome;
   counters: UsageCounter[];
   credits: { reported?: number; estimated?: number } | null;
 }
 
-function planFor(p: ProviderOutcome, policy: ChildRuntimeConfig["policy"], checkedAt: Date): Plan {
+function planFor(p: ProviderOutcome, policy: PipelineConfig["policy"], checkedAt: Date): Plan {
   switch (p.kind) {
     case "resolved": {
       const credits = {
@@ -146,7 +151,7 @@ function planFor(p: ProviderOutcome, policy: ChildRuntimeConfig["policy"], check
         const company: CacheCompany = { domain: p.domain, organisationName: p.organisationName, qualificationCategory: q.category };
         return {
           commit: { status: "qualified", company, ttlMs: policy.ttl_qualified_ms },
-          result: { status: "qualified", company: companyContext(company, checkedAt), source: "provider", reason: q.reason },
+          result: outcome("qualified", q.reason, "provider"),
           counters: ["domain_resolutions", "qualified_matches"],
           credits,
         };
@@ -196,10 +201,10 @@ function planFor(p: ProviderOutcome, policy: ChildRuntimeConfig["policy"], check
 
 export async function runJob(
   deps: PipelineDeps,
-  config: ChildRuntimeConfig,
-  job: ChildJobMessage,
+  config: PipelineConfig,
+  job: ResolutionJob,
   now: () => Date = () => new Date(),
-): Promise<ChildOutcome> {
+): Promise<ResolutionOutcome> {
   const { cache, usage, controls, companies, activity, provider, logger } = deps;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const policy = config.policy;
@@ -215,6 +220,11 @@ export async function runJob(
   let key: CacheKey | null = null;
   let token: string | null = null;
   let dispatched = false;
+  const aborted = () => job.signal?.aborted === true;
+  /** Stops the job once the runner has answered the caller at the deadline. */
+  const checkpoint = () => {
+    if (aborted()) throw new DeadlineAbortError();
+  };
 
   // Counters and credit estimates are best-effort: a failure, or a delay past
   // the accounting budget, must change neither a correct outcome nor the
@@ -224,7 +234,7 @@ export async function runJob(
   // atomically before dispatch, is the authoritative spend figure.
   const accounting = async (category: "usage_counter" | "usage_credits", op: () => Promise<void>): Promise<void> => {
     const budget = Math.min(ACCOUNTING_TIMEOUT_MS, job.deadline_at_ms - now().getTime() - ACCOUNTING_RESERVE_MS);
-    if (budget <= 0) {
+    if (budget <= 0 || aborted()) {
       logger.warn("db_error", { category: `${category}_skipped` });
       return;
     }
@@ -257,8 +267,8 @@ export async function runJob(
       await repo(() => cache.release(key!, t));
     }
   };
-  const finish = (o: ChildOutcome): ChildOutcome => {
-    logger.info("child_job_finished", {
+  const finish = (o: ResolutionOutcome): ResolutionOutcome => {
+    logger.info("job_finished", {
       status: o.status,
       ...(o.reason ? { reason: o.reason } : {}),
       source: o.source,
@@ -273,10 +283,10 @@ export async function runJob(
    * commit whose fence held), stays within the deadline, and reports failure
    * explicitly instead of claiming a record that was not written.
    */
-  const recordActivity = async (o: ChildOutcome, companyId: number, source: ObservationSource, observedAt: Date): Promise<ChildOutcome> => {
-    const base: ChildActivity = { company_id: companyId, previously_seen: null, recorded: false, observation_ref: job.observation_ref };
+  const recordActivity = async (o: ResolutionOutcome, companyId: number, source: ObservationSource, observedAt: Date): Promise<ResolutionOutcome> => {
+    const base: ObservationActivity = { company_id: companyId, previously_seen: null, recorded: false, observation_ref: job.observation_ref };
     const remaining = job.deadline_at_ms - now().getTime();
-    if (remaining < ACTIVITY_MIN_REMAINING_MS) {
+    if (remaining < ACTIVITY_MIN_REMAINING_MS || aborted()) {
       logger.warn("activity_write_failed", { company_id: companyId, reason: "deadline_exceeded", source });
       return { ...o, activity: base };
     }
@@ -289,9 +299,15 @@ export async function runJob(
         observationRef: job.observation_ref,
         source,
         observedAt,
+        context: job.context,
       });
       const r = await new Promise<RecordObservationResult>((resolve, reject) => {
-        const t = setTimeout(() => reject(new ActivityTimeoutError()), Math.max(1, remaining - ACTIVITY_DEADLINE_MARGIN_MS));
+        const t = setTimeout(() => {
+          // The write keeps running (bounded by the pool's statement and query
+          // timeouts); hand it to the runner so shutdown drains it.
+          deps.onDeferred?.(write.then(noop, noop));
+          reject(new ActivityTimeoutError());
+        }, Math.max(1, remaining - ACTIVITY_DEADLINE_MARGIN_MS));
         write.then(
           (v) => {
             clearTimeout(t);
@@ -317,13 +333,12 @@ export async function runJob(
   };
 
   /** A fresh qualified cache row reuses the durable company identity and records activity; other rows record nothing. */
-  const activityForRow = async (row: CacheRow): Promise<ChildOutcome> => {
+  const activityForRow = async (row: CacheRow): Promise<ResolutionOutcome> => {
     const o = outcomeFromCacheRow(row);
     if (o.status !== "qualified" || row.companyId === null) return o;
     return recordActivity(o, row.companyId, "cache", now());
   };
 
-  logger.debug("child_job_started", { job_id: job.job_id });
   await count("resolver_requests");
 
   try {
@@ -338,6 +353,7 @@ export async function runJob(
     secret.fill(0);
     key = { installationId: config.installation_id, websiteId: config.website_id, keyVersion: config.key_version, ipFingerprint: fingerprint };
     const k = key;
+    checkpoint();
 
     // 3. Reserve. Liveness, expiry and takeover are decided by the database clock.
     const reservation = await repo(() => cache.reserve(k, { leaseMs: policy.lease_ms }));
@@ -354,6 +370,7 @@ export async function runJob(
       const waitUntil = Math.min(job.deadline_at_ms - PENDING_MARGIN_MS, started + policy.pending_wait_ms);
       for (let t = now().getTime(); t < waitUntil; t = now().getTime()) {
         await sleep(Math.max(1, Math.min(policy.pending_poll_ms, waitUntil - t)));
+        checkpoint();
         const row = await repo(() => cache.readFresh(k));
         if (row) {
           logger.debug("cache_lookup", { outcome: "hit_after_wait" });
@@ -373,12 +390,14 @@ export async function runJob(
       await release();
       return finish(outcome("disabled", "provider_disabled"));
     }
+    checkpoint();
     if (!(await repo(() => controls.isEnrichmentEnabled(config.installation_id)))) {
       await release();
       return finish(outcome("disabled", "kill_switch"));
     }
 
     // 5. Usage allowance (never undone once reserved).
+    checkpoint();
     const allowance = await repo(() => usage.reserveProviderAttempt(scope, policy.period_call_cap));
     logger.info("usage_reservation", { outcome: allowance, period_key: scope.periodKey, cap: policy.period_call_cap });
     if (allowance !== "reserved") {
@@ -401,9 +420,11 @@ export async function runJob(
       return finish(outcome("unavailable", "deadline_exceeded"));
     }
 
-    // 7. Provider call.
+    // 7. Provider call, bounded by its own timeout and aborted with the job.
+    checkpoint();
     dispatched = true;
-    const p = await provider.lookup(ip.canonical, { signal: AbortSignal.timeout(timeoutMs) });
+    const providerSignal = job.signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), job.signal]) : AbortSignal.timeout(timeoutMs);
+    const p = await provider.lookup(ip.canonical, { signal: providerSignal });
     logger.info("provider_call", { duration_ms: now().getTime() - t0 });
     logger.info("provider_outcome", { outcome: p.kind, ...(p.kind === "error" ? { category: p.category } : {}) });
 
@@ -431,9 +452,13 @@ export async function runJob(
     }
     return finish(result);
   } catch (err) {
-    const isDb = err instanceof RepositoryError;
-    logger.error(isDb ? "db_error" : "child_error", { category: isDb ? "repository" : "pipeline" });
     // Free the key for another worker only if nothing was dispatched.
+    if (err instanceof DeadlineAbortError) {
+      if (!dispatched) await release().catch(() => undefined);
+      return finish(outcome("unavailable", "deadline_exceeded"));
+    }
+    const isDb = err instanceof RepositoryError;
+    logger.error(isDb ? "db_error" : "job_error", { category: isDb ? "repository" : "pipeline" });
     if (!dispatched) await release().catch(() => undefined);
     return finish(outcome("unavailable", isDb ? "database_error" : "internal_error"));
   } finally {

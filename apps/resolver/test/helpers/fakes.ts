@@ -16,6 +16,7 @@ import type {
   CommitResult,
   CompanyRepository,
   ControlsRepository,
+  ObservationContext,
   ProviderAttemptReservation,
   RecordObservationInput,
   RecordObservationResult,
@@ -282,6 +283,8 @@ export interface FakeObservation {
   observationRef: string;
   source: "cache" | "provider";
   companyFirst: boolean;
+  /** Entrance evidence as the SQL insert stores it (null columns when absent). */
+  context: ObservationContext | null;
 }
 
 /**
@@ -335,6 +338,7 @@ export class FakeActivityRepository implements ActivityRepository {
       observationRef: input.observationRef,
       source: input.source,
       companyFirst: !previouslySeen,
+      context: input.context ? { ...input.context } : null,
     });
     return { kind: "recorded", observationId: id, previouslySeen };
   }

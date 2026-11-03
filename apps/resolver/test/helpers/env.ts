@@ -18,12 +18,13 @@ export function testConfig(overrides: Partial<Record<string, string>> = {}): Con
     REQUEST_DEADLINE_MS: "2000",
     ENRICH_TIMEOUT_MS: "800",
     LEASE_MS: "1500",
-    CHILD_HARD_KILL_GRACE_MS: "300",
-    MAX_CONCURRENT_CHILDREN: "4",
+    MAX_CONCURRENT_JOBS: "4",
     RATE_LIMIT_PER_MINUTE: "1000",
     PENDING_WAIT_MS: "600",
     PENDING_POLL_MS: "25",
     ALLOW_DOCUMENTATION_RANGES: "true",
+    // Required, no default (D3); tests pick a value inside the 1-365 bound.
+    OBSERVATION_RETENTION_DAYS: "30",
     ...overrides,
   });
 }

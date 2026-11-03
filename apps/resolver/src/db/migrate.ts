@@ -1,5 +1,7 @@
 /**
- * Plain-SQL migration runner.
+ * Plain-SQL migration runner, and the startup check that the database is
+ * current (the service never migrates on start: it refuses to start while a
+ * migration in migrations/ is not recorded in schema_migrations).
  *
  * - Reads migrations/*.sql in lexical order.
  * - Each file is applied in its own transaction together with its
@@ -12,6 +14,7 @@
  * default "require").
  */
 import { readdir, readFile } from "node:fs/promises";
+import type { QueryConfig, QueryResultRow } from "pg";
 import { pathToFileURL } from "node:url";
 import type { Logger } from "../log/index.js";
 import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from "./pool.js";
@@ -19,6 +22,8 @@ import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from
 /** Arbitrary constant namespace for the migration advisory lock. */
 const MIGRATION_LOCK_KEY = "7262021001";
 const MIGRATION_STATEMENT_TIMEOUT = "120s";
+/** Client-side bound for migration statements; above the session's 120 s statement_timeout, overriding the pool's short default. */
+const MIGRATION_QUERY_TIMEOUT_MS = 125_000;
 
 export interface MigrateOptions {
   /** Directory containing *.sql files. Defaults to the repository's migrations/. */
@@ -35,9 +40,52 @@ function defaultDir(): URL {
   return new URL("../../migrations/", import.meta.url);
 }
 
+async function migrationNames(dir: string | URL): Promise<string[]> {
+  return (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+}
+
+export interface MigrationStatus {
+  /** Files in migrations/ not recorded in schema_migrations (all of them when the table does not exist). */
+  pending: string[];
+  /** Recorded in schema_migrations but absent from this build (the database is ahead of the code). */
+  unknown: string[];
+}
+
+/** Read-only comparison of the build's migrations with the database's schema_migrations. */
+export async function migrationStatus(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrationStatus> {
+  const names = await migrationNames(options.dir ?? defaultDir());
+  return guarded(logger, async () => {
+    const table = await pool.query<{ t: string | null }>("SELECT to_regclass('public.schema_migrations')::text AS t");
+    const applied = table.rows[0]?.t ? (await pool.query<{ name: string }>("SELECT name FROM schema_migrations")).rows.map((r) => r.name) : [];
+    const done = new Set(applied);
+    const known = new Set(names);
+    return { pending: names.filter((n) => !done.has(n)), unknown: applied.filter((n) => !known.has(n)).sort() };
+  });
+}
+
+/** The database is missing migrations this build needs. The message names files only (never a URL or credential). */
+export class PendingMigrationsError extends Error {
+  readonly pending: string[];
+  constructor(pending: string[]) {
+    super(
+      `database schema is behind this build: ${pending.length} pending migration(s): ${pending.join(", ")}. ` +
+        "Apply them with `node dist/db/migrate.js` (the Railway preDeployCommand; locally `npm run migrate`), then start the service.",
+    );
+    this.name = "PendingMigrationsError";
+    this.pending = pending;
+  }
+}
+
+/** Startup gate: throws PendingMigrationsError unless every migration in this build is applied. */
+export async function assertSchemaCurrent(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrationStatus> {
+  const status = await migrationStatus(pool, logger, options);
+  if (status.pending.length > 0) throw new PendingMigrationsError(status.pending);
+  return status;
+}
+
 export async function applyMigrations(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrateResult> {
   const dir = options.dir ?? defaultDir();
-  const names = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+  const names = await migrationNames(dir);
   const sqlByName = new Map<string, string>();
   for (const name of names) {
     const base = typeof dir === "string" ? pathToFileURL(dir.endsWith("/") ? dir : `${dir}/`) : dir;
@@ -46,14 +94,17 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
 
   return guarded(logger, async () => {
     const client = await pool.connect();
+    // Every statement on this connection gets the migration bound instead of the pool's short client-side timeout.
+    const query = <R extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) =>
+      client.query<R>({ text, ...(values ? { values } : {}), query_timeout: MIGRATION_QUERY_TIMEOUT_MS } as QueryConfig);
     try {
-      await client.query(`SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT}'`);
-      await client.query("SELECT pg_advisory_lock($1::bigint)", [MIGRATION_LOCK_KEY]);
+      await query(`SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT}'`);
+      await query("SELECT pg_advisory_lock($1::bigint)", [MIGRATION_LOCK_KEY]);
       try {
-        await client.query(
+        await query(
           "CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
         );
-        const done = await client.query<{ name: string }>("SELECT name FROM schema_migrations");
+        const done = await query<{ name: string }>("SELECT name FROM schema_migrations");
         const doneSet = new Set(done.rows.map((r) => r.name));
         const applied: string[] = [];
         const alreadyApplied: string[] = [];
@@ -63,19 +114,19 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
             continue;
           }
           try {
-            await client.query("BEGIN");
-            await client.query(sqlByName.get(name) as string);
-            await client.query("INSERT INTO schema_migrations (name, applied_at) VALUES ($1, now())", [name]);
-            await client.query("COMMIT");
+            await query("BEGIN");
+            await query(sqlByName.get(name) as string);
+            await query("INSERT INTO schema_migrations (name, applied_at) VALUES ($1, now())", [name]);
+            await query("COMMIT");
           } catch (err) {
-            await client.query("ROLLBACK").catch(() => undefined);
+            await query("ROLLBACK").catch(() => undefined);
             throw new MigrationError(name, toDbError(err).code);
           }
           applied.push(name);
         }
         return { applied, alreadyApplied };
       } finally {
-        await client.query("SELECT pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]).catch(() => undefined);
+        await query("SELECT pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]).catch(() => undefined);
       }
     } finally {
       // Always destroy this connection: it carries a non-default

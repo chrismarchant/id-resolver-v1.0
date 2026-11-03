@@ -4,6 +4,7 @@
  * fingerprint. Implementations must be safe under concurrent callers in
  * separate processes.
  */
+import type { Acquisition } from "./api.js";
 
 export const CACHE_STATUSES = [
   "pending", // reservation held; lease_expires_at governs ownership
@@ -165,14 +166,36 @@ export interface ObservationScope {
   websiteId: string;
 }
 
+/**
+ * Entrance evidence stored with an observation (migration 0005). Only the
+ * normalised path, the closed acquisition class, the contract id and the
+ * eligibility rule-set id: never a query string, referrer, UTM value,
+ * header, user agent or IP.
+ */
+export interface ObservationContext {
+  /** Normalised path (isValidPageKey). */
+  pageKey: string;
+  acquisition: Acquisition;
+  /** e.g. "entrance.v1" (ENTRANCE_CONTRACT_PATTERN). */
+  entranceContract: string;
+  /** ELIGIBILITY_PATTERN. */
+  eligibility: string;
+}
+
 export interface RecordObservationInput {
   scope: ObservationScope;
   companyId: number;
-  /** Bounded opaque idempotency reference (^[A-Za-z0-9_-]{1,64}$), unique within the scope. */
+  /** Bounded opaque idempotency reference (^[A-Za-z0-9_-]{1,64}$), unique within the scope; the entrance_id for entrance.v1. */
   observationRef: string;
   source: ObservationSource;
   /** Server timestamp of the accepted resolution. */
   observedAt: Date;
+  /**
+   * Entrance evidence. Every entrance.v1 write carries it; it is optional only
+   * so fixtures can seed observations without one (the columns are nullable,
+   * and the feed contract allows null for older contracts).
+   */
+  context?: ObservationContext;
 }
 
 export type RecordObservationResult =

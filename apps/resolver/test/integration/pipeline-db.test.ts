@@ -1,14 +1,14 @@
 /**
- * The child pipeline against the REAL repositories with deliberately offset
+ * The resolution pipeline against the REAL repositories with deliberately offset
  * worker clocks (review P1: database-authoritative lease lifecycle). Workers
  * whose clocks run ahead or behind must neither take over a live reservation,
  * nor dispatch a second provider call for one address, nor persist a stale
  * result; the only clock that decides ownership is the database's.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { runJob, type PipelineDeps } from "../../src/child/pipeline.js";
+import { runJob, type PipelineDeps } from "../../src/resolution/pipeline.js";
 import { usagePeriodKey, type UsageScope } from "../../src/contracts/db.js";
-import { IPC_PROTOCOL_VERSION, type ChildJobMessage, type ChildRuntimeConfig } from "../../src/contracts/ipc.js";
+import type { PipelineConfig, ResolutionJob } from "../../src/contracts/runtime.js";
 import type { ProviderAdapter } from "../../src/contracts/provider.js";
 import type { Db } from "../../src/db/index.js";
 import { createMemoryLogger } from "../../src/log/index.js";
@@ -18,13 +18,12 @@ import { createTestDb, resetTestDb } from "../helpers/db.js";
 const SECRET = "0123456789abcdef".repeat(4);
 const IP = "203.0.113.40";
 
-function config(over: Partial<ChildRuntimeConfig["policy"]> = {}): ChildRuntimeConfig {
+function config(over: Partial<PipelineConfig["policy"]> = {}): PipelineConfig {
   return {
     installation_id: "inst-test",
     website_id: "site-test",
     key_version: 1,
     ip_hmac_secret: SECRET,
-    database_url: "postgres://unused@localhost/unused",
     provider: { mode: "mock", base_url: "https://provider.invalid", api_key: "k", auth_header: "x-api-key", timeout_ms: 5_000 },
     policy: {
       ttl_qualified_ms: 60_000,
@@ -44,13 +43,11 @@ function config(over: Partial<ChildRuntimeConfig["policy"]> = {}): ChildRuntimeC
       allow_documentation_ranges: true,
       ...over,
     },
-    log_level: "debug",
   };
 }
 
-const job = (ref: string, deadlineInMs = 6_000): ChildJobMessage => ({
-  v: IPC_PROTOCOL_VERSION,
-  type: "job",
+const job = (ref: string, deadlineInMs = 6_000): ResolutionJob => ({
+  context: { pageKey: "/pricing", acquisition: "search", entranceContract: "entrance.v1", eligibility: "tsa-1" },
   job_id: `job-${ref}`,
   ip: IP,
   deadline_at_ms: Date.now() + deadlineInMs,

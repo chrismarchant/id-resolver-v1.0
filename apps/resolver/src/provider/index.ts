@@ -6,12 +6,12 @@
  * mode "live" with base_url pointing at the mock server (loopback only may
  * use plain http).
  */
-import type { ChildRuntimeConfig } from "../contracts/ipc.js";
+import type { PipelineConfig } from "../contracts/runtime.js";
 import type { ProviderAdapter } from "../contracts/provider.js";
 import { createEnrichAdapter } from "./enrich.js";
 import { createMockProvider, type MockScript } from "./mock.js";
 
-export type ProviderInput = Pick<ChildRuntimeConfig["provider"], "mode" | "base_url" | "api_key" | "auth_header">;
+export type ProviderInput = Pick<PipelineConfig["provider"], "mode" | "base_url" | "api_key" | "auth_header">;
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 

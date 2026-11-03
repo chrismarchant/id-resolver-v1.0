@@ -5,7 +5,7 @@ import {
   canonicaliseUsageType,
   qualify,
   type QualificationPolicy,
-} from "../../src/child/qualify.js";
+} from "../../src/resolution/qualify.js";
 
 const policy: QualificationPolicy = {
   qualified_usage_types: ["COM", "ORG", "GOV", "EDU", "MIL", "LIB"],

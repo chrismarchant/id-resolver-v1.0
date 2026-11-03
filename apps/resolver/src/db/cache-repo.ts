@@ -225,6 +225,7 @@ export function createCacheRepository(pool: Pool, logger?: Logger): CacheReposit
       if (!Number.isSafeInteger(outcome.ttlMs) || outcome.ttlMs < 0) throw new DbError("INVALID_TTL");
       return guarded(logger, async () => {
         const client = await pool.connect();
+        let failed = false;
         try {
           await client.query("BEGIN");
           try {
@@ -268,11 +269,14 @@ export function createCacheRepository(pool: Pool, logger?: Logger): CacheReposit
             const id = res.rows[0]?.company_id ?? null;
             return { kind: "committed", companyId: id === null ? null : Number(id) };
           } catch (err) {
+            failed = true;
             await client.query("ROLLBACK").catch(() => undefined);
             throw err;
           }
         } finally {
-          client.release();
+          // A failed transaction (including a client-side query timeout) may
+          // leave the connection mid-statement: discard it instead of reusing it.
+          client.release(failed);
         }
       });
     },

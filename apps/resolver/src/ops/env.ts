@@ -13,8 +13,10 @@ const OpsSchema = ConfigSchema.pick({
   DATABASE_SSL: true,
   USAGE_PERIOD: true,
   CACHE_PRUNE_BATCH: true,
-  OBSERVATION_RETENTION_DAYS: true,
 });
+
+/** Only the prune command needs the (required, bounded) retention window. */
+const RetentionSchema = ConfigSchema.pick({ OBSERVATION_RETENTION_DAYS: true });
 
 export type OpsConfig = ReturnType<typeof OpsSchema.parse>;
 
@@ -25,6 +27,15 @@ export function loadOpsConfig(env: NodeJS.ProcessEnv = process.env): OpsConfig {
     throw new Error(`invalid configuration: ${names.join("; ")}`);
   }
   return parsed.data;
+}
+
+export function loadRetentionDays(env: NodeJS.ProcessEnv = process.env): number {
+  const parsed = RetentionSchema.safeParse(env);
+  if (!parsed.success) {
+    const names = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    throw new Error(`invalid configuration: ${names.join("; ")}`);
+  }
+  return parsed.data.OBSERVATION_RETENTION_DAYS;
 }
 
 /** Prints a generic failure without echoing arbitrary error text from the driver. */

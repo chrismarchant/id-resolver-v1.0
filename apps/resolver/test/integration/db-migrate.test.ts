@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool, type Pool } from "../../src/db/pool.js";
-import { applyMigrations } from "../../src/db/migrate.js";
+import { applyMigrations, assertSchemaCurrent, migrationStatus, PendingMigrationsError } from "../../src/db/migrate.js";
 import { createDb } from "../../src/db/index.js";
 import { createScratchDatabase } from "../helpers/db.js";
 
@@ -219,5 +219,47 @@ describe("privacy guard: no IP-bearing schema", () => {
       await p.end();
       await fresh.drop();
     }
+  });
+});
+
+describe("startup schema gate (migrations never run on start)", () => {
+  let scratch: Awaited<ReturnType<typeof createScratchDatabase>>;
+  let pool: Pool;
+  const all = readdirSync(join(ROOT, "migrations")).filter((f) => f.endsWith(".sql")).sort();
+
+  beforeAll(async () => {
+    scratch = await createScratchDatabase();
+    pool = createPool({ databaseUrl: scratch.url, ssl: "disable", max: 2 });
+  });
+  afterAll(async () => {
+    await pool.end();
+    await scratch.drop();
+  });
+
+  it("an empty database has every migration pending and is refused, read-only", async () => {
+    const status = await migrationStatus(pool);
+    expect(status).toEqual({ pending: all, unknown: [] });
+    const err = await assertSchemaCurrent(pool).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PendingMigrationsError);
+    expect((err as PendingMigrationsError).pending).toEqual(all);
+    expect((err as Error).message).toContain("node dist/db/migrate.js");
+    expect((err as Error).message).not.toContain(scratch.url);
+    // The check never creates or changes anything.
+    expect((await pool.query("SELECT to_regclass('public.schema_migrations')::text AS t")).rows[0].t).toBeNull();
+  });
+
+  it("a partially migrated database names exactly the missing files", async () => {
+    const partial = mkdtempSync(join(tmpdir(), "idr-gate-"));
+    for (const f of all.slice(0, -1)) copyFileSync(join(ROOT, "migrations", f), join(partial, f));
+    await applyMigrations(pool, undefined, { dir: partial });
+    const err = await assertSchemaCurrent(pool).catch((e: unknown) => e);
+    expect((err as PendingMigrationsError).pending).toEqual([all.at(-1)]);
+  });
+
+  it("a current database passes; one ahead of the build passes and reports the unknown migration", async () => {
+    await applyMigrations(pool);
+    expect(await assertSchemaCurrent(pool)).toEqual({ pending: [], unknown: [] });
+    await pool.query("INSERT INTO schema_migrations (name) VALUES ('9999_from_a_newer_build.sql')");
+    expect(await assertSchemaCurrent(pool)).toEqual({ pending: [], unknown: ["9999_from_a_newer_build.sql"] });
   });
 });
