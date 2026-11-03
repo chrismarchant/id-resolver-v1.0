@@ -43,7 +43,7 @@ time under Settings → Code security; re-check before relying on them.
 |---|---|---|
 | **gitleaks 8.30.1** over the full git history, default ruleset + a narrow value-level allowlist of two synthetic test values | `.github/workflows/ci.yml` job `hygiene`; config `.gitleaks.toml` | Binary pinned by sha256 from the release checksums. A negative control (random hex and base64 tokens planted in a scratch directory) is detected with the same config. |
 | **Public-safety gate**, working tree: concrete `*.up.railway.app` / `*.railway.internal` hostnames, UUID literals, public IPv4 literals outside private/reserved/RFC 5737 ranges, public IPv6 literals (global unicast outside RFC 3849 and the protocol block; times and `Foo::bar` are not addresses), non-example e-mails, private-key blocks, committed `.env`/key files. UTF-8 (BOM), UTF-16 and UTF-32 are decoded; a text file over 2 MB **fails** unless its exact path is on the reviewed list; only the root `package-lock.json` and the probe lockfile are skipped (never by basename); true binaries are not scanned and are **listed** in the output | `scripts/check-public-safety.mjs`, job `hygiene` | `scripts/check-public-safety.test.mjs` plants a violation for every rule and encoding (UTF-16 LE/BE, BOM-less, NUL, large file, nested lockfile, IPv6) and proves allowed forms pass |
-| **Public-safety gate**, history: the same rules over every line **added** by any commit reachable from any ref (`git log -p --all`; added UTF-16 blobs are decoded whole; committed `.env`/key files are caught even if later deleted). Fails on a shallow clone. Reviewed historical synthetic hits are exact `commit:path:rule:value` fingerprints in `.public-safety-history-allow`, each with a justification | `node scripts/check-public-safety.mjs --history`, job `hygiene` (checkout `fetch-depth: 0`) | Self-test: a value added and later removed is found; exact-fingerprint allow-listing; UTF-16 and deleted `.env` in history; shallow clone refused |
+| **Public-safety gate**, history: the same rules over every line **added** by any commit reachable from any ref (`git log -p --all`; added UTF-16 blobs are decoded whole; committed `.env`/key files are caught even if later deleted). Fails on a shallow clone. Reviewed historical synthetic hits are exact `commit:path:rule:sha256(value)` fingerprints in `.public-safety-history-allow` (see "History allow-list" below) | `node scripts/check-public-safety.mjs --history`, job `hygiene` (checkout `fetch-depth: 0`) | Self-test: a value added and later removed is found; exact hashed-fingerprint allow-listing (one entry waives one hit); refused rules, missing justifications and raw values in the allow-list fail; UTF-16 and deleted `.env` in history; shallow clone refused |
 | Dependency audit `npm audit --audit-level=high`; `npm ci --ignore-scripts` (no install hooks) | job `verify` | CI log |
 | Actions pinned to full commit SHAs; `permissions: contents: read`; `persist-credentials: false` | `ci.yml` | Review |
 | `.gitignore` excludes `.env*` (except `.env.example`), key files, dumps and logs | `.gitignore` | Review |
@@ -54,11 +54,29 @@ UUID, IPv4 and IPv6 rules for deliberately synthetic parser inputs. Every opt-ou
 printed in the CI log for review. The marker cannot opt out of the hostname,
 e-mail or key rules.
 
+### History allow-list (`.public-safety-history-allow`)
+
+* An entry is `<full commit sha>:<path>:<rule>:<sha256 hex of the value>` and waives exactly
+  one value in one file of one commit. The file holds hashes, never the flagged values.
+* The file is scanned like any other file, in both modes, so a raw value written into it,
+  even in a comment, is a finding.
+* Every entry needs a non-empty `# ...` justification directly above it, or above its block
+  of consecutive entries. A blank line in between does not count.
+* Entries for `forbidden-file`, `private-key-block`, `email`, `railway-public-host` and
+  `railway-private-host` are refused as a hard error, as are malformed entries (including
+  the old raw-value format) and unknown rules. These hits need history rewriting and
+  credential rotation, not a waiver; for them the gate prints that remediation and no
+  fingerprint.
+* Next to every other fingerprint the gate prints the remediation: only a **synthetic**
+  value may be listed; a real one must be removed from history and rotated or revoked.
+* The file is validated in every mode (tree, `--staged`, `--history`).
+
 Limits, stated plainly: the gate is pattern-based (no hostname or domain allowlist beyond
 the Railway patterns, no entropy checks; gitleaks covers secrets). Binary files, and
 encodings other than UTF-8/16/32, are not scanned. History fingerprints name commit SHAs, so a
 history rewrite makes entries stale (reported as warnings) and the reviewed hits must be
-re-listed. The history allow-list file itself is excluded from scanning.
+re-listed. A finding line still prints the flagged value itself in the CI log, so a
+reviewer can judge it; the value is already in the scanned content.
 
 ## 4. Recommended owner actions (optional, not assumed)
 

@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import { tmpdir } from "node:os";
@@ -238,7 +239,7 @@ test("--history finds a value that was added and later removed; the working tree
     assert.match(r.out, /old\.ts/);
     assert.match(r.out, /public-ipv4/);
     assert.match(r.out, /public-ipv6/);
-    assert.match(r.out, /allow-list fingerprint: [0-9a-f]{40}:old\.ts:public-ipv4:/);
+    assert.match(r.out, /allow-list fingerprint: [0-9a-f]{40}:old\.ts:public-ipv4:[0-9a-f]{64}\n/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -276,16 +277,176 @@ test("--history sees an added UTF-16 file, a deleted .env, and ignores removed l
   }
 });
 
-test("--history honours exact commit:path:rule:value fingerprints and nothing broader", () => {
+// ---- history allow-list: hashed entries, scanned, refusals (CHR-66 N4) ------
+
+const sha256 = (v) => createHash("sha256").update(v, "utf8").digest("hex");
+const ALLOW = ".public-safety-history-allow";
+const otherIp = [9, 9, 9, 8].join(".");
+
+test("--history honours exact commit:path:rule:sha256 fingerprints and nothing broader", () => {
   const { dir, sha } = historyRepo("old.ts", `ip = "${publicIp}"\n`);
   try {
-    const allow = join(dir, ".public-safety-history-allow");
-    // Wrong path, wrong value and a short sha must not match.
-    writeFileSync(allow, [`${sha}:other.ts:public-ipv4:${publicIp}`, `${sha}:old.ts:public-ipv4:${[9, 9, 9, 8].join(".")}`, `${sha.slice(0, 7)}:old.ts:public-ipv4:${publicIp}`].join("\n") + "\n");
-    assert.equal(runGate(dir, "--history").code, 1);
-    writeFileSync(allow, `# reviewed: synthetic\n${sha}:old.ts:public-ipv4:${publicIp}\n`);
+    const allow = join(dir, ALLOW);
+    // Wrong path, wrong hash, wrong rule: valid entries that match nothing, so the hit stays a finding.
+    writeFileSync(allow, ["# reviewed: synthetic", `${sha}:other.ts:public-ipv4:${sha256(publicIp)}`, `${sha}:old.ts:public-ipv4:${sha256(otherIp)}`, `${sha}:old.ts:uuid-literal:${sha256(publicIp)}`].join("\n") + "\n");
+    let r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /old\.ts: public-ipv4/);
+    assert.match(r.out, /3 unused entr/);
+    // A short sha is malformed (full commit ids only).
+    writeFileSync(allow, `# reviewed: synthetic\n${sha.slice(0, 12)}:old.ts:public-ipv4:${sha256(publicIp)}\n`);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /malformed entry/);
+    writeFileSync(allow, `# reviewed: synthetic\n${sha}:old.ts:public-ipv4:${sha256(publicIp)}\n`);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+    assert.doesNotMatch(r.out, /unused/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a printed fingerprint holds the hash, not the value, next to the remediation", () => {
+  const { dir, sha } = historyRepo("old.ts", `ip = "${publicIp}"\n`);
+  try {
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    const fpLine = r.out.split("\n").find((l) => l.includes("allow-list fingerprint:"));
+    assert.equal(fpLine.trim(), `allow-list fingerprint: ${sha}:old.ts:public-ipv4:${sha256(publicIp)}`);
+    assert.ok(!fpLine.includes(publicIp));
+    assert.match(r.out, /only a SYNTHETIC value may be allow-listed; if the value is real, rewrite history to remove it and rotate or revoke it/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a hashed entry waives exactly one hit", () => {
+  const dir = mkdtempSync(join(tmpdir(), "public-safety-hist-"));
+  try {
+    git(dir, "init", "-q");
+    writeFileSync(join(dir, "a.ts"), `x = "${publicIp}"\ny = "${otherIp}"\n`);
+    writeFileSync(join(dir, "b.ts"), `x = "${publicIp}"\n`);
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "add");
+    const sha = git(dir, "rev-parse", "HEAD").trim();
+    git(dir, "rm", "-q", "a.ts", "b.ts");
+    git(dir, "commit", "-q", "-m", "remove");
+    writeFileSync(join(dir, ALLOW), `# reviewed: synthetic parser input\n${sha}:a.ts:public-ipv4:${sha256(publicIp)}\n`);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    const findings = r.out.split("\n").filter((l) => / public-ipv4: public IPv4 literal/.test(l));
+    assert.deepEqual(findings.map((l) => l.trim().replace(/^[0-9a-f]{12}:/, "")).sort(), [
+      `a.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${otherIp}`,
+      `b.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${publicIp}`,
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [rule, path, content, value] of [
+  ["forbidden-file", ".env", "X=1\n", ".env"],
+  ["private-key-block", "k.txt", `${keyBlock}\n`, keyBlock],
+  ["email", "e.txt", `owner ${email}\n`, email],
+  ["railway-public-host", "h.txt", `url ${host}\n`, host],
+  ["railway-private-host", "p.txt", `db ${["api-prod", "railway", "internal"].join(".")}\n`, ["api-prod", "railway", "internal"].join(".")],
+]) {
+  test(`refuses an allow entry for ${rule} (hard error, no fingerprint offered)`, () => {
+    const { dir, sha } = historyRepo(path, content);
+    try {
+      let r = runGate(dir, "--history");
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, new RegExp(`${rule}: .*\\n\\s+cannot be allow-listed: rewrite history to remove it and rotate or revoke the credential`));
+      assert.doesNotMatch(r.out, /allow-list fingerprint/);
+      writeFileSync(join(dir, ALLOW), `# reviewed: it is fine, trust me\n${sha}:${path}:${rule}:${sha256(value)}\n`);
+      for (const mode of [["--history"], []]) {
+        r = runGate(dir, ...mode);
+        assert.equal(r.code, 1, r.out);
+        assert.match(r.out, new RegExp(`${ALLOW.replace(".", "\\.")}:2: rule ${rule} cannot be allow-listed`));
+        assert.match(r.out, /hard error/);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("the reviewer's case: a committed-then-removed .env with a key block cannot be waived", () => {
+  const { dir, sha } = historyRepo(".env", `${keyBlock}\nX=1\n`);
+  try {
+    writeFileSync(join(dir, ALLOW), [`# reviewed`, `${sha}:.env:forbidden-file:${sha256(".env")}`, `${sha}:.env:private-key-block:${sha256(keyBlock)}`].join("\n") + "\n");
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /\.env: forbidden-file/);
+    assert.match(r.out, /\.env: private-key-block/);
+    assert.match(r.out, /2 refused entr/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the allow-list file is scanned: a raw value in it, even in a comment, is a finding in both modes", () => {
+  // The reviewer's case: a comment quoting a public IPv4, a non-example e-mail and a concrete Railway host.
+  const comment = `# reviewed: prod db at ${publicIp}, owner ${email}, host ${host}\n`;
+  const dir = repoWith({ [ALLOW]: comment, "a.md": "clean\n" });
+  try {
+    let r = runGate(dir);
+    assert.equal(r.code, 1, r.out);
+    for (const rule of ["public-ipv4", "email", "railway-public-host"]) assert.match(r.out, new RegExp(`${ALLOW.replace(".", "\\.")}:1: ${rule}`));
+    git(dir, "commit", "-q", "-m", "allow file");
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    for (const rule of ["public-ipv4", "email", "railway-public-host"]) assert.match(r.out, new RegExp(`${ALLOW.replace(".", "\\.")}: ${rule}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // An entry in the old raw-value format is refused as malformed (and its value is a finding).
+  const { dir: d2, sha } = historyRepo("old.ts", `ip = "${publicIp}"\n`);
+  try {
+    writeFileSync(join(d2, ALLOW), `# reviewed: synthetic\n${sha}:old.ts:public-ipv4:${publicIp}\n`);
+    const r = runGate(d2, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /:2: malformed entry/);
+    assert.match(runGate(d2).out, /\.public-safety-history-allow:2: public-ipv4/);
+  } finally {
+    rmSync(d2, { recursive: true, force: true });
+  }
+});
+
+test("an entry without a justification directly above it (or its block) is refused", () => {
+  const { dir, sha } = historyRepo("old.ts", `ip = "${publicIp}"\n`);
+  const entry = `${sha}:old.ts:public-ipv4:${sha256(publicIp)}`;
+  try {
+    for (const text of [
+      `${entry}\n`, // no comment
+      `# reviewed: synthetic\n\n${entry}\n`, // a blank line in between
+      `#\n${entry}\n`, // empty comment
+      `#   \n${entry}\n`, // whitespace only
+      `# ----\n${entry}\n`, // no words
+    ]) {
+      writeFileSync(join(dir, ALLOW), text);
+      const r = runGate(dir, "--history");
+      assert.equal(r.code, 1, `${JSON.stringify(text)}\n${r.out}`);
+      assert.match(r.out, /no justification/);
+    }
+    // Accepted: a comment block (even if its last line is empty) directly above a block of entries.
+    writeFileSync(join(dir, ALLOW), `# reviewed: synthetic parser inputs\n#\n${entry}\n${sha}:old.ts:public-ipv4:${sha256(otherIp)}\n`);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /1 unused entr/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an entry for an unknown rule is refused", () => {
+  const { dir, sha } = historyRepo("old.ts", "x = 1\n");
+  try {
+    writeFileSync(join(dir, ALLOW), `# reviewed\n${sha}:old.ts:public-ip:${sha256(publicIp)}\n`);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /unknown rule "public-ip"/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

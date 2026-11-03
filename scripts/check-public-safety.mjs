@@ -38,13 +38,22 @@
  *   --history   every line ADDED by any commit reachable from any ref
  *               (`git log -p --all`), with the same rules. History is
  *               immutable, so already-reviewed historical synthetic hits are
- *               listed as exact `commit:path:rule:value` fingerprints in
- *               .public-safety-history-allow (see that file).
+ *               listed as exact `commit:path:rule:sha256(value)` fingerprints
+ *               in .public-safety-history-allow (see that file).
+ *
+ * The allow-list file is scanned like any other file, so it can hold no raw
+ * hit value: entries store the SHA-256 of the value. Every entry needs a
+ * justification comment directly above it (or above its block). Entries for
+ * the rules in NEVER_ALLOW are refused as a hard error: a committed key or env
+ * file, a real e-mail address or a concrete Railway host needs history
+ * rewriting and credential rotation, not a waiver. The allow-list is validated
+ * in every mode.
  *
  * Usage: node scripts/check-public-safety.mjs [--staged | --history]
  * Exit code 0 = clean, 1 = findings, 2 = internal error.
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 
 const MARKER = "public-safety: allow-synthetic";
@@ -52,9 +61,9 @@ const MAX_BYTES = 2 * 1024 * 1024;
 const HISTORY_ALLOW_FILE = ".public-safety-history-allow";
 
 // Generated lockfiles that are skipped entirely: EXACT repository-relative
-// paths only (never matched by basename, never at any other depth).
-// The history allow-list is skipped too: its entries necessarily quote the values they allow.
-const SKIP_FILES = new Set(["package-lock.json", "packages/tanstack/verification/cf-lifecycle/package-lock.json", HISTORY_ALLOW_FILE]);
+// paths only (never matched by basename, never at any other depth). The
+// history allow-list is NOT skipped: its entries hold hashes, not values.
+const SKIP_FILES = new Set(["package-lock.json", "packages/tanstack/verification/cf-lifecycle/package-lock.json"]);
 // Text files over MAX_BYTES that a reviewer has accepted (exact paths). Empty
 // on purpose: any other large text file is a finding, not a silent skip.
 const REVIEWED_LARGE_TEXT = new Set([]);
@@ -114,6 +123,18 @@ const RULES = [
     why: "public IPv6 literal (use RFC 3849 2001:db8::/32)",
   },
 ];
+
+// History hits of these rules can never be allow-listed: they need history
+// rewriting and credential rotation, not a waiver.
+const NEVER_ALLOW = new Set(["forbidden-file", "private-key-block", "email", "railway-public-host", "railway-private-host"]);
+const KNOWN_RULES = new Set([...RULES.map((r) => r.id), "forbidden-file"]);
+const REMEDIATION =
+  "only a SYNTHETIC value may be allow-listed; if the value is real, rewrite history to remove it and rotate or revoke it (do not list it)";
+const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it and rotate or revoke the credential";
+
+export function sha256Hex(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
 
 /** Strict IPv6 text parser (RFC 4291, incl. "::" and an embedded dotted quad). Returns 8 hextets or null. */
 function parseIpv6(text) {
@@ -275,37 +296,68 @@ function checkTree(staged) {
   return { count: files.length, findings, optOuts, skippedBinary };
 }
 
+// `<full commit sha>:<path>:<rule>:<sha256 hex of the value>`; the path may contain ":".
+const ALLOW_ENTRY = /^([0-9a-f]{40}|[0-9a-f]{64}):(.+):([a-z0-9-]+):([0-9a-f]{64})$/;
+
+/**
+ * Parses the history allow-list. Returns `{ entries, errors }`: `entries` maps
+ * each accepted fingerprint to `{ line, used }`; `errors` lists every refused
+ * line (malformed, unknown or never-allowed rule, no justification).
+ */
+export function parseHistoryAllow(text) {
+  const entries = new Map();
+  const errors = [];
+  let commentHasText = false; // the comment block directly above has a justification
+  let blockJustified = false; // the current block of consecutive entries is justified
+  let prev = "blank";
+  text.split(/\r\n|\n|\r/).forEach((raw, i) => {
+    const line = raw.trim();
+    const where = `${HISTORY_ALLOW_FILE}:${i + 1}`;
+    if (line === "") {
+      prev = "blank";
+      return;
+    }
+    if (line.startsWith("#")) {
+      const hasText = /[A-Za-z]/.test(line.replace(/^#+/, ""));
+      commentHasText = prev === "comment" ? commentHasText || hasText : hasText;
+      prev = "comment";
+      return;
+    }
+    if (prev === "comment") blockJustified = commentHasText;
+    else if (prev === "blank") blockJustified = false;
+    prev = "entry";
+    const m = ALLOW_ENTRY.exec(line);
+    if (!m) {
+      errors.push(`${where}: malformed entry (expected <full commit sha>:<path>:<rule>:<sha256 hex of the value>; raw values are not accepted)`);
+      return;
+    }
+    const [, commit, path, rule, hash] = m;
+    if (!KNOWN_RULES.has(rule)) errors.push(`${where}: unknown rule "${rule}"`);
+    else if (NEVER_ALLOW.has(rule)) errors.push(`${where}: rule ${rule} ${NO_WAIVER}`);
+    else if (!blockJustified) errors.push(`${where}: no justification: put a non-empty "# ..." comment directly above this entry or its block`);
+    else entries.set(`${commit}:${path}:${rule}:${hash}`, { line: i + 1, used: false });
+  });
+  return { entries, errors };
+}
+
 function loadHistoryAllow() {
-  const allow = new Map(); // fingerprint -> used?
   let text;
   try {
     text = readFileSync(HISTORY_ALLOW_FILE, "utf8");
   } catch {
-    return allow;
+    return { entries: new Map(), errors: [] };
   }
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    allow.set(line, false);
-  }
-  return allow;
+  return parseHistoryAllow(text);
 }
 
 function isAllowed(allow, commit, path, rule, value) {
-  for (const key of allow.keys()) {
-    const parts = key.split(":");
-    if (parts.length < 4) continue;
-    const [c, p, r] = parts;
-    const v = parts.slice(3).join(":");
-    if (c.length >= 12 && commit.startsWith(c) && p === path && r === rule && v === value) {
-      allow.set(key, true);
-      return true;
-    }
-  }
-  return false;
+  const entry = allow.get(`${commit}:${path}:${rule}:${sha256Hex(value)}`);
+  if (!entry) return false;
+  entry.used = true;
+  return true;
 }
 
-function checkHistory() {
+function checkHistory(allow) {
   if (execFileSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
     throw new Error("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
   }
@@ -314,7 +366,6 @@ function checkHistory() {
     ["-c", "core.quotePath=false", "log", "--all", "-p", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
     { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
   );
-  const allow = loadHistoryAllow();
   const findings = [];
   const optOuts = [];
   const skippedBinary = [];
@@ -326,12 +377,13 @@ function checkHistory() {
   let combined = false;
   const rawNew = new Map(); // path -> blob id added in this commit
   const emit = (rule, hit, where, optedOut) => {
-    const fp = `${commit}:${path}:${rule.id}:${hit}`;
+    const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
     if (seen.has(fp)) return;
     seen.add(fp);
     if (isAllowed(allow, commit, path, rule.id, hit)) return;
     if (optedOut) optOuts.push(`${commit.slice(0, 12)}:${path}: ${rule.id} (${hit})`);
-    else findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}`);
+    else if (NEVER_ALLOW.has(rule.id)) findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      ${NO_WAIVER}`);
+    else findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
   };
   const addLine = (line) => scanText(line, (rule, hit, _n, optedOut) => emit(rule, hit, "", optedOut));
 
@@ -380,7 +432,7 @@ function checkHistory() {
     if (path === null || skipPath) continue;
     if (combined ? line.startsWith("++") : line.startsWith("+")) addLine(line.slice(combined ? 2 : 1));
   }
-  const unused = [...allow].filter(([, used]) => !used).map(([k]) => k);
+  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k}`);
   return { count: commits, findings, optOuts, skippedBinary, unused };
 }
 
@@ -399,7 +451,8 @@ function splitBuffer(buf, sep) {
 
 function main() {
   const history = process.argv.includes("--history");
-  const r = history ? checkHistory() : checkTree(process.argv.includes("--staged"));
+  const allow = loadHistoryAllow();
+  const r = history ? checkHistory(allow.entries) : checkTree(process.argv.includes("--staged"));
   const unit = history ? "commit(s)" : "file(s)";
   if (r.optOuts.length > 0) {
     console.log(`public-safety: ${r.optOuts.length} marked synthetic opt-out(s):`);
@@ -413,11 +466,15 @@ function main() {
     console.log(`public-safety: warning: ${r.unused.length} unused entr(y/ies) in ${HISTORY_ALLOW_FILE} (history rewritten or fixed?):`);
     for (const u of r.unused) console.log(`  ${u}`);
   }
+  if (allow.errors.length > 0) {
+    console.error(`public-safety: ${allow.errors.length} refused entr(y/ies) in ${HISTORY_ALLOW_FILE} (hard error, the gate fails whatever else it finds):`);
+    for (const e of allow.errors) console.error(`  ${e}`);
+  }
   if (r.findings.length > 0) {
     console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}:`);
     for (const f of r.findings) console.error(`  ${f}`);
-    process.exit(1);
   }
+  if (allow.errors.length > 0 || r.findings.length > 0) process.exit(1);
   console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit} scanned)`);
 }
 
