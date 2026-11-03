@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { IdrOptions } from "../src/index.js";
 
 /** Synthetic test secret: matches the public-repo allowlist pattern (32 chars). */
@@ -64,5 +66,31 @@ export function validateEntranceV1(body: unknown): string[] {
   if (pk.length < 1 || pk.length > 256 || !pk.startsWith("/") || /[?#\s\u0000-\u001f\u007f]/.test(pk)) errors.push("page_key");
   if (!["direct", "search", "social", "email", "paid", "referral", "internal", "unknown"].includes(s("acquisition"))) errors.push("acquisition");
   if (!/^[a-z0-9][a-z0-9.-]{0,31}$/.test(s("eligibility"))) errors.push("eligibility");
+  return errors;
+}
+
+/** The canonical vocabulary, read from the contract (not from the package under test). */
+export function canonicalVocabulary(): { types: Record<string, string[]> } {
+  return JSON.parse(readFileSync(resolve(import.meta.dirname, "../../../docs/contracts/event-vocabulary.v1.json"), "utf8")) as { types: Record<string, string[]> };
+}
+
+export const EVENT_V1_KEYS = ["consent", "contract", "event_id", "name", "occurred_at", "page_key", "type", "website_id"];
+
+/** Strict validator for the frozen event.v1 resolver request body (docs/contracts/event.v1.md, section 2). */
+export function validateEventV1(body: unknown): string[] {
+  const errors: string[] = [];
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return ["body is not an object"];
+  const b = body as Record<string, unknown>;
+  if (JSON.stringify(Object.keys(b).sort()) !== JSON.stringify(EVENT_V1_KEYS)) errors.push(`keys ${Object.keys(b).sort().join(",")}`);
+  const s = (k: string): string => (typeof b[k] === "string" ? (b[k] as string) : "");
+  if (b["contract"] !== "event.v1") errors.push("contract");
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(s("website_id"))) errors.push("website_id");
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(s("event_id"))) errors.push("event_id");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(s("occurred_at")) || Number.isNaN(Date.parse(s("occurred_at")))) errors.push("occurred_at");
+  const types = canonicalVocabulary().types;
+  if (!(types[s("type")] ?? []).includes(s("name"))) errors.push("type/name");
+  const pk = s("page_key");
+  if (pk.length < 1 || pk.length > 256 || !pk.startsWith("/") || /[?#\s\u0000-\u001f\u007f]/.test(pk)) errors.push("page_key");
+  if (b["consent"] !== "granted" && b["consent"] !== "not_required") errors.push("consent");
   return errors;
 }

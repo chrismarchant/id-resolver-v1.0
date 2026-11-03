@@ -43,3 +43,20 @@ export interface EntrancePayload {
   acquisition: Acquisition;
   eligibility: typeof ELIGIBILITY_RULE_SET_ID;
 }
+
+export const EVENT_CONTRACT = "event.v1";
+
+/**
+ * Body of `POST /v1/events` (docs/contracts/event.v1.md, section 2). It has no IP, user-agent, referrer, cookie,
+ * session, visitor, company or free-text field.
+ */
+export interface EventPayload {
+  contract: typeof EVENT_CONTRACT;
+  website_id: string;
+  event_id: string;
+  occurred_at: string;
+  type: string;
+  name: string;
+  page_key: string;
+  consent: "granted" | "not_required";
+}

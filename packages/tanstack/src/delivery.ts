@@ -1,5 +1,5 @@
-import type { DeliveryResult, ResolvedConfig } from "./config.js";
-import type { EntrancePayload } from "./types.js";
+import type { DeliveryResult, ResolvedConfig, ResolvedDelivery } from "./config.js";
+import type { EntrancePayload, EventPayload } from "./types.js";
 
 type Mode = DeliveryResult["mode"];
 
@@ -20,11 +20,13 @@ function timeoutSignal(ms: number): { signal: AbortSignal; cancel: () => void } 
   return { signal: c.signal, cancel: () => clearTimeout(t) };
 }
 
-async function attempt(cfg: ResolvedConfig, payload: EntrancePayload, timeoutMs: number): Promise<AttemptResult> {
+type DeliveryConfig = Pick<ResolvedDelivery, "token" | "fetch" | "retry" | "retryDelayMs">;
+
+async function attempt(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload, timeoutMs: number): Promise<AttemptResult> {
   const { signal, cancel } = timeoutSignal(timeoutMs);
   try {
     const doFetch = cfg.fetch ?? globalThis.fetch;
-    const res = await doFetch(cfg.endpoint, {
+    const res = await doFetch(url, {
       method: "POST",
       headers: { authorization: `Bearer ${cfg.token}`, "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify(payload),
@@ -57,6 +59,12 @@ async function attempt(cfg: ResolvedConfig, payload: EntrancePayload, timeoutMs:
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+export interface DeliverOptions {
+  mode: Mode;
+  allowRetry: boolean;
+  timeoutMs: number;
+}
+
 /**
  * Sends one entrance. Never rejects and never throws: every failure becomes a
  * `dropped` result. A retry happens at most once, only when `allowRetry`
@@ -64,7 +72,19 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  * (timeout, network error, 429, 502, 503, 504). The entrance_id makes the
  * retry idempotent at the resolver.
  */
-export async function deliverEntrance(cfg: ResolvedConfig, payload: EntrancePayload, opts: { mode: Mode; allowRetry: boolean; timeoutMs: number }): Promise<DeliveryResult> {
+export function deliverEntrance(cfg: ResolvedConfig, payload: EntrancePayload, opts: DeliverOptions): Promise<DeliveryResult> {
+  return deliverJson(cfg, cfg.endpoint, payload, opts);
+}
+
+/**
+ * Sends one `event.v1` body to `<resolverBase>/v1/events`, with the same
+ * guarantees as `deliverEntrance` (the event_id makes the retry idempotent).
+ */
+export function deliverEvent(cfg: ResolvedDelivery, payload: EventPayload, opts: DeliverOptions): Promise<DeliveryResult> {
+  return deliverJson(cfg, `${cfg.resolverBase}/v1/events`, payload, opts);
+}
+
+async function deliverJson(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload, opts: DeliverOptions): Promise<DeliveryResult> {
   const started = Date.now();
   let attempts = 0;
   let last: AttemptResult = { kind: "network" };
@@ -72,7 +92,7 @@ export async function deliverEntrance(cfg: ResolvedConfig, payload: EntrancePayl
   try {
     while (attempts < maxAttempts) {
       attempts++;
-      last = await attempt(cfg, payload, opts.timeoutMs);
+      last = await attempt(cfg, url, payload, opts.timeoutMs);
       if (last.kind === "http" && last.status === 200) break;
       const transient = last.kind !== "http" || RETRYABLE_STATUS.has(last.status);
       if (!transient || attempts >= maxAttempts) break;

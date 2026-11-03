@@ -1,0 +1,89 @@
+{
+  "sinkMode": "500",
+  "target": "cloudflare",
+  "node": "v22.23.4",
+  "lifecycle": [],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 22,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "l7O-CzMVsWorbRHb5MiM-g",
+      "occurred_at": "2026-11-03T20:13:04Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"dropped\",\"reason\":\"http_5xx\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":500,\"durationMs\":6}"
+    ]
+  },
+  "collectorRoute": {
+    "accepted": {
+      "status": 204,
+      "ttfb_ms": 10,
+      "body": "",
+      "setCookie": null,
+      "cacheControl": "no-store"
+    },
+    "replayStatus": 409,
+    "crossSiteStatus": 403,
+    "queryPathStatus": 400,
+    "sinkEvents": 1,
+    "sinkUrl": "/v1/events",
+    "sinkHasBearer": true,
+    "forwardedKeys": [
+      "consent",
+      "contract",
+      "event_id",
+      "name",
+      "occurred_at",
+      "page_key",
+      "type",
+      "website_id"
+    ],
+    "forwarded": {
+      "contract": "event.v1",
+      "website_id": "probe-site",
+      "event_id": "2whF867sP5sPDczA1mUTYL",
+      "occurred_at": "2026-11-03T20:13:05Z",
+      "type": "conversion_intent",
+      "name": "cta_click",
+      "page_key": "/orders/:n",
+      "consent": "not_required"
+    },
+    "forwardedContainsAnyHeaderValue": false,
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"dropped\",\"reason\":\"http_5xx\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":500,\"durationMs\":3}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:replay\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":1}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:origin\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}"
+    ]
+  },
+  "collectorBrowser": {
+    "chrome": true,
+    "sinkEvents": 1,
+    "forwarded": [
+      {
+        "contract": "event.v1",
+        "website_id": "probe-site",
+        "event_id": "pQeOQykHMVFU3WT_0-gXA8",
+        "occurred_at": "2026-11-03T20:13:07Z",
+        "type": "page_view",
+        "name": "page_view",
+        "page_key": "/landing/browser-check",
+        "consent": "not_required"
+      }
+    ],
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"dropped\",\"reason\":\"http_5xx\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":500,\"durationMs\":7}"
+    ]
+  }
+}
