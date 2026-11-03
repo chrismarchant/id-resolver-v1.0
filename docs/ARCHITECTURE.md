@@ -83,11 +83,16 @@ association.
   forward-only, as the owner; it also provisions the runtime role); a failed
   migration fails the deployment. The service also **refuses to start while
   migrations are pending**.
-* **Railway configuration:** Railway Config as Code (`railway.json`) is
-  deprecated: new services cannot opt in, and it stops being read on
-  2026-12-01. Service settings are applied through the Railway API for now;
-  `railway.json` documents the intended settings. Migrating to Railway
-  Infrastructure as Code (`.railway/railway.ts`) is a follow-up.
+* **Railway configuration** *(Gate 5)*: Railway Infrastructure as Code,
+  `.railway/railway.ts` (TypeScript SDK `railway`, pinned exactly as a root
+  devDependency), evaluated by the Railway CLI (`railway config plan` /
+  `apply`). It is a whole-project file: an apply deletes any resource or
+  variable it omits, so it declares the whole development environment, with
+  every variable value `preserve()`d (never a value in this public
+  repository). Config as Code (`railway.json`) is deprecated (no longer read
+  from 2026-12-01; a service managed by it blocks IaC plans) and has been
+  removed. Runbook, token requirements and the dev rollout:
+  [RAILWAY_IAC.md](RAILWAY_IAC.md).
 * **Retention and cache pruning** run once at startup and then every
   interval, draining in bounded batches within `CACHE_PRUNE_BUDGET_MS`. A run
   that cannot finish logs `maintenance_backlog` (alert on repeats).
@@ -112,7 +117,8 @@ association.
     handshake only, no credentials sent; trust on first use, so confirm it
     against the certificate file on the database volume).
   * **Development:** switch from `no-verify` to `verify-pinned` (until then
-    the build refuses `no-verify` unless `ALLOW_UNVERIFIED_DATABASE_TLS=true`).
+    the build refuses `no-verify` unless `ALLOW_UNVERIFIED_DATABASE_TLS=true`;
+    rollout in [RAILWAY_IAC.md](RAILWAY_IAC.md#dev-rollout-database-tls-and-roles)).
     **Production (before Gate 6):** `verify-pinned` (or `require` with a
     CA-issued certificate) and a private-network-only database with no TCP
     proxy or public domain.

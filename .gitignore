@@ -31,3 +31,6 @@ core
 !core/
 core.[0-9]*
 .DS_Store
+
+# Railway IaC saved plans (may describe the live environment)
+railway-plan*.json

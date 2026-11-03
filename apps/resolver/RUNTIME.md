@@ -174,7 +174,7 @@ Railway encrypts between services), never through a public TCP proxy, and
 confirm it with a second, independent reading taken on the database's own
 volume (Railway shell of the PostgreSQL service):
 `openssl x509 -noout -fingerprint -sha256 -in /var/lib/postgresql/data/certs/server.crt`
-(the colon-separated output is accepted as a pin as is).
+(the colon-separated value after `=` is accepted as a pin as is).
 
 ### Rotation (two pins)
 
@@ -288,7 +288,7 @@ warning on every start). `config_loaded` reports `db_role: runtime|owner`.
 |---|---|---|---|---|
 | Production | `verify-pinned` (or `require` with a CA-issued certificate) | `DATABASE_TLS_PIN_SHA256` (optional `DATABASE_CA_CERT`) | `DATABASE_RUNTIME_PASSWORD` (sealed), optional `DATABASE_RUNTIME_ROLE` | none |
 | Development (Railway), target | `verify-pinned` | `DATABASE_TLS_PIN_SHA256` | `DATABASE_RUNTIME_PASSWORD` (sealed) | `ALLOW_MOCK_PROVIDER` only |
-| Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them) |
+| Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them; steps in `docs/RAILWAY_IAC.md`) |
 | Local development / tests | `disable` with `NODE_ENV=development` or `test` | — | optional | — |
 
 **Rollback.** The previous build (no role separation) connects as the owner
@@ -353,8 +353,9 @@ browser events are **never** associated with companies.
 ## Migrations
 
 Migrations never run on application start. They run as the deploy
-pre-step (`node dist/db/migrate.js`, the service's pre-deploy command;
-advisory-locked, forward-only; locally `npm run migrate`), as the owner (`DATABASE_URL`), and then provision the runtime role
+pre-step (`node dist/db/migrate.js`, the service's pre-deploy command in
+`.railway/railway.ts`; advisory-locked, forward-only; locally `npm run
+migrate`), as the owner (`DATABASE_URL`), and then provision the runtime role
 (see "Database roles"). At startup the
 service compares `migrations/*.sql` with `schema_migrations` and **refuses to
 start** while any migration of this build is not applied, naming the missing
