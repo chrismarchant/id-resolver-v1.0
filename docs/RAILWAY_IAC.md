@@ -104,7 +104,8 @@ All commands from the repository root, with `RAILWAY_TOKEN` set as above.
    list only changes you intend. A plan that shows any of these is wrong and
    must not be applied: a destroy of a service, database, volume or variable; a
    change to the PostgreSQL image, volume or networking; a TCP proxy or domain
-   added anywhere; a change of `id-resolver`'s source. Values are redacted in
+   added anywhere; the removal of `id-resolver`'s generated public domain; a
+   change of `id-resolver`'s source. Values are redacted in
    plan output (`«hidden»`); do not use `--show-values` in a shared terminal.
 
 3. **Apply only a reviewed plan**:

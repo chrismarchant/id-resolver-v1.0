@@ -263,6 +263,14 @@ every ops command connects with `DATABASE_URL`. `ops:usage` and `ops:prune`
 also run as the owner (one rule for every ops command); `ops:prune` deletes
 through the same triggers.
 
+**Scope of the separation.** The owner `DATABASE_URL` (on Railway the
+template's superuser) is in the service's own environment, because the
+pre-deploy migrate shares the service's variables; `process.env` is scrubbed
+at startup but `/proc/<pid>/environ` keeps it. Role separation therefore
+contains SQL-level abuse and a leaked runtime password, not a compromise of
+the service process (a separate migrator service would be the structural
+answer).
+
 **Provisioning** (`node dist/db/migrate.js`, after the migrations, under the
 migration advisory lock, one transaction, on every run, only when
 `DATABASE_RUNTIME_PASSWORD` is set):
@@ -271,10 +279,14 @@ migration advisory lock, one transaction, on every run, only when
    NOREPLICATION NOBYPASSRLS NOINHERIT`), or updates it when it exists;
    refuses (the deploy fails, nothing changes) if a role of that name exists
    with an elevated attribute, a membership or owned objects: it never
-   demotes a role it did not create;
+   demotes a role it did not create. An existing role of that name without
+   any of these is taken over (password reset, grants replaced), so
+   `DATABASE_RUNTIME_ROLE` must name a role nothing else uses;
 2. sets its password as a SCRAM-SHA-256 verifier computed in the migrate
    process, so the plaintext never appears in SQL text, server logs or
-   `pg_stat_activity`;
+   `pg_stat_activity` (the verifier itself is in the statement text, so it can
+   reach server logs with `log_statement = ddl`, or `pg_stat_statements`; it
+   does not reveal the password);
 3. revokes every privilege it holds in the schema and grants exactly the
    table above. Objects created by future migrations get their grants from
    this map, re-applied on every run (no `ALTER DEFAULT PRIVILEGES`). An
@@ -319,6 +331,11 @@ warning on every start). `config_loaded` reports `db_role: runtime|owner`.
 | Development (Railway), target | `verify-pinned` | `DATABASE_TLS_PIN_SHA256` | `DATABASE_RUNTIME_PASSWORD` (sealed) | `ALLOW_MOCK_PROVIDER` only |
 | Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them; steps in `docs/RAILWAY_IAC.md`) |
 | Local development / tests | `disable` with `NODE_ENV=development` or `test` | — | optional | — |
+
+`NODE_ENV` must stay `production` (the image's default) on every deployed
+service: `development` or `test` silently switches off all three production
+refusals (`disable`, unverified TLS, the owner login), and `config_loaded`
+does not report `NODE_ENV`.
 
 **Rollback.** The previous build (no role separation) connects as the owner
 with `DATABASE_URL`, which still works: migration 0009 changes no table,
