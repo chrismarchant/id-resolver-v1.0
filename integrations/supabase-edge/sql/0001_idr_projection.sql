@@ -12,7 +12,8 @@
 --
 -- Roles: relies on the standard Supabase roles anon, authenticated and
 -- service_role. Writes happen only through the idr_* functions below, which
--- only service_role may execute (the Edge Function uses the service key).
+-- only service_role may execute (the Edge Function uses the service key);
+-- idr_begin_resync, the operator's action, only the owner (CHR-66 G5R1-L3).
 -- The writing functions are SECURITY DEFINER (CHR-66 R2-8): service_role has
 -- no direct INSERT, UPDATE or DELETE on any table, so the sync state, the gap
 -- log and the projection change only through those functions' checks.
@@ -312,7 +313,8 @@ end $$;
 -- owner of the tables, so service_role needs no table write privilege and the
 -- state machine below (compare-and-set, generations, the drain proof) is the
 -- only way to change the sync state or the gap log. Each one validates its
--- arguments, uses no dynamic SQL, and only service_role may execute it.
+-- arguments, uses no dynamic SQL, and only service_role may execute it
+-- (idr_begin_resync: only the owner, CHR-66 G5R1-L3).
 -- The read-only functions (idr_get_sync_state, idr_reconcile_counts,
 -- idr_schema_version) stay SECURITY INVOKER: service_role can read the tables.
 -- ---------------------------------------------------------------------------
@@ -711,7 +713,10 @@ revoke all on function public.idr_sync_gaps_guard() from public, anon, authentic
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text, boolean) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
-grant execute on function public.idr_begin_resync(text) to service_role;
+-- idr_begin_resync is NOT granted to service_role (CHR-66 G5R1-L3): it is the
+-- operator's action, run as the owner (for example in the SQL editor), and the
+-- Edge function never calls it. Without it, the service-role key cannot
+-- release a halted gap (needs_resync) and then assert a drain for it.
 grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
 grant execute on function public.idr_record_sync_gap(text, text, text) to service_role;

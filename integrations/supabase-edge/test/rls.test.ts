@@ -18,6 +18,8 @@ const FUNCS = [
 ];
 /** Trigger functions cannot be called directly; only their ACL is checked. */
 const TRIGGER_FUNCS = ["idr_sync_gaps_guard()"];
+/** The operator's action: executable by the owner only, not by service_role (CHR-66 G5R1-L3). */
+const OWNER_ONLY = ["idr_begin_resync(text)"];
 
 beforeAll(async () => {
   pool = newPool();
@@ -104,7 +106,7 @@ describe("row level security", () => {
     }
   });
 
-  it("only service_role can execute the functions", async () => {
+  it("only service_role can execute the functions; idr_begin_resync only the owner (G5R1-L3)", async () => {
     const calls: Record<string, [string, unknown[]]> = {
       "idr_schema_version()": ["select public.idr_schema_version()", []],
       "idr_get_sync_state(text)": ["select public.idr_get_sync_state($1)", [INSTALLATION]],
@@ -121,17 +123,22 @@ describe("row level security", () => {
       for (const role of ["anon", "authenticated"]) {
         await expect(asRole(pool, role, (c) => c.query(sql, args)), `${role} ${f}`).rejects.toThrow(/permission denied/);
       }
-      await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).resolves.toBeDefined();
+      if (OWNER_ONLY.includes(f)) {
+        await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).rejects.toThrow(/permission denied/);
+        await expect(pool.query(sql, args), `owner ${f}`).resolves.toBeDefined();
+      } else {
+        await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).resolves.toBeDefined();
+      }
     }
-    // No other role (PUBLIC) holds EXECUTE, and nobody but the owner on the trigger function (G4-L4).
+    // No other role (PUBLIC) holds EXECUTE, and nobody but the owner on the trigger function (G4-L4) or on idr_begin_resync (G5R1-L3).
     const acl = await pool.query<{ proname: string; proacl: string[] }>(
       "select proname, proacl::text[] as proacl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
     );
     expect(acl.rows.length).toBe(FUNCS.length + TRIGGER_FUNCS.length);
     for (const row of acl.rows) {
       const grantees = row.proacl.map((a) => a.split("=")[0]);
-      const trigger = TRIGGER_FUNCS.includes(`${row.proname}()`);
-      expect(grantees.sort(), row.proname).toEqual(trigger ? ["resolver"] : ["resolver", "service_role"]);
+      const ownerOnly = [...TRIGGER_FUNCS, ...OWNER_ONLY].some((f) => f.startsWith(`${row.proname}(`));
+      expect(grantees.sort(), row.proname).toEqual(ownerOnly ? ["resolver"] : ["resolver", "service_role"]);
     }
   });
 
@@ -173,7 +180,7 @@ describe("G4-L4: exact privileges under Supabase's default privileges", () => {
     expect(await columnGrants(pool)).toEqual([]);
   });
 
-  it("every idr_* function: EXECUTE for service_role only (nobody on the trigger function), nothing for PUBLIC, anon or authenticated", async () => {
+  it("every idr_* function: EXECUTE for service_role only (nobody on the trigger function or idr_begin_resync), nothing for PUBLIC, anon or authenticated", async () => {
     expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
   });
 

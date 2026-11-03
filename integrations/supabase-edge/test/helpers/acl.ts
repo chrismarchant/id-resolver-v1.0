@@ -26,7 +26,8 @@ export const EXPECTED_RELATION_GRANTS: Grants = {
 /** Every idr_* function: grantee -> privileges. */
 export const EXPECTED_FUNCTION_GRANTS: Grants = {
   "idr_apply_feed_page(text,text,text,jsonb,text,boolean)": { service_role: ["EXECUTE"] },
-  "idr_begin_resync(text)": { service_role: ["EXECUTE"] },
+  // The operator's action: the owner only (CHR-66 G5R1-L3).
+  "idr_begin_resync(text)": {},
   "idr_get_sync_state(text)": { service_role: ["EXECUTE"] },
   "idr_reconcile_counts(text,date,date)": { service_role: ["EXECUTE"] },
   "idr_record_sync_gap(text,text,text)": { service_role: ["EXECUTE"] },

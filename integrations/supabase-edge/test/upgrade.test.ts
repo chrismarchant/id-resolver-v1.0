@@ -166,7 +166,7 @@ describe.each(["6318ab2", "f12b1ad", "fced2ea"] as const)("upgrade from the %s r
     expect(r.gap).toMatchObject({ recorded: true, newGap: version === "6318ab2" });
     expect(await gapRows(pool)).toHaveLength(1);
 
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const ok = await runSync(testConfig(mock), testDeps(store));
     expect(ok).toMatchObject({ status: "ok", gapsResolved: 1 });
     const gaps = await gapRows(pool);
@@ -180,7 +180,7 @@ describe("upgrade from schema 4 in the middle of a resync (R2-8)", () => {
   it("a gap whose resync and replay started under schema 4 resolves at the first drained run after the upgrade, with no new resync", async () => {
     await installLegacy("fced2ea");
     await seedLegacyState("fced2ea"); // obs 1-2 at c2, an open gap with needs_resync
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     // The replay's first page, applied by the schema-4 function (five arguments, no drain flag).
     await asRole(pool, "service_role", (c) => c.query("select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb, null)", [INSTALLATION, JSON.stringify([obs(1, 7, D)])]));
     await ensureProjection(pool);
