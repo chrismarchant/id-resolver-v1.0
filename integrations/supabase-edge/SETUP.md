@@ -21,8 +21,7 @@ causation.
 
 ## 1. Apply the SQL
 
-Run `sql/0001_idr_projection.sql` against the project (SQL editor or `supabase db push`
-after copying it into `supabase/migrations/`). It is idempotent (re-run it to upgrade an
+Run `sql/0001_idr_projection.sql` against the project (see "How to apply it" below). It is idempotent (re-run it to upgrade an
 existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_state` columns
 `resync_requested_at`, `reset_from_cursor` and `drained_generation`, and replaces `idr_apply_feed_page`
 (now with a sixth argument, `p_drained`) and `idr_record_sync_gap` with new signatures, so re-run the
@@ -56,13 +55,42 @@ No role but the owner keeps `TRUNCATE`, `REFERENCES`, `TRIGGER` or `MAINTAIN` on
 access to the view, or any privilege on the `idr_sync_gaps` id sequence (an identity column needs none).
 Re-running the script on an existing project removes those privileges there too.
 
-The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
-transaction-safe): if any statement fails, nothing is applied and the previous version stays
-intact, even with `psql -f`, which by default continues after an error. `idr_schema_version()` is
-defined last, so it reports the new version only for a completely applied script. Apply it as one
-script (SQL editor or `psql -f`); with a migration runner that wraps each file in its own
-transaction, check how it treats the script's own `BEGIN`/`COMMIT` (not verified for
-`supabase db push`).
+### How to apply it
+
+The script is **one statement**: a single `DO` block with no `BEGIN`, `COMMIT` or other
+transaction control of its own (every statement inside it is transaction-safe). One statement is
+atomic however it is sent: if anything in it fails, nothing is applied and the previous version
+stays intact. `idr_schema_version()` is defined last as well, so it reports the new version only
+for a completely applied script. Supported methods:
+
+1. **psql** (recommended for a manual apply):
+   `psql -X -v ON_ERROR_STOP=1 --single-transaction -d "<connection string>" -f sql/0001_idr_projection.sql`.
+   `ON_ERROR_STOP=1` makes psql exit with code 3 on an error; without it psql still prints the
+   error but exits 0. `--single-transaction` is harmless (the script never opens or ends a
+   transaction itself). Plain `psql -f` is also atomic.
+2. **SQL editor**: paste the whole file and run it once.
+3. **Migration runners that wrap each file in their own transaction** (for example
+   `supabase migration up` / `supabase db push` after copying the file unchanged into
+   `supabase/migrations/`): the statement runs inside the runner's transaction, so it is applied,
+   or rolled back, together with the runner's own bookkeeping.
+
+> **Warning about wrapping runners.** Releases before Gate 5 (schema 4 and earlier) wrapped the
+> script in their own `BEGIN` … `COMMIT`. Under a runner that wraps the file in a transaction,
+> that `COMMIT` ended the **runner's** transaction early: what the runner had done before the
+> file was committed with it, and what it did afterwards (such as recording the migration) ran
+> outside any transaction. The current script has no transaction control, so this cannot happen.
+> Do **not** add `BEGIN`/`COMMIT` around or inside it, and do not split it into several files or
+> statements. A tool that splits SQL on semicolons without understanding dollar quoting cannot
+> run it (nor any earlier release, whose function bodies are dollar-quoted too).
+
+Verified locally on PostgreSQL 16 (`test/upgrade.test.ts`): plain `psql -f` and the psql command
+above, each twice; that command with a failure injected (exit 3, nothing applied); and a simulated
+runner (`BEGIN`, a bookkeeping table, the file, a bookkeeping row, then `ROLLBACK` or `COMMIT`):
+the rollback undoes the script and the bookkeeping, the commit keeps both. **Not verified:** the
+Supabase CLI's own runner (`supabase migration up` / `db push`) was not run against this script,
+so how it wraps a file is not confirmed here; and nothing was applied to a hosted Supabase project
+(neither its SQL editor nor its PostgreSQL 17). A single statement is atomic in every case above,
+which is why the script has this form.
 
 **Before upgrading an existing project**, check its sync state:
 

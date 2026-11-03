@@ -21,13 +21,21 @@
 -- authenticated and service_role, so each object is first stripped of every
 -- privilege of those roles and PUBLIC, then granted only what it needs.
 --
--- The whole script is ONE transaction: every statement in it is
--- transaction-safe (no CREATE INDEX CONCURRENTLY, VACUUM or similar), so a
--- failure part-way leaves the previous version untouched. idr_schema_version()
--- is defined last, so it can only report this version once everything before
--- it has been applied.
+-- The whole script is ONE STATEMENT: a single DO block, with no BEGIN, COMMIT
+-- or other transaction control of its own (CHR-66 R3-D and its migration-
+-- runner follow-up). One statement is atomic however it is applied: alone
+-- (plain `psql -f`, the SQL editor), in psql's --single-transaction, or inside
+-- a migration runner that wraps each file in its own transaction (it then
+-- commits or rolls back together with the runner's bookkeeping; an earlier
+-- release's own COMMIT ended such a transaction early). A failure anywhere
+-- leaves the previous version untouched. Every statement in it is
+-- transaction-safe (no CREATE INDEX CONCURRENTLY, VACUUM or similar).
+-- idr_schema_version() is still defined last.
+-- Supported apply methods: SETUP.md, section 1. Do not add BEGIN/COMMIT, and
+-- do not split the file.
 
-begin;
+do $idr_projection$
+begin
 
 create table if not exists public.idr_companies (
   installation_id   text   not null,
@@ -713,13 +721,15 @@ grant execute on function public.idr_resolve_sync_gaps(text, text) to service_ro
 -- LAST: the projection schema this script installs. The Edge function refuses
 -- to run (status schema_mismatch, HTTP 500) unless it matches the version its
 -- code expects, so code/SQL skew can never silently drop gap evidence.
+-- (The script's one-statement form changes nothing that is installed, so it
+-- does not change this version.)
 -- 6 = this release: the writing functions are SECURITY DEFINER, service_role
 -- has no direct table write, and a gap resolves only after a drained replay
 -- (drained_generation; CHR-66 R2-8). 5 = exact privileges under Supabase's
 -- default privileges (CHR-66 G4-L4). 4 = the gap log with compare-and-set, the reset_from_cursor
 -- re-check after a 400 and after a voluntary resync, generations. Earlier
--- releases had no version function. Defined after everything else, inside the
--- same transaction, so it never reports a version for a partially applied
+-- releases had no version function. Defined after everything else, in the
+-- same statement, so it never reports a version for a partially applied
 -- script.
 -- ---------------------------------------------------------------------------
 create or replace function public.idr_schema_version()
@@ -731,4 +741,5 @@ as $$ select 6 $$;
 revoke all on function public.idr_schema_version() from public, anon, authenticated, service_role;
 grant execute on function public.idr_schema_version() to service_role;
 
-commit;
+end
+$idr_projection$;

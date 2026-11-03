@@ -196,6 +196,8 @@ describe("upgrade from schema 4 in the middle of a resync (R2-8)", () => {
 
 describe("R3-D: the script is atomic and reports its version last", () => {
   const sql = () => readFileSync(SQL_PATH, "utf8");
+  /** The script with `stmt` injected just before its closing `end` (inside the single DO statement). */
+  const injectAtEnd = (stmt: string) => sql().replace(/\nend\n\$idr_projection\$;\s*$/, `\n${stmt}\nend\n$idr_projection$;\n`);
   /** Statements without comments, for structural checks. */
   const code = () =>
     sql()
@@ -204,10 +206,17 @@ describe("R3-D: the script is atomic and reports its version last", () => {
       .join("\n")
       .trim();
 
-  it("runs in one transaction (begin; ... commit;), has no transaction-unsafe statement, and defines idr_schema_version() last", () => {
+  it("is ONE statement (a single DO block) with no transaction control of its own, no transaction-unsafe statement, and defines idr_schema_version() last", () => {
     const c = code();
-    expect(c.startsWith("begin;")).toBe(true);
-    expect(c.endsWith("commit;")).toBe(true);
+    expect(c.startsWith("do $idr_projection$\nbegin\n")).toBe(true);
+    expect(c.endsWith("\nend\n$idr_projection$;")).toBe(true);
+    expect(c.split("$idr_projection$").length).toBe(3); // the delimiter appears exactly twice
+    // No transaction control at the top level of the block (function bodies and the nested DO blocks, all
+    // dollar-quoted, are left out): a migration runner's own transaction is never committed or ended early.
+    const body = c.slice("do $idr_projection$\nbegin\n".length, c.length - "\nend\n$idr_projection$;".length);
+    const topLevel = body.replace(/\$([A-Za-z_]*)\$[\s\S]*?\$\1\$/g, "$$...$$");
+    expect(topLevel).toMatch(/create table if not exists public\.idr_sync_gaps/); // the stripping kept the top level
+    expect(topLevel).not.toMatch(/^\s*(begin|commit|rollback|end|abort|start\s+transaction|savepoint|release)\b[^;]*;/im);
     expect(c).not.toMatch(/\bconcurrently\b|\bvacuum\b|alter\s+system|create\s+database/i);
     const defs = [...c.matchAll(/create or replace function (public\.[a-z_]+)\(/g)].map((m) => m[1]);
     expect(defs[defs.length - 1]).toBe("public.idr_schema_version");
@@ -217,7 +226,7 @@ describe("R3-D: the script is atomic and reports its version last", () => {
     await installLegacy("f12b1ad");
     await seedLegacyState("f12b1ad");
     const before = await counts(pool);
-    const broken = sql().replace(/commit;\s*$/, "select 1 / 0;\ncommit;\n");
+    const broken = injectAtEnd("perform 1 / 0;");
     expect(broken).not.toBe(sql());
     const c = await pool.connect();
     try {
@@ -246,7 +255,7 @@ describe("R3-D: the script is atomic and reports its version last", () => {
     await seedLegacyState("f12b1ad");
     const marker = "create or replace function public.idr_resolve_sync_gaps(";
     expect(sql()).toContain(marker);
-    const broken = sql().replace(marker, `select 1 / 0;\n${marker}`);
+    const broken = sql().replace(marker, `perform 1 / 0;\n${marker}`);
     const dir = mkdtempSync(join(tmpdir(), "idr-sql-"));
     try {
       const file = join(dir, "broken.sql");
@@ -263,3 +272,74 @@ describe("R3-D: the script is atomic and reports its version last", () => {
   });
 });
 
+
+describe("migration runners (CHR-66 R3-D follow-up): the script never ends a runner's transaction", () => {
+  const sql = () => readFileSync(SQL_PATH, "utf8");
+  const exists = async () =>
+    (
+      await pool.query(
+        "select to_regclass('public.idr_sync_gaps') is not null as gaps, to_regclass('public.runner_history') is not null as history, to_regprocedure('public.idr_schema_version()') is not null as version",
+      )
+    ).rows[0];
+
+  it("inside a runner's own transaction (BEGIN, bookkeeping, the file, bookkeeping): ROLLBACK undoes all of it, COMMIT keeps all of it", async () => {
+    await freshPublicSchema(pool);
+    const runner = async (end: "rollback" | "commit") => {
+      const c = await pool.connect();
+      try {
+        await c.query("begin");
+        await c.query("create table if not exists public.runner_history (version text primary key)");
+        await c.query(sql()); // as the runner sends a migration file
+        await c.query("insert into public.runner_history values ('0001_idr_projection')");
+        await c.query(end);
+      } finally {
+        c.release();
+      }
+    };
+    await runner("rollback"); // e.g. the runner's own step after the file failed
+    expect(await exists()).toEqual({ gaps: false, history: false, version: false });
+    await runner("commit");
+    expect(await exists()).toEqual({ gaps: true, history: true, version: true });
+    expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
+    expect(await relationGrants(pool)).toMatchObject(EXPECTED_RELATION_GRANTS);
+  });
+
+  const hasPsql = spawnSync("psql", ["--version"], { encoding: "utf8" }).status === 0;
+  const psql = (args: string[], file = SQL_PATH) => spawnSync("psql", ["-X", "-q", "-d", TEST_DB_URL, ...args, "-f", file], { encoding: "utf8" });
+
+  it.skipIf(!hasPsql)("psql --single-transaction -v ON_ERROR_STOP=1 (the documented command): applies, twice, with no WARNING and no ERROR", async () => {
+    await freshPublicSchema(pool);
+    for (let i = 0; i < 2; i++) {
+      const r = psql(["--single-transaction", "-v", "ON_ERROR_STOP=1"]);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).not.toMatch(/WARNING|ERROR/);
+    }
+    expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
+  });
+
+  it.skipIf(!hasPsql)("plain psql -f (autocommit, no flags) applies too, twice", async () => {
+    await freshPublicSchema(pool);
+    for (let i = 0; i < 2; i++) {
+      const r = psql([]);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stderr).not.toMatch(/WARNING|ERROR/);
+    }
+    expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
+  });
+
+  it.skipIf(!hasPsql)("the documented command with a failure in the script: exit code 3 and nothing applied", async () => {
+    await freshPublicSchema(pool);
+    const marker = "create or replace function public.idr_resolve_sync_gaps(";
+    const dir = mkdtempSync(join(tmpdir(), "idr-sql-"));
+    try {
+      const file = join(dir, "broken.sql");
+      writeFileSync(file, sql().replace(marker, `perform 1 / 0;\n${marker}`));
+      const r = psql(["--single-transaction", "-v", "ON_ERROR_STOP=1"], file);
+      expect(r.status).toBe(3);
+      expect(r.stderr).toMatch(/division by zero/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(await exists()).toEqual({ gaps: false, history: false, version: false });
+  });
+});
