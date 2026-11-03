@@ -5,6 +5,7 @@ import { INSTALLATION, asRole, newPool, resetDatabase, truncateAll } from "./hel
 let pool: pg.Pool;
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 const FUNCS = [
+  "idr_schema_version()",
   "idr_get_sync_state(text)",
   "idr_apply_feed_page(text,text,text,jsonb,text)",
   "idr_record_sync_status(text,text,boolean)",
@@ -104,6 +105,7 @@ describe("row level security", () => {
 
   it("only service_role can execute the functions", async () => {
     const calls: Record<string, [string, unknown[]]> = {
+      "idr_schema_version()": ["select public.idr_schema_version()", []],
       "idr_get_sync_state(text)": ["select public.idr_get_sync_state($1)", [INSTALLATION]],
       "idr_apply_feed_page(text,text,text,jsonb,text)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],

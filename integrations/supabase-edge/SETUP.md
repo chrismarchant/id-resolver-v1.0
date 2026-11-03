@@ -118,6 +118,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. Only the milliseconds between that check and the first page remain unchecked | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 3 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 
@@ -132,7 +133,11 @@ the last page was applied, `last_observed_at` = the newest observation in the pr
 that gap is open, repeated runs do not add rows. The function then stops: it **does not advance
 or skip the cursor** and does not call the resolver again until an operator acts. Every such run
 responds `409` with `"gap_recorded": true` and logs `continuity gap: ...` (status and counts only).
-If recording ever failed, the response says `"gap_recorded": false` and the next run retries it.
+If recording ever failed, the response says `"gap_recorded": false` and the next run retries it;
+and `idr_begin_resync` itself inserts the gap row (bounded by the stored state) whenever
+`needs_resync` is set but no open gap is on record, before it clears the flag, so a resync can
+never erase the only evidence. Code/SQL version skew cannot drop it either: the function refuses
+to run (`schema_mismatch`) unless the installed SQL is the version it requires.
 
 1. Find out why the sync stalled (disabled schedule, repeated `auth_failed`, outage, a rotated
    resolver `IP_HMAC_SECRET` while far behind) and fix it.

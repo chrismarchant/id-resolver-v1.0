@@ -247,6 +247,18 @@ end $$;
 -- privilege elevation is needed and a mistake here cannot widen access.
 -- ---------------------------------------------------------------------------
 
+-- The projection schema this script installs. The Edge function refuses to
+-- run (status schema_mismatch, HTTP 500) unless it matches the version its
+-- code expects, so code/SQL skew can never silently drop gap evidence.
+-- 3 = this release (gap log with compare-and-set, reset_from_cursor,
+-- generations); earlier releases had no version function.
+create or replace function public.idr_schema_version()
+returns integer
+language sql
+immutable
+set search_path = ''
+as $$ select 3 $$;
+
 create or replace function public.idr_get_sync_state(p_installation_id text)
 returns jsonb
 language sql
@@ -259,7 +271,8 @@ as $$
     jsonb_build_object('cursor', null, 'needs_resync', false, 'reset_from_cursor', null))
     || jsonb_build_object('gap_open', exists (
          select 1 from public.idr_sync_gaps g
-          where g.installation_id = p_installation_id and g.resolved_at is null));
+          where g.installation_id = p_installation_id and g.resolved_at is null),
+       'schema_version', public.idr_schema_version());
 $$;
 
 -- Applies one feed page atomically, only if the stored cursor equals
@@ -398,21 +411,44 @@ $$;
 -- commercial-history retention); replays are idempotent. This rebuilds from
 -- what the resolver still retains; it does NOT recover observations pruned
 -- before the resync. The gap row in idr_sync_gaps stays.
+-- Evidence first (CHR-66 R2-6): if needs_resync is set but no open gap is on
+-- record (the gap RPC failed and only the status write succeeded), the gap
+-- row is inserted here, in the same transaction, before the flag is cleared,
+-- bounded by the stored state. A pending re-check of a rejected cursor is
+-- then fulfilled too (reset_from_cursor cleared); without needs_resync it is
+-- kept, so the next run still re-checks it.
 create or replace function public.idr_begin_resync(p_installation_id text)
 returns jsonb
 language plpgsql
 set search_path = ''
 as $$
+declare
+  v_needs boolean;
+  v_cursor text;
+  v_reset_from text;
+  v_last_applied timestamptz;
+  v_generation bigint;
+  v_id bigint;
 begin
   insert into public.idr_sync_state (installation_id) values (p_installation_id)
     on conflict (installation_id) do nothing;
-  perform 1 from public.idr_sync_state s where s.installation_id = p_installation_id for update;
+  select s.needs_resync, s.cursor, s.reset_from_cursor, s.last_applied_at, s.resync_generation
+    into v_needs, v_cursor, v_reset_from, v_last_applied, v_generation
+    from public.idr_sync_state s where s.installation_id = p_installation_id for update;
+  if v_needs then
+    insert into public.idr_sync_gaps (installation_id, kind, detected_at, detected_generation, expired_cursor, last_applied_at, last_observed_at)
+      values (p_installation_id, 'cursor_expired', clock_timestamp(), v_generation, coalesce(v_cursor, v_reset_from), v_last_applied,
+              (select max(o.observed_at) from public.idr_observations o where o.installation_id = p_installation_id))
+      on conflict (installation_id, kind) where resolved_at is null do nothing
+      returning id into v_id;
+  end if;
   update public.idr_sync_state
      set cursor = null, needs_resync = false, status = 'resync_requested',
+         reset_from_cursor = case when v_needs then null else reset_from_cursor end,
          resync_generation = resync_generation + 1,
          resync_requested_at = clock_timestamp(), updated_at = now()
    where installation_id = p_installation_id;
-  return jsonb_build_object('ok', true);
+  return jsonb_build_object('ok', true, 'gap_recorded', v_id is not null);
 end;
 $$;
 
@@ -518,6 +554,7 @@ as $$
     and (o.observed_at at time zone 'utc')::date between p_from and p_to;
 $$;
 
+revoke all on function public.idr_schema_version() from public, anon, authenticated;
 revoke all on function public.idr_get_sync_state(text) from public, anon, authenticated;
 revoke all on function public.idr_apply_feed_page(text, text, text, jsonb, text) from public, anon, authenticated;
 revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated;
@@ -527,6 +564,7 @@ revoke all on function public.idr_reconcile_counts(text, date, date) from public
 revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated;
 revoke all on function public.idr_resolve_sync_gaps(text, text) from public, anon, authenticated;
 revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
+grant execute on function public.idr_schema_version() to service_role;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;

@@ -65,7 +65,14 @@ export class PostgrestStore implements Store {
     if (cursor !== null && typeof cursor !== "string") throw new StoreError("bad_rpc_response");
     const resetFrom = r["reset_from_cursor"] ?? null;
     if (resetFrom !== null && typeof resetFrom !== "string") throw new StoreError("bad_rpc_response");
-    return { cursor: cursor ?? null, needsResync: r["needs_resync"] === true, gapOpen: r["gap_open"] === true, resetFromCursor: resetFrom };
+    const version = r["schema_version"];
+    return {
+      schemaVersion: typeof version === "number" && Number.isSafeInteger(version) ? version : null,
+      cursor: cursor ?? null,
+      needsResync: r["needs_resync"] === true,
+      gapOpen: r["gap_open"] === true,
+      resetFromCursor: resetFrom,
+    };
   }
 
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {

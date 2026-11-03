@@ -29,7 +29,15 @@ export interface FeedPage {
   hasMore: boolean;
 }
 
+/**
+ * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
+ * this code requires. The engine refuses to run against any other.
+ */
+export const PROJECTION_SCHEMA_VERSION = 3;
+
 export interface SyncState {
+  /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
+  schemaVersion: number | null;
   cursor: string | null;
   needsResync: boolean;
   /**
@@ -69,6 +77,7 @@ export type SyncStatus =
   | "contract_error"
   | "cursor_rejected"
   | "store_error"
+  | "schema_mismatch"
   | "reconcile_mismatch";
 
 export interface RecordStatusArgs {

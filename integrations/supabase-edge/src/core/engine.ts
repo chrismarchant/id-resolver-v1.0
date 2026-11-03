@@ -1,4 +1,4 @@
-import type { FeedPage, ReconcileOutcome, SyncConfig, SyncDeps, SyncResult, SyncStatus } from "./types.ts";
+import { PROJECTION_SCHEMA_VERSION, type FeedPage, type ReconcileOutcome, type SyncConfig, type SyncDeps, type SyncResult, type SyncStatus } from "./types.ts";
 import { parseFeedPage, parseSummary } from "./validate.ts";
 
 const MAX_BODY_CHARS = 8 * 1024 * 1024;
@@ -165,6 +165,14 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     state = await deps.store.getState();
   } catch {
     return finish("store_error");
+  }
+  // Code/SQL version skew (CHR-66 R2-6): a projection without the gap
+  // functions this code relies on could lose gap evidence. Refuse loudly,
+  // before any fetch, and write nothing (the old schema may not even accept
+  // this status).
+  if (state.schemaVersion !== PROJECTION_SCHEMA_VERSION) {
+    result.status = "schema_mismatch";
+    return result;
   }
   // A pending resync is an operator decision; never fetch, advance or skip.
   // Re-recording is idempotent and covers a gap whose record failed earlier.

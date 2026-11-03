@@ -41,6 +41,7 @@ const HTTP_BY_STATUS: Record<SyncStatus, number> = {
   contract_error: 502,
   cursor_rejected: 200,
   store_error: 500,
+  schema_mismatch: 500,
 };
 
 function json(body: unknown, status: number): Response {
@@ -103,6 +104,9 @@ export async function handleSyncRequest(req: Request, deps: HandlerDeps): Promis
       random: deps.random ?? Math.random,
     });
     deps.log?.(logLine(result));
+    if (result.status === "schema_mismatch") {
+      deps.log?.("schema mismatch: the projection SQL is not the version this function requires; re-run sql/0001_idr_projection.sql (nothing was fetched or written)");
+    }
     if (result.status === "needs_resync") {
       deps.log?.(
         result.gap?.recorded === true

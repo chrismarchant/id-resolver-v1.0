@@ -425,6 +425,36 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     expect((await runSync(testConfig(mock), testDeps(store))).status).toBe("ok");
   });
 
+  it("PG R2-6: recording fails once and the operator resyncs before the retry: exactly one gap row survives the resync (scenario E)", async () => {
+    await setupStalled(store);
+    let fail = true;
+    const flaky: Store = {
+      getState: () => store.getState(),
+      applyPage: (a) => store.applyPage(a),
+      recordStatus: (a) => store.recordStatus(a),
+      localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => store.resetCursor(c),
+      recordGap: async (a) => {
+        if (fail) {
+          fail = false;
+          throw new Error("rpc down");
+        }
+        return store.recordGap(a);
+      },
+      resolveGaps: (c) => store.resolveGaps(c),
+    };
+    const r1 = await runSync(testConfig(mock), testDeps(flaky));
+    expect(r1).toMatchObject({ status: "needs_resync", gap: { recorded: false } });
+    expect(await gapRows(pool)).toHaveLength(0); // only the needs_resync flag is durable
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION])); // the operator acts first
+    const gaps = await gapRows(pool);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: "c2" });
+    const r2 = await runSync(testConfig(mock), testDeps(store));
+    expect(r2).toMatchObject({ status: "ok", gapsResolved: 1 });
+    expect(await gapRows(pool)).toHaveLength(1);
+  });
+
   it("in-memory store: the same lifecycle (record once, survive the resync, resolve after the drain)", async () => {
     const mem = new MemoryStore();
     await setupStalled(mem);

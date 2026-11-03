@@ -163,6 +163,43 @@ describe("resolution", () => {
   });
 });
 
+describe("R2-6: begin_resync never clears needs_resync without a gap on record", () => {
+  const flagOnly = (cursor: string) =>
+    // What survives when idr_record_sync_gap failed but the status write succeeded.
+    svc("select public.idr_apply_feed_page($1, null, $2, '[]'::jsonb, null)", [INSTALLATION, cursor]).then(() =>
+      svc("select public.idr_record_sync_status($1, 'needs_resync', true)", [INSTALLATION]),
+    );
+
+  it("records the missing gap itself, bounded by the stored state, before clearing the flag; resolvable after the replay", async () => {
+    await flagOnly("c2");
+    expect(await gapRows(pool)).toHaveLength(0);
+    const r = (await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r;
+    expect(r).toEqual({ ok: true, gap_recorded: true });
+    const gaps = await gapRows(pool);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: "c2", detected_generation: 0, resolved_at: null });
+    expect((await pool.query("select needs_resync, cursor from public.idr_sync_state")).rows[0]).toEqual({ needs_resync: false, cursor: null });
+    await replay("c1");
+    expect(await resolveGaps()).toBe(1);
+  });
+
+  it("adds no second row when a gap is already open, and none when needs_resync is not set", async () => {
+    await recordGap();
+    expect((await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
+    expect(await gapRows(pool)).toHaveLength(1);
+    await replay("c1");
+    expect((await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
+    expect(await gapRows(pool)).toHaveLength(1);
+  });
+
+  it("idr_schema_version() reports the version the engine requires", async () => {
+    const { PROJECTION_SCHEMA_VERSION } = await import("../src/core/index.ts");
+    expect((await svc<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
+    const st = (await svc<{ s: { schema_version: number } }>("select public.idr_get_sync_state($1) as s", [INSTALLATION])).rows[0]!.s;
+    expect(st.schema_version).toBe(PROJECTION_SCHEMA_VERSION);
+  });
+});
+
 describe("append-only guard", () => {
   it("rejects DELETE, TRUNCATE, re-resolving and changing any other column, even for the table owner", async () => {
     await recordGap();

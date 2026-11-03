@@ -1,3 +1,4 @@
+import { PROJECTION_SCHEMA_VERSION } from "../../src/core/index.ts";
 import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapArgs, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
 
 export interface MemoryGap {
@@ -36,7 +37,7 @@ export class MemoryStore implements Store {
   }
 
   async getState(): Promise<SyncState> {
-    return { cursor: this.cursor, needsResync: this.needsResync, gapOpen: this.gaps.some((g) => g.resolvedAt === null), resetFromCursor: this.resetFromCursor };
+    return { schemaVersion: PROJECTION_SCHEMA_VERSION, cursor: this.cursor, needsResync: this.needsResync, gapOpen: this.gaps.some((g) => g.resolvedAt === null), resetFromCursor: this.resetFromCursor };
   }
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     if (a.expectedCursor !== this.cursor || a.expectedResetFrom !== this.resetFromCursor) return { applied: false, observations: 0, tombstones: 0 };
@@ -89,8 +90,20 @@ export class MemoryStore implements Store {
     }
     return n;
   }
-  /** The operator action (idr_begin_resync). */
+  /** The operator action (idr_begin_resync): records a missing gap first, like the SQL. */
   beginResync(): void {
+    if (this.needsResync && !this.gaps.some((g) => g.resolvedAt === null)) {
+      this.gaps.push({
+        id: this.gaps.length + 1,
+        kind: "cursor_expired",
+        detectedAt: this.now(),
+        detectedGeneration: this.resyncGeneration,
+        expiredCursor: this.cursor ?? this.resetFromCursor,
+        resolvedAt: null,
+        resolution: null,
+      });
+    }
+    if (this.needsResync) this.resetFromCursor = null;
     this.cursor = null;
     this.needsResync = false;
     this.status = "resync_requested";

@@ -126,13 +126,19 @@ export class PgStore implements Store {
 
   async getState(): Promise<SyncState> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ s: { cursor: string | null; needs_resync: boolean; gap_open?: boolean; reset_from_cursor?: string | null } }>(
+      c.query<{ s: { cursor: string | null; needs_resync: boolean; gap_open?: boolean; reset_from_cursor?: string | null; schema_version?: number } }>(
         "select public.idr_get_sync_state($1) as s",
         [this.installationId],
       ),
     );
     const s = r.rows[0]!.s;
-    return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: s.gap_open === true, resetFromCursor: s.reset_from_cursor ?? null };
+    return {
+      schemaVersion: typeof s.schema_version === "number" ? s.schema_version : null,
+      cursor: s.cursor,
+      needsResync: s.needs_resync,
+      gapOpen: s.gap_open === true,
+      resetFromCursor: s.reset_from_cursor ?? null,
+    };
   }
 
   async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
