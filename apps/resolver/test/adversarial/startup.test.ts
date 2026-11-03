@@ -149,6 +149,31 @@ describe("service startup refusals", () => {
     }
   });
 
+  it("G5R2-L3: refuses to start when the runtime role carries session defaults (e.g. set with a leaked credential), naming the reason", async () => {
+    const u = new URL(getTestDatabaseUrl());
+    u.username = TEST_RUNTIME_ROLE;
+    u.password = TEST_RUNTIME_PASSWORD;
+    const rt = createPool({ databaseUrl: u.toString(), ssl: "disable", max: 1 });
+    const owner = createPool({ databaseUrl: getTestDatabaseUrl(), ssl: "disable", max: 1 });
+    try {
+      await rt.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} SET default_transaction_read_only = on`);
+      const r = await runService(baseEnv());
+      expect(r.code).toBe(1);
+      expect(r.started).toBe(false);
+      expect(r.output).toContain("the runtime database role is not least-privilege (role_settings)");
+      expect(r.output).toContain("the migrate step resets them");
+      expectNoSecrets(r.output, getTestDatabaseUrl());
+      // The deploy pre-step (migrate) clears them; the service then starts.
+      await prodDb.provision();
+      const ok = await runService(baseEnv(), { stopAfterStart: true });
+      expect(ok.started, ok.output).toBe(true);
+    } finally {
+      await owner.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} RESET ALL`);
+      await rt.end();
+      await owner.end();
+    }
+  });
+
   it("a wrong runtime password fails with a hint naming the variables, never the value", async () => {
     const wrong = "f".repeat(40);
     const r = await runService(baseEnv({ DATABASE_RUNTIME_PASSWORD: wrong }));

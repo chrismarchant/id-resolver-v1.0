@@ -270,7 +270,13 @@ migration advisory lock, one transaction, on every run, only when
    object without an entry gets no privilege and is named in a warning;
    `test/integration/runtime-role.test.ts` fails while any object the
    migrations create has no entry;
-4. checks the result is least privilege (fails otherwise, e.g. CREATE on
+4. removes every session default stored on the role (`ALTER ROLE ...
+   RESET ALL`, for all databases and `IN DATABASE` this one). A role can set
+   its own defaults, so a leaked runtime credential could otherwise make every
+   later service session read-only (`default_transaction_read_only`) or
+   change its timeouts or durability (G5R2-L3); the service's session settings
+   live in code (`src/db/pool.ts`), never on the role;
+5. checks the result is least privilege (fails otherwise, e.g. CREATE on
    `public` granted to PUBLIC on PostgreSQL 14 and older).
 
 The owner needs CREATEROLE (or superuser, as on Railway) for step 1.
@@ -282,7 +288,12 @@ connection it opens after the migrate fails authentication.
 **Startup.** With `DATABASE_RUNTIME_PASSWORD` set the service logs in as the
 runtime role and checks its own login (`database_role_check`): it refuses to
 start (exit 1, naming the excess, e.g. `owns_objects`, `superuser`) if the
-login can do anything listed under "Not granted". A wrong password exits 1
+login can do anything listed under "Not granted", or if the role carries
+session defaults for all databases or this one (`role_settings`, set after
+the last migrate run, e.g. with a leaked credential; a redeploy runs the
+migrate step, which resets them). The runtime role can also change its own
+password: new connections then fail authentication until the next migrate
+run sets it again. A wrong password exits 1
 with `database authentication failed (28P01)` and a hint that the pre-deploy
 migrate must have run with the same value. Without `DATABASE_RUNTIME_PASSWORD`
 the service logs in as the owner: refused when `NODE_ENV=production` unless

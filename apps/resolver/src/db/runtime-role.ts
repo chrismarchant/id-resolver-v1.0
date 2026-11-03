@@ -29,8 +29,12 @@
  *     is reported by name; test/integration/runtime-role.test.ts fails while
  *     any object the migrations create has no entry.
  *
+ *   - removes every session default stored on the role (ALTER ROLE ... RESET
+ *     ALL, globally and IN DATABASE), which the role can set on itself.
+ *
  * The service checks its own login at startup (checkConnectedRolePrivileges)
- * and refuses to run as a privileged role when role separation is on.
+ * and refuses to run as a privileged role, or as one carrying session
+ * defaults, when role separation is on.
  */
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import type { QueryResult, QueryResultRow } from "pg";
@@ -204,6 +208,17 @@ export async function provisionRuntimeRole(query: Query, opts: { role: string; p
     verifier,
   ]);
   await query((ddl.rows[0] as { sql: string }).sql);
+  // G5R2-L3: session defaults set on the role (ALTER ROLE ... SET, also by the
+  // role itself with a leaked credential, e.g. default_transaction_read_only)
+  // would apply to every later service session. Remove them, globally and for
+  // this database; the service's session settings live in code (pool.ts).
+  const resets = await query<{ global: string; local: string }>(
+    "SELECT format('ALTER ROLE %I RESET ALL', $1::text) AS global, format('ALTER ROLE %I IN DATABASE %I RESET ALL', $1::text, current_database()) AS local",
+    [opts.role],
+  );
+  const reset = resets.rows[0] as { global: string; local: string };
+  await query(reset.global);
+  await query(reset.local);
 
   const objects = await query<{ name: string; kind: string }>(SCHEMA_OBJECTS_SQL);
   const unmapped = objects.rows
@@ -248,6 +263,7 @@ export async function provisionRuntimeRole(query: Query, opts: { role: string; p
 }
 
 interface PrivilegeRow {
+  has_role_settings: boolean;
   rolsuper: boolean;
   rolcreaterole: boolean;
   rolcreatedb: boolean;
@@ -270,6 +286,9 @@ function privilegeCheckSql(who: string, parameterPrivileges: boolean): string {
   return `
 SELECT r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
        EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid) AS has_memberships,
+       EXISTS (SELECT 1 FROM pg_db_role_setting s
+               WHERE s.setrole = r.oid
+                 AND s.setdatabase IN (0, (SELECT d.oid FROM pg_database d WHERE d.datname = current_database()))) AS has_role_settings,
        EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                WHERE n.nspname = 'public' AND pg_has_role(r.oid, c.relowner, 'MEMBER')) AS owns_objects,
        has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create_in_schema,
@@ -296,6 +315,8 @@ function privilegeReasons(row: PrivilegeRow | undefined): string[] {
   if (row.can_create_schema) out.push("create_schema");
   if (row.can_truncate_or_trigger) out.push("truncate_or_trigger");
   if (row.can_set_replication_role) out.push("set_session_replication_role");
+  // Session defaults stored on the role (ALTER ROLE ... SET), for all databases or this one (G5R2-L3).
+  if (row.has_role_settings) out.push("role_settings");
   return out;
 }
 

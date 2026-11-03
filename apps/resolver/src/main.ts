@@ -162,7 +162,8 @@ async function main(): Promise<void> {
 function startupFailureDetail(err: unknown): string {
   if (err instanceof ConfigError || err instanceof PendingMigrationsError) return err.message;
   if (err instanceof RuntimeRoleError) {
-    return `the runtime database role is not least-privilege (${err.reasons.join(", ")}): check DATABASE_RUNTIME_ROLE; it must be the role the migrate step provisions, never the owner`;
+    const settings = err.reasons.includes("role_settings") ? "; role_settings are session defaults stored on the role (ALTER ROLE ... SET): the migrate step resets them, so redeploy" : "";
+    return `the runtime database role is not least-privilege (${err.reasons.join(", ")}): check DATABASE_RUNTIME_ROLE; it must be the role the migrate step provisions, never the owner${settings}`;
   }
   if (err instanceof DbError && err.code === "28P01") {
     return "database authentication failed (28P01): if DATABASE_RUNTIME_PASSWORD is set, the pre-deploy migrate must have run with the same value (it sets the runtime role's password)";

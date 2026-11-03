@@ -270,6 +270,60 @@ describe("provisioning the runtime role (migrate step, as the owner)", () => {
     expect(scramSha256Verifier(TEST_RUNTIME_PASSWORD, salt)).toBe(scramSha256Verifier(TEST_RUNTIME_PASSWORD, salt));
   });
 
+  it("G5R2-L3: session defaults the runtime role set on itself are reported by the startup check and removed by provisioning", async () => {
+    const dbName = new URL(scratch.url).pathname.slice(1);
+    const rt = await runtimeClient(scratch.url);
+    try {
+      // What a leaked runtime credential can do: persistent defaults for every later session of the role.
+      await rt.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} SET default_transaction_read_only = on`);
+      await rt.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} SET synchronous_commit = off`);
+      await rt.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} IN DATABASE ${dbName} SET lock_timeout = '1ms'`);
+    } finally {
+      await rt.end();
+    }
+    try {
+      const tampered = createRuntimeDb({ databaseUrl: scratch.url, max: 1 });
+      try {
+        expect((await tampered.pool.query("SHOW default_transaction_read_only")).rows[0].default_transaction_read_only).toBe("on");
+        expect(await checkConnectedRolePrivileges(tampered.pool)).toEqual(["role_settings"]);
+      } finally {
+        await tampered.close();
+      }
+      // The next migrate run removes every setting of the role (global and for this database).
+      await provisionTestRuntimeRole(scratch.url);
+      const settings = await owner.query(
+        "SELECT count(*)::int AS n FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole WHERE r.rolname = $1",
+        [TEST_RUNTIME_ROLE],
+      );
+      expect(settings.rows[0].n).toBe(0);
+      const clean = createRuntimeDb({ databaseUrl: scratch.url, max: 1 });
+      try {
+        expect((await clean.pool.query("SHOW default_transaction_read_only")).rows[0].default_transaction_read_only).toBe("off");
+        expect(await checkConnectedRolePrivileges(clean.pool)).toEqual([]);
+        expect(await clean.events.record({ installationId: "inst-l3", websiteId: "site-l3", eventId: randomBytes(12).toString("base64url"), type: "page", name: "view", pageKey: "/l3", consent: "granted", occurredAt: new Date() })).toBe(true);
+      } finally {
+        await clean.close();
+      }
+    } finally {
+      // Never leave a cluster-wide setting behind for the other suites.
+      await owner.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} RESET ALL`);
+    }
+  });
+
+  it("G5R2-L3: a role setting for another database is not this database's concern (not reported)", async () => {
+    await owner.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} IN DATABASE postgres SET work_mem = '64kB'`);
+    try {
+      const rt = createRuntimeDb({ databaseUrl: scratch.url, max: 1 });
+      try {
+        expect(await checkConnectedRolePrivileges(rt.pool)).toEqual([]);
+      } finally {
+        await rt.close();
+      }
+    } finally {
+      await owner.query(`ALTER ROLE ${TEST_RUNTIME_ROLE} IN DATABASE postgres RESET ALL`);
+    }
+  });
+
   it("the startup self-check reports nothing for the runtime role and every excess privilege for the owner", async () => {
     const rt = createRuntimeDb({ databaseUrl: scratch.url, max: 1 });
     try {
