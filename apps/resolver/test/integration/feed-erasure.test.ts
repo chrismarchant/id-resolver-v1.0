@@ -235,7 +235,7 @@ describe("reporting feed: company erasure and tombstones", () => {
       cwd: ROOT,
       encoding: "utf8",
       timeout: 30_000,
-      env: { PATH: process.env["PATH"] ?? "", DATABASE_URL: getTestDatabaseUrl(), DATABASE_SSL: "disable", INSTALLATION_ID: "inst-test", WEBSITE_ID: "site-test" },
+      env: { PATH: process.env["PATH"] ?? "", NODE_ENV: "test", DATABASE_URL: getTestDatabaseUrl(), DATABASE_SSL: "disable", INSTALLATION_ID: "inst-test", WEBSITE_ID: "site-test" },
     });
     expect(run.status, run.stderr).toBe(0);
     expect(JSON.parse(run.stdout)).toEqual({ erased: true, company_id: x, tombstones: 1, observations_deleted: 1, refs_deleted: 0, stats_deleted: 0, cache_rows_deleted: 1 });

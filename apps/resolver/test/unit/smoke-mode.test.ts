@@ -21,6 +21,7 @@ import {
 } from "../../src/ops/smoke-mode.js";
 import type { SmokeTargetKind } from "../../src/ops/smoke-target.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
+import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
 
 const SERVICE_REQUIRED = {
   INSTALLATION_ID: "inst-test",
@@ -29,6 +30,8 @@ const SERVICE_REQUIRED = {
   IP_HMAC_SECRET: TEST_HMAC_SECRET,
   DATABASE_URL: "postgres://user:pw@db.invalid:5432/resolver",
   OBSERVATION_RETENTION_DAYS: "14",
+  // Production (the default NODE_ENV) requires the separate runtime role (Gate 5).
+  DATABASE_RUNTIME_PASSWORD: TEST_RUNTIME_PASSWORD,
 };
 
 describe("smoke documentation-range mode", () => {

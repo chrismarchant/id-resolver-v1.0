@@ -37,6 +37,8 @@ export class Resolver {
   baseEnv() {
     return {
       PATH: process.env["PATH"] ?? "",
+      // Local plaintext database: development (production refuses DATABASE_SSL=disable, also for migrate).
+      NODE_ENV: "development",
       DATABASE_URL: this.dbUrl,
       DATABASE_SSL: "disable",
       INSTALLATION_ID: this.o.installationId,

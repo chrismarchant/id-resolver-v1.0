@@ -1,27 +1,34 @@
 /**
  * PostgreSQL pool factory and error hygiene shared by every repository.
  *
- * SSL modes (DATABASE_SSL):
- *  - "require":   TLS with certificate verification (rejectUnauthorized: true).
- *  - "no-verify": TLS without certificate verification
- *                 (rejectUnauthorized: false). Railway's internal/proxied
- *                 Postgres commonly presents a certificate that does not
- *                 chain to a public CA, so this is often required there. The
- *                 connection is still encrypted, but not authenticated.
- *  - "disable":   plaintext. Local development and tests only.
+ * TLS (DATABASE_SSL: require | verify-pinned | no-verify | disable) is
+ * documented and implemented in tls.ts; every connection path (service pool,
+ * migrate, ops commands) goes through createPool, so all honour it.
  *
- * Any `sslmode=` in the connection string is stripped so DATABASE_SSL is the
- * single source of truth (node-postgres would otherwise let it override).
+ * Every TLS-related parameter in the connection string (`sslmode`, `ssl`,
+ * `sslrootcert`, `sslcert`, `sslkey`, `sslnegotiation`, `uselibpqcompat`, ...)
+ * is stripped so DATABASE_SSL is the single source of truth: node-postgres
+ * would otherwise let them override the explicit option (`?ssl=0` would turn
+ * TLS off, `?sslrootcert=` would read a file).
  */
 import pg from "pg";
 import type { Logger } from "../log/index.js";
+import { pgTlsOptions, type DbTlsInput } from "./tls.js";
 
 export type Pool = pg.Pool;
-export type SslMode = "require" | "disable" | "no-verify";
+export type { SslMode, DbTlsConfig, DbTlsInput } from "./tls.js";
+
+/** Login credentials that replace the user and password of the connection string (the runtime role). */
+export interface DbCredentials {
+  user: string;
+  password: string;
+}
 
 export interface CreatePoolOptions {
   databaseUrl: string;
-  ssl: SslMode;
+  ssl: DbTlsInput;
+  /** When set, connect as this role instead of the user in the URL (host, port and database stay). */
+  credentials?: DbCredentials;
   /** Small by default; the service sizes its single shared pool from MAX_CONCURRENT_JOBS. */
   max?: number;
   statementTimeoutMs?: number;
@@ -48,33 +55,57 @@ export const DEFAULT_STATEMENT_TIMEOUT_MS = 3_000;
  */
 export const QUERY_TIMEOUT_MARGIN_MS = 1_000;
 
-export function sslOption(mode: SslMode): false | { rejectUnauthorized: boolean } {
-  switch (mode) {
-    case "require":
-      return { rejectUnauthorized: true };
-    case "no-verify":
-      return { rejectUnauthorized: false };
-    case "disable":
-      return false;
-  }
-}
+const TLS_URL_PARAMS = new Set([
+  "ssl",
+  "sslmode",
+  "sslcert",
+  "sslkey",
+  "sslrootcert",
+  "sslcrl",
+  "sslpassword",
+  "sslnegotiation",
+  "sslcompression",
+  "sslsni",
+  "uselibpqcompat",
+]);
 
-/** Removes sslmode so DATABASE_SSL alone controls TLS. Never throws, never logs the URL. */
+/** Removes every TLS-related parameter so DATABASE_SSL alone controls TLS. Never throws, never logs the URL. */
 export function stripSslMode(databaseUrl: string): string {
   try {
     const u = new URL(databaseUrl);
-    if (!u.searchParams.has("sslmode")) return databaseUrl;
-    u.searchParams.delete("sslmode");
+    const drop = [...u.searchParams.keys()].filter((k) => TLS_URL_PARAMS.has(k.toLowerCase()));
+    if (drop.length === 0) return databaseUrl;
+    for (const k of drop) u.searchParams.delete(k);
     return u.toString();
   } catch {
     return databaseUrl;
   }
 }
 
+/**
+ * The connection string with its user and password replaced (the URL setters
+ * percent-encode; node-postgres decodes). Throws a DbError with a fixed code,
+ * never the URL, when the URL cannot be parsed.
+ */
+export function withCredentials(databaseUrl: string, credentials: DbCredentials): string {
+  let u: URL;
+  try {
+    u = new URL(databaseUrl);
+  } catch {
+    throw new DbError("INVALID_URL");
+  }
+  u.username = credentials.user;
+  u.password = credentials.password;
+  return u.toString();
+}
+
 export function createPool(opts: CreatePoolOptions): Pool {
+  const tls = pgTlsOptions(opts.ssl);
+  const url = opts.credentials ? withCredentials(opts.databaseUrl, opts.credentials) : opts.databaseUrl;
   const pool = new pg.Pool({
-    connectionString: stripSslMode(opts.databaseUrl),
-    ssl: sslOption(opts.ssl),
+    connectionString: stripSslMode(url),
+    ssl: tls.ssl,
+    ...(tls.stream ? { stream: tls.stream } : {}),
     max: opts.max ?? DEFAULT_POOL_MAX,
     statement_timeout: opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
     query_timeout: opts.queryTimeoutMs ?? (opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS) + QUERY_TIMEOUT_MARGIN_MS,

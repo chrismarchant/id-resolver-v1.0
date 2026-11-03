@@ -27,7 +27,7 @@ async function main(): Promise<void> {
   try {
     const { engage, reason } = parseArgs(process.argv.slice(2));
     const cfg = loadOpsConfig();
-    const db = createDb({ databaseUrl: cfg.DATABASE_URL, ssl: cfg.DATABASE_SSL, max: 1 });
+    const db = createDb({ databaseUrl: cfg.DATABASE_URL, ssl: cfg.DATABASE_TLS, max: 1 });
     try {
       await db.controls.setEnrichmentEnabled(cfg.INSTALLATION_ID, !engage, reason);
       const enabled = await db.controls.isEnrichmentEnabled(cfg.INSTALLATION_ID);

@@ -30,6 +30,13 @@ import type { Db } from "../../src/db/index.js";
 import { SMOKE_ENGAGE_REASON_PREFIX, SMOKE_RESTORE_REASON_PREFIX } from "../../src/ops/smoke-kill-switch.js";
 import { KILL_SWITCH_PROBE_PREFIX } from "../../src/ops/smoke-mode.js";
 import { createTestDb, getTestDatabaseUrl, resetTestDb } from "../helpers/db.js";
+import { startProductionDb } from "../helpers/prod-db.js";
+import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
+
+// Production posture for the service and the smoke runner: verified (pinned) TLS through the test terminator.
+const prodDb = await startProductionDb();
+await prodDb.provision();
+afterAll(() => prodDb.close());
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
 const INSTALLATION = "inst-test";
@@ -67,8 +74,7 @@ function serviceEnv(port: number, documentationRanges: "true" | "false"): Record
     RESOLVER_AUTH_TOKEN: WEBSITE_TOKEN,
     REPORTING_AUTH_TOKEN: REPORTING_TOKEN,
     IP_HMAC_SECRET: HMAC_SECRET,
-    DATABASE_URL: getTestDatabaseUrl(),
-    DATABASE_SSL: "disable",
+    ...prodDb.env(),
     PROVIDER_MODE: "mock",
     ALLOW_MOCK_PROVIDER: "true",
     ALLOW_DOCUMENTATION_RANGES: documentationRanges,
@@ -116,7 +122,7 @@ function runSmoke(env: Record<string, string>, onChild?: (child: ChildProcess) =
 /** Nothing secret, no configuration value and no address in anything the smoke writes. */
 function expectSecretFree(r: SmokeRun, base: string): void {
   const out = `${r.stdout}${r.stderr}`;
-  for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), base, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://"]) {
+  for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), prodDb.url(), prodDb.cert.sha256, TEST_RUNTIME_PASSWORD, base, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://"]) {
     expect(out.includes(needle), "smoke output leaked a value").toBe(false);
   }
   // JSON lines only on stdout.

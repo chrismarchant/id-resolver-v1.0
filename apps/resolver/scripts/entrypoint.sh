@@ -22,7 +22,7 @@ if [ "${NODE_DEBUG+set}" = "set" ]; then
 fi
 
 # V1: migrations are NOT applied at startup. They run as a separate deploy
-# pre-step (railway.json preDeployCommand: node dist/db/migrate.js), which is
+# pre-step (.railway/railway.ts preDeploy: node dist/db/migrate.js), which is
 # advisory-locked and fails the deployment if a migration fails. The service
 # itself refuses to start while the database has pending migrations.
 

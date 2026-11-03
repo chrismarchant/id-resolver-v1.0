@@ -10,14 +10,21 @@
  *   the applied set is re-read after the lock is taken, so a loser of the race
  *   sees the winner's work and does nothing.
  *
- * CLI: `npm run migrate` needs only DATABASE_URL (and optionally DATABASE_SSL,
- * default "require").
+ * CLI: `npm run migrate` / `node dist/db/migrate.js` needs DATABASE_URL (the
+ * owner) and follows the service's database TLS policy (DATABASE_SSL, default
+ * "require"; DATABASE_TLS_PIN_SHA256; DATABASE_CA_CERT; NODE_ENV=production,
+ * the default, refuses disable and unverified TLS). With
+ * DATABASE_RUNTIME_PASSWORD set it also provisions the runtime role
+ * DATABASE_RUNTIME_ROLE (default idr_runtime): see runtime-role.ts.
  */
 import { readdir, readFile } from "node:fs/promises";
 import type { QueryConfig, QueryResultRow } from "pg";
 import { pathToFileURL } from "node:url";
 import type { Logger } from "../log/index.js";
-import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from "./pool.js";
+import { ConfigError, ConfigSchema, databaseUrlUser, loadDatabaseTls } from "../config/index.js";
+import { createPool, DbError, guarded, toDbError, type Pool } from "./pool.js";
+import { provisionRuntimeRole, RuntimeRoleError, type ProvisionResult } from "./runtime-role.js";
+import type { DbTlsConfig } from "./tls.js";
 
 /** Arbitrary constant namespace for the migration advisory lock. */
 const MIGRATION_LOCK_KEY = "7262021001";
@@ -28,11 +35,19 @@ const MIGRATION_QUERY_TIMEOUT_MS = 125_000;
 export interface MigrateOptions {
   /** Directory containing *.sql files. Defaults to the repository's migrations/. */
   dir?: string | URL;
+  /**
+   * Role separation (src/db/runtime-role.ts): after the migrations, under the
+   * same advisory lock and in one transaction, create or update this login
+   * role and apply its exact grants. Absent = no role is touched.
+   */
+  runtimeRole?: { role: string; password: string };
 }
 
 export interface MigrateResult {
   applied: string[];
   alreadyApplied: string[];
+  /** Set when options.runtimeRole was given and provisioning committed. */
+  runtimeRole?: ProvisionResult;
 }
 
 function defaultDir(): URL {
@@ -124,7 +139,17 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
           }
           applied.push(name);
         }
-        return { applied, alreadyApplied };
+        if (!options.runtimeRole) return { applied, alreadyApplied };
+        let runtimeRole: ProvisionResult;
+        try {
+          await query("BEGIN");
+          runtimeRole = await provisionRuntimeRole(query, options.runtimeRole);
+          await query("COMMIT");
+        } catch (err) {
+          await query("ROLLBACK").catch(() => undefined);
+          throw err instanceof RuntimeRoleError ? err : toDbError(err);
+        }
+        return { applied, alreadyApplied, runtimeRole };
       } finally {
         await query("SELECT pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]).catch(() => undefined);
       }
@@ -137,6 +162,8 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
   });
 }
 
+const RuntimeRoleSchema = ConfigSchema.pick({ DATABASE_RUNTIME_ROLE: true, DATABASE_RUNTIME_PASSWORD: true });
+
 export class MigrationError extends DbError {
   readonly migration: string;
   constructor(migration: string, code: string) {
@@ -146,10 +173,18 @@ export class MigrationError extends DbError {
   }
 }
 
-function parseSsl(raw: string | undefined): SslMode {
-  const v = raw ?? "require";
-  if (v === "require" || v === "disable" || v === "no-verify") return v;
-  throw new Error("DATABASE_SSL must be one of: require, disable, no-verify");
+/** DATABASE_RUNTIME_ROLE / DATABASE_RUNTIME_PASSWORD, validated like the service does; undefined when the password is unset. */
+function loadRuntimeRole(env: NodeJS.ProcessEnv): { role: string; password: string } | undefined {
+  const parsed = RuntimeRoleSchema.safeParse(env);
+  if (!parsed.success) {
+    throw new ConfigError(`invalid configuration: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+  }
+  const { DATABASE_RUNTIME_ROLE: role, DATABASE_RUNTIME_PASSWORD: password } = parsed.data;
+  if (password === undefined) return undefined;
+  if (role === databaseUrlUser(env["DATABASE_URL"] ?? "")) {
+    throw new ConfigError("invalid configuration: DATABASE_RUNTIME_ROLE must differ from the DATABASE_URL user (the owner that runs migrations)");
+  }
+  return { role, password };
 }
 
 async function main(): Promise<void> {
@@ -159,24 +194,50 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  let ssl: SslMode;
+  let ssl: DbTlsConfig;
   try {
-    ssl = parseSsl(process.env["DATABASE_SSL"]);
+    const loaded = loadDatabaseTls(process.env);
+    for (const w of loaded.warnings) console.error(`migrate: ${w}`);
+    ssl = loaded.tls;
   } catch (e) {
-    console.error(`migrate: ${(e as Error).message}`);
+    // ConfigError messages name variables only, never values.
+    console.error(`migrate: ${e instanceof ConfigError ? e.message : "invalid configuration"}`);
     process.exitCode = 1;
     return;
   }
+  let runtimeRole: { role: string; password: string } | undefined;
+  try {
+    runtimeRole = loadRuntimeRole(process.env);
+  } catch (e) {
+    console.error(`migrate: ${e instanceof ConfigError ? e.message : "invalid configuration"}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!runtimeRole) {
+    console.error(
+      "migrate: runtime role not configured (DATABASE_RUNTIME_PASSWORD unset); the service refuses to start in production unless ALLOW_OWNER_DATABASE_ROLE=true",
+    );
+  }
   const pool = createPool({ databaseUrl, ssl, max: 1 });
   try {
-    const result = await applyMigrations(pool);
+    const result = await applyMigrations(pool, undefined, runtimeRole ? { runtimeRole } : {});
+    if (result.runtimeRole && result.runtimeRole.unmapped.length > 0) {
+      // Object names from this database's schema only; the runtime role holds no privilege on them.
+      console.error(`migrate: warning: no runtime grant decision for ${result.runtimeRole.unmapped.join(", ")} (the runtime role has no privilege on them)`);
+    }
     console.log(
-      JSON.stringify({ migrated: result.applied, already_applied: result.alreadyApplied.length }),
+      JSON.stringify({
+        migrated: result.applied,
+        already_applied: result.alreadyApplied.length,
+        runtime_role: result.runtimeRole ? (result.runtimeRole.created ? "created" : "updated") : "not_configured",
+      }),
     );
   } catch (err) {
-    const e = err instanceof MigrationError ? err : toDbError(err);
-    const where = e instanceof MigrationError ? ` in ${e.migration}` : "";
-    console.error(`migrate: failed${where} (${e.code})`);
+    const e = err instanceof MigrationError || err instanceof RuntimeRoleError ? err : toDbError(err);
+    const where = e instanceof MigrationError ? ` in ${e.migration}` : e instanceof RuntimeRoleError ? " provisioning the runtime role" : "";
+    // RuntimeRoleError reasons are fixed tokens or object names from this schema, never values.
+    const why = e instanceof RuntimeRoleError && e.reasons.length > 0 ? `: ${e.reasons.join(", ")}` : "";
+    console.error(`migrate: failed${where} (${e.code}${why})`);
     process.exitCode = 1;
   } finally {
     await pool.end().catch(() => undefined);

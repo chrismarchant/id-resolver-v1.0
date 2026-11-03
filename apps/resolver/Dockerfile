@@ -2,8 +2,9 @@
 # Two stages: the build stage compiles TypeScript with dev dependencies; the
 # runtime stage has production dependencies only. No secrets are copied in;
 # .env files are excluded by .dockerignore. Migrations are NOT run on start:
-# railway.json runs them as a separate preDeployCommand, and the service
-# refuses to start while the database has pending migrations.
+# the Railway service runs them as a separate pre-deploy command
+# (.railway/railway.ts), and the service refuses to start while the database
+# has pending migrations.
 # Single-process runtime (CHR-70): one Node process serves the API and runs
 # every resolution job; NODE_OPTIONS caps its heap.
 
