@@ -262,6 +262,8 @@ describe("page_key mapping cost is bounded (CHR-66 N6)", () => {
     "128-char x@ + dots + @ segments": (n) => ("/x@" + ".".repeat(124) + "@").repeat(Math.ceil(n / 128)),
     "128-char a@a@ segments": (n) => ("/" + "a@".repeat(64)).repeat(Math.ceil(n / 129)),
     "short digit segments": (n) => "/12345".repeat(Math.ceil(n / 6)),
+    "percent-encoded digit segments": (n) => ("/" + "%31".repeat(42)).repeat(Math.ceil(n / 127)),
+    "malformed escape segments": (n) => "/a%".repeat(Math.ceil(n / 3)),
   };
 
   function bestOf3Ms(fn: () => void): number {
@@ -441,5 +443,33 @@ describe("a site mapper never bypasses the default mapper (CHR-66 N3)", () => {
     expect(normalisePageKey("/orders/12345", composePageKeyMapper(templates))).toBe("/orders/:n");
     expect(normalisePageKey("/orders/12345", composePageKeyMapper(templates, false))).toBe("/orders/12345");
     expect(composePageKeyMapper(undefined)).toBe(defaultPageKeyMapper);
+  });
+});
+
+describe("percent-encoded segments are classified on their decoded form (CHR-66 R2-3)", () => {
+  it.each<[string, string]>([
+    ["/orders/%31%32%33%34%35", "/orders/:n"],
+    ["/orders/%31%32%33%34%35/invoice", "/orders/:n/invoice"],
+    ["/order-%31%32%33%34%35/details", "/:n/details"],
+    ["/orders/%31%32%33", "/orders/%31%32%33"],
+    ["/archive/%32%30%32%36", "/archive/%32%30%32%36"],
+    ["/blog/%68ello-world", "/blog/%68ello-world"],
+    ["/unsubscribe/person%40example.com", "/unsubscribe/:email"],
+    ["/reset/%39f86d081884c7d659a2feaa0c55ad015", "/reset/:token"],
+    // A segment that does not decode cleanly is not a readable slug.
+    ["/sale/100%-off", "/sale/:token"],
+    ["/x/%E0%A4%A", "/x/:token"],
+    ["/x/%FF", "/x/:token"],
+    // Plain digit runs keep the in-place rule.
+    ["/order-12345/details", "/order-:n/details"],
+  ])("%j -> %j", (input, expected) => {
+    expect(normalisePageKey(input, defaultPageKeyMapper)).toBe(expected);
+    expect(normalisePageKey(input, resolveConfig(baseOptions({ pageKeyMapper: compileRouteTemplates(["/blog/:slug/:id"]) })).pageKeyMapper)).toBe(expected);
+  });
+
+  it("the built entrance for an encoded order number carries the placeholder", () => {
+    const r = buildEntrance(reqWithIp("/orders/%31%32%33%34%35?x=1"), baseOptions());
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.payload.page_key).toBe("/orders/:n");
   });
 });

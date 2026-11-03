@@ -42,11 +42,12 @@ const TOKEN_CHARSET = /^[A-Za-z0-9_-]+$/;
 const SLUG_PART = /^(?:[a-z]+|[0-9]{1,4}|[a-z0-9]{1,4})$/;
 const YEAR = /^(?:19|20)[0-9]{2}$/;
 
-function decodeForClassification(segment: string): string {
+/** The percent-decoded segment, or null for a malformed escape (a lone `%`, invalid UTF-8). */
+function decodeForClassification(segment: string): string | null {
   try {
     return decodeURIComponent(segment);
   } catch {
-    return segment;
+    return null;
   }
 }
 
@@ -80,14 +81,22 @@ function isTokenLike(segment: string): boolean {
   return segment.split(/[-_]/).some((p) => p.length >= 12 && /[A-Za-z]/.test(p) && /[0-9]/.test(p));
 }
 
+const DIGIT_RUN = /[0-9]{4,}/g;
+const isIdDigits = (run: string): boolean => !YEAR.test(run);
+
 function mapSegment(segment: string): string {
   if (segment.length > SEGMENT_CLASSIFY_MAX) return ":token";
+  // Every rule judges the percent-decoded form (CHR-66 R2-3): `%31%32%33%34%35` is 12345.
+  // A segment that does not decode cleanly is not a readable slug.
   const decoded = decodeForClassification(segment);
+  if (decoded === null) return ":token";
   if (isEmailLike(decoded)) return ":email";
   if (UUID_SEGMENT.test(decoded)) return ":uuid";
   if (isTokenLike(decoded)) return ":token";
-  // Digit runs of 4+ are identifiers (order or account numbers); a plain year is kept.
-  return segment.replace(/[0-9]{4,}/g, (run) => (YEAR.test(run) ? run : ":n"));
+  // Digit runs of 4+ are identifiers (order or account numbers); a plain year is kept. Where
+  // decoding changed the segment the raw positions do not line up, so the whole segment is :n.
+  if (decoded !== segment) return (decoded.match(DIGIT_RUN) ?? []).some(isIdDigits) ? ":n" : segment;
+  return segment.replace(DIGIT_RUN, (run) => (isIdDigits(run) ? ":n" : run));
 }
 
 /**
