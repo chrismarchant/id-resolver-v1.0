@@ -29,9 +29,11 @@
  *     (readable, exact reporting-feed.v1 shape, no address) and "POST
  *     /v1/events answers exactly like an unknown route", plus the public edge.
  *     It sends nothing that resolves, writes nothing and reads no database,
- *     and every check holds for every build since Gate 3, so the current
- *     smoke can check a deployment rolled back to a build without migration
- *     0008 (docs/DEV_SMOKE.md).
+ *     even when pointed at a deployment that does serve POST /v1/events (its
+ *     probe body is refused there before anything is stored, and the check
+ *     fails), and every check holds for every build since Gate 3, so the
+ *     current smoke can check a deployment rolled back to a build without
+ *     migration 0008 (docs/DEV_SMOKE.md).
  *
  * Modes of the full suite, read from this process's environment with the
  * service's own parsers (src/ops/smoke-mode.ts); the target must run with the

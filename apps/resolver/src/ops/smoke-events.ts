@@ -27,7 +27,8 @@
  *     event page_key or event_id anywhere in it, this run's observation count
  *     unchanged) and the reporting-feed.v1 shape exactly.
  * Events disabled: POST /v1/events answers exactly like an unknown route
- * (404 with the website credential, 401 without), byte for byte.
+ * (404 with the website credential, 401 without), byte for byte, with a
+ * body that a live events route would refuse before storing.
  *
  * Side effects: two (three under EVENT_CONSENT_MODE=not_required) synthetic
  * browser_events rows with page_key /smoke/<run>/ev, pruned by retention like
@@ -315,10 +316,37 @@ async function databaseChecks(
 }
 
 /**
+ * The body the absent check sends. A route that does not exist never reads
+ * it (an unknown route is answered before its body is parsed in Gate 4 and
+ * later builds, and from the not-found handler in older ones), so the
+ * byte-for-byte comparison does not depend on it. A live events route,
+ * reached by mistake, must not store it (G5R1-L1): the contract is not
+ * event.v1, so the strict schema refuses it first (400), and its event_id
+ * breaks both the request pattern and the browser_events CHECK (0008), so
+ * nothing could store it even past the schema. 400 still differs from the
+ * 404 of an unknown route on every build that has the route, so the check
+ * fails loudly there.
+ */
+export function absentProbeBody(websiteId: string, run: string): Record<string, unknown> {
+  return {
+    contract: "event.v0",
+    website_id: websiteId,
+    event_id: "absent.check",
+    occurred_at: new Date().toISOString(),
+    type: "page_view",
+    name: "page_view",
+    page_key: eventPageKey(run),
+    consent: "granted",
+  };
+}
+
+/**
  * Events disabled: POST /v1/events must be indistinguishable from an unknown
  * route, with and without the website credential. `expectStatus` is 404 for
  * a Gate 4 or later build; a rollback target older than Gate 4 answers every
  * authenticated unknown route with 400 and passes `undefined` (any 4xx).
+ * It never stores an event, even on a target that serves the route
+ * (absentProbeBody).
  */
 export async function checkEventsAbsent(deps: {
   report: SmokeReport;
@@ -331,16 +359,7 @@ export async function checkEventsAbsent(deps: {
   names?: { withCredential: string; withoutCredential: string };
 }): Promise<void> {
   const names = deps.names ?? { withCredential: EV.disabled, withoutCredential: EV.disabledNoCredential };
-  const body = {
-    contract: "event.v1",
-    website_id: deps.websiteId,
-    event_id: newEventId(),
-    occurred_at: new Date().toISOString(),
-    type: "page_view",
-    name: "page_view",
-    page_key: eventPageKey(deps.run),
-    consent: "granted",
-  };
+  const body = absentProbeBody(deps.websiteId, deps.run);
   const compare = async (name: string, headers: Record<string, string>, status: number | undefined) => {
     const events = await deps.post("/v1/events", headers, body);
     const unknown = await deps.post(UNKNOWN_ROUTE, headers, body);
