@@ -632,7 +632,11 @@ describe("upgrade, re-run and rollback", () => {
     } finally {
       await rt0.close();
     }
-    await createFeedRetention(owner).pruneBefore(new Date(Date.now() - 30 * 86_400_000), 10);
+    // A plain DELETE (not the SKIP LOCKED retention batch): node-postgres reports the refused statement as soon as
+    // the error arrives, possibly before the server has finished aborting it, so its row lock can still be held and
+    // a SKIP LOCKED batch would skip the row. This DELETE waits for the lock instead; the trigger advances the watermark.
+    const deleted = await owner.query("DELETE FROM company_observations WHERE observed_at < $1", [new Date(Date.now() - 30 * 86_400_000)]);
+    expect(deleted.rowCount).toBe(1);
 
     const wm0008 = (await owner.query("SELECT pruned_through_id::text AS id FROM feed_retention_watermarks")).rows[0].id as string;
     expect(BigInt(wm0008)).toBeGreaterThan(BigInt(pruned.id));
