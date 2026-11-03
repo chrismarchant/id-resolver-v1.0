@@ -28,7 +28,32 @@ existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_s
 `idr_record_sync_gap` with new signatures, so re-run the SQL and redeploy the function together). It creates the
 projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
-execution to `service_role` only.
+execution to `service_role` only. The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
+transaction-safe): if any statement fails, nothing is applied and the previous version stays
+intact, even with `psql -f`, which by default continues after an error. `idr_schema_version()` is
+defined last, so it reports the new version only for a completely applied script. Apply it as one
+script (SQL editor or `psql -f`); with a migration runner that wraps each file in its own
+transaction, check how it treats the script's own `BEGIN`/`COMMIT` (not verified for
+`supabase db push`).
+
+**Before upgrading an existing project**, check its sync state:
+
+```sql
+select installation_id, cursor, needs_resync, status, last_applied_at
+  from public.idr_sync_state;
+select count(*) as open_gaps from public.idr_sync_gaps where resolved_at is null; -- if the table exists
+```
+
+- `cursor is null and last_applied_at is not null` on an install of an earlier release (no
+  `reset_from_cursor` column yet) means a reset or a resync is in flight. The earlier SQL never
+  stored the old position, so this upgrade cannot re-check it, and a prune past it would go
+  unreported. Let the function run until a run drains (`status = ok` or `cursor_rejected`) before
+  upgrading; if that is not possible, treat it as a potential gap: after the upgrade, run
+  `select public.idr_begin_resync('<installation-id>');` once and record the incident.
+- A gap that was open before the upgrade (even one already resynced) stays open, and keeps
+  alerting, until a resync requested after the upgrade has drained: the earlier SQL did not record
+  the generation the rules below rely on. If `open_gaps` is not 0, run `idr_begin_resync` once
+  after the upgrade.
 
 ## 2. Set secrets
 
@@ -116,7 +141,7 @@ used.
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
-| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. Only the milliseconds between that check and the first page remain unchecked | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
+| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. The first page after that check is sent at once and only once (no retry or backoff; any failure ends the run with the position kept, so the next run checks again); what remains unchecked is the interval between the resolver's check and that one request (plus, right after a 400, the one store write that keeps the position), each bounded by its timeout | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
 | `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 4 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |

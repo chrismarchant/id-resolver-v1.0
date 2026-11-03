@@ -47,6 +47,10 @@ export async function ensureProjection(pool: pg.Pool, sqlPath: string = SQL_PATH
     await c.query("grant execute on function auth.jwt() to anon, authenticated, service_role");
     await c.query("grant usage on schema public to anon, authenticated, service_role");
     await c.query(readFileSync(sqlPath, "utf8"));
+  } catch (e) {
+    // The script is one transaction: leave no aborted transaction on the pooled connection.
+    await c.query("rollback").catch(() => undefined);
+    throw e;
   } finally {
     c.release();
   }

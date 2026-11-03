@@ -734,6 +734,60 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
     expect((await counts(pool)).observations).toBe(5);
   });
 
+  it("R3-A: pending re-check passes, the first page from null fails once and retention prunes during what would have been the backoff: no retry, upstream_error, re-checked and recorded by the next run", async () => {
+    await resetButReplayFailed(); // reset_from_cursor = c2
+    mock.requests = [];
+    const deps = testDeps(store, { fetch: failFirstCursorless() }); // default policy: 5 retries with backoff
+    deps.sleep = async (ms: number) => {
+      deps.sleeps.push(ms);
+      mock.retentionFloor = 3; // a prune during a backoff would pass c2 (obs 3 never delivered)
+    };
+    const r = await runSync(cfg(), deps);
+    expect(r.status).toBe("upstream_error");
+    expect(deps.sleeps).toEqual([]); // the first replay page was not retried
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2"]); // re-check only; the 503 never reached the mock
+    expect(await resetFromCursor()).toBe("c2");
+    expect(await storedCursor(pool)).toBeNull();
+    mock.retentionFloor = 3; // retention runs before the next run
+    const next = await runSync(cfg(), testDeps(store));
+    expect(next).toMatchObject({ status: "needs_resync", gap: { recorded: true, newGap: true } });
+    expect((await gapRows(pool)).map((g) => g.expired_cursor)).toEqual(["c2"]);
+  });
+
+  it("R3-A: right after an in-loop 400 reset the first page is single-shot too; a prune before the next run becomes a recorded gap", async () => {
+    mock.items = [1, 2, 3, 4, 5].map((i) => obs(i, 7, D));
+    expect((await runSync(testConfig(mock, { maxPages: 1 }), testDeps(store))).status).toBe("partial");
+    mock.cursorPrefix = "k2"; // rotation: c2 now gets 400
+    const deps = testDeps(store, { fetch: failFirstCursorless() });
+    const r = await runSync(cfg(), deps);
+    expect(r.status).toBe("upstream_error");
+    expect(deps.sleeps).toEqual([]);
+    expect(await resetFromCursor()).toBe("c2");
+    const st = await pool.query("select status from public.idr_sync_state");
+    expect(st.rows[0]).toEqual({ status: "upstream_error" }); // no intermediate cursor_rejected write
+    mock.retentionFloor = 3;
+    const next = await runSync(cfg(), testDeps(store));
+    expect(next).toMatchObject({ status: "needs_resync", gap: { recorded: true } });
+  });
+
+  it("R3-A: once the first replay page is applied, the normal retry policy applies again", async () => {
+    await resetButReplayFailed();
+    let failed = false;
+    const failSecondPage = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (!failed && new URL(String(url)).searchParams.get("after") === "k2c2") {
+        failed = true;
+        return new Response("", { status: 503 });
+      }
+      return fetch(url, init);
+    }) as typeof fetch;
+    const deps = testDeps(store, { fetch: failSecondPage });
+    const r = await runSync(cfg(), deps);
+    expect(r.status).toBe("cursor_rejected");
+    expect(deps.sleeps).toHaveLength(1); // retried within the run
+    expect(await resetFromCursor()).toBeNull();
+    expect((await counts(pool)).observations).toBe(5);
+  });
+
   it("R2-5 SQL: the reset keeps the rejected cursor; apply is a compare-and-set on it and clears it atomically", async () => {
     await pool.query("insert into public.idr_sync_state (installation_id, cursor) values ($1, 'c7')", [INSTALLATION]);
     const svc = (sql: string, args: unknown[]) => asRole(pool, "service_role", (c) => c.query<{ r: { applied: boolean } }>(sql, args));

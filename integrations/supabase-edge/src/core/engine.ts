@@ -95,7 +95,13 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     return result;
   }
 
-  async function getJson(pathAndQuery: string, allow410: boolean, carriedCursor = false): Promise<Fetched> {
+  /**
+   * One resolver GET with the bounded in-run retry policy. `singleShot`
+   * disables the retry (any 429/5xx/network failure ends at once): used for
+   * the first page of a replay while a re-check is pending, so that nothing,
+   * in particular no backoff sleep, separates the check from that page.
+   */
+  async function getJson(pathAndQuery: string, allow410: boolean, carriedCursor = false, singleShot = false): Promise<Fetched> {
     const url = `${cfg.baseUrl.replace(/\/+$/, "")}${pathAndQuery}`;
     let attempt = 0;
     for (;;) {
@@ -153,7 +159,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
       // 429 / 5xx / network failure: bounded retry within the budget.
       const rateLimited = status === 429;
       const failStatus: SyncStatus = rateLimited ? "rate_limited" : "upstream_error";
-      if (attempt >= cfg.maxRetries) return { kind: "stop", status: failStatus };
+      if (singleShot || attempt >= cfg.maxRetries) return { kind: "stop", status: failStatus };
       const backoff = Math.min(cfg.maxDelayMs, cfg.baseDelayMs * 2 ** attempt);
       const jittered = Math.round(backoff / 2 + (deps.random() * backoff) / 2);
       const wait = rateLimited ? (parseRetryAfter(retryAfter, deps.now()) ?? jittered) : jittered;
@@ -232,7 +238,14 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   while (result.pages < cfg.maxPages) {
     if (deps.now() >= deadline) break;
     const q = `limit=${cfg.pageLimit}${cursor === null ? "" : `&after=${encodeURIComponent(cursor)}`}`;
-    const fetched = await getJson(`/v1/reporting/observations?${q}`, true, cursor !== null);
+    // CHR-66 R3-A: the first page from null while a re-check is pending (after
+    // a passed re-check, or right after an in-loop 400 reset) is single-shot.
+    // A retry with backoff would leave the old position unchecked for as long
+    // as the retries take, and a prune in that time would be silent. On any
+    // failure the run ends with reset_from_cursor still set; the next run
+    // re-checks first. Once that page is applied, normal retries resume.
+    const firstReplayPage = cursor === null && resetFrom !== null;
+    const fetched = await getJson(`/v1/reporting/observations?${q}`, true, cursor !== null, firstReplayPage);
     if (fetched.kind === "stop") {
       if (fetched.status === "partial") break;
       if (fetched.status === "cursor_rejected" && cursor !== null && !cursorReset) {
@@ -248,11 +261,8 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         cursorReset = true;
         resetFrom = cursor;
         cursor = null;
-        try {
-          await deps.store.recordStatus({ status: "cursor_rejected", needsResync: null });
-        } catch {
-          // best effort
-        }
+        // Straight to the first page (single-shot): no other work between the
+        // 400 and that request. The run's final status is recorded by finish().
         continue;
       }
       if (fetched.status === "cursor_rejected") return finish("contract_error");

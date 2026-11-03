@@ -180,10 +180,23 @@ UTC days inside the retained window.
 
   In short: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
   is behind the retention watermark, and otherwise `400` followed by a safe
-  replay. Known limit: the last `400` (or re-check) and the snapshot of the
-  first page from the start are two reads, so a retention run that passes the
-  rejected position in the milliseconds between them is not reported. Positions
-  are not secret, so answering from the claimed position leaks nothing.
+  replay. Known limit (precise, CHR-66 R3-A): the last check of the old
+  position (the `400`, or the re-check) and the first page from the start
+  are two requests, so a retention run that passes the position between the
+  resolver's watermark read for the check and its snapshot for that page is
+  not reported. The consumer must keep that interval to one request: the
+  reference engine sends the first page immediately and **once** (no retry, no
+  backoff; any failure ends the run with the position still kept, and the next
+  run checks again), and after an in-loop `400` the only other step in between
+  is the single store write that keeps the position. The interval is thus
+  bounded by that write and one request, each limited by its timeout
+  (`IDR_REQUEST_TIMEOUT_MS` for the request); normal retries resume only after
+  the first page is applied. A second run that reads the state inside the
+  interval sees the same window (R3-C): its `410` on the kept position is
+  superseded once the first page has been applied, and two runs holding the
+  same cursor across a prune can make the later one halt spuriously
+  (conservative). Positions are not secret, so answering from the claimed
+  position leaks nothing.
 
 ### Erasure and re-observation
 

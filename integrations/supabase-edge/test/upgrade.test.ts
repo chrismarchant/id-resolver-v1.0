@@ -4,13 +4,17 @@
  * existing row. Fixtures are verbatim copies of the script as released at
  * 6318ab2 (before the gap log) and f12b1ad (gap log, round 2).
  */
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { handleSyncRequest, PROJECTION_SCHEMA_VERSION, runSync } from "../src/core/index.ts";
 import { FakePostgrest, SERVICE_KEY } from "./helpers/fake-postgrest.ts";
 import { TOKEN } from "./helpers/mock-resolver.ts";
-import { INSTALLATION, PgStore, asRole, counts, ensureProjection, gapRows, newPool, resetDatabase, storedCursor } from "./helpers/db.ts";
+import { INSTALLATION, PgStore, SQL_PATH, TEST_DB_URL, asRole, counts, ensureProjection, gapRows, newPool, resetDatabase, storedCursor } from "./helpers/db.ts";
 import { MockResolver, obs } from "./helpers/mock-resolver.ts";
 import { testConfig, testDeps } from "./helpers/setup.ts";
 
@@ -157,3 +161,73 @@ describe.each(["6318ab2", "f12b1ad"] as const)("upgrade from the %s release", (v
     expect((await counts(pool)).observations).toBe(4);
   });
 });
+
+describe("R3-D: the script is atomic and reports its version last", () => {
+  const sql = () => readFileSync(SQL_PATH, "utf8");
+  /** Statements without comments, for structural checks. */
+  const code = () =>
+    sql()
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("--"))
+      .join("\n")
+      .trim();
+
+  it("runs in one transaction (begin; ... commit;), has no transaction-unsafe statement, and defines idr_schema_version() last", () => {
+    const c = code();
+    expect(c.startsWith("begin;")).toBe(true);
+    expect(c.endsWith("commit;")).toBe(true);
+    expect(c).not.toMatch(/\bconcurrently\b|\bvacuum\b|alter\s+system|create\s+database/i);
+    const defs = [...c.matchAll(/create or replace function (public\.[a-z_]+)\(/g)].map((m) => m[1]);
+    expect(defs[defs.length - 1]).toBe("public.idr_schema_version");
+  });
+
+  it("a failure late in the script leaves the earlier release fully intact: no version reported, old signatures and rows kept", async () => {
+    await installLegacy("f12b1ad");
+    await seedLegacyState("f12b1ad");
+    const before = await counts(pool);
+    const broken = sql().replace(/commit;\s*$/, "select 1 / 0;\ncommit;\n");
+    expect(broken).not.toBe(sql());
+    const c = await pool.connect();
+    try {
+      await expect(c.query(broken)).rejects.toThrow(/division by zero/);
+      await c.query("rollback");
+    } finally {
+      c.release();
+    }
+    const probe = await pool.query(
+      "select to_regprocedure('public.idr_schema_version()') as v, to_regprocedure('public.idr_record_sync_gap(text,text)') as old_gap, to_regprocedure('public.idr_record_sync_gap(text,text,text)') as new_gap",
+    );
+    expect(probe.rows[0]).toEqual({ v: null, old_gap: "idr_record_sync_gap(text,text)", new_gap: null });
+    const cols = await pool.query("select column_name from information_schema.columns where table_schema = 'public' and table_name = 'idr_sync_state' and column_name = 'reset_from_cursor'");
+    expect(cols.rowCount).toBe(0);
+    expect(await counts(pool)).toEqual(before);
+    // The current function refuses this install, as for any earlier release.
+    expect((await runSync(testConfig(mock), testDeps(new PgStore(pool)))).status).toBe("schema_mismatch");
+    // A clean re-run then upgrades it.
+    await ensureProjection(pool);
+    expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
+  });
+
+  const hasPsql = spawnSync("psql", ["--version"], { encoding: "utf8" }).status === 0;
+  it.skipIf(!hasPsql)("with psql's default (continue after an error, autocommit), a failure in the middle still applies nothing: no version 4, no new function", async () => {
+    await installLegacy("f12b1ad");
+    await seedLegacyState("f12b1ad");
+    const marker = "create or replace function public.idr_resolve_sync_gaps(";
+    expect(sql()).toContain(marker);
+    const broken = sql().replace(marker, `select 1 / 0;\n${marker}`);
+    const dir = mkdtempSync(join(tmpdir(), "idr-sql-"));
+    try {
+      const file = join(dir, "broken.sql");
+      writeFileSync(file, broken);
+      const r = spawnSync("psql", ["-X", "-q", "-d", TEST_DB_URL, "-f", file], { encoding: "utf8" });
+      expect(r.stderr).toMatch(/division by zero/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const probe = await pool.query(
+      "select to_regprocedure('public.idr_schema_version()') as v, to_regprocedure('public.idr_record_sync_gap(text,text)') as old_gap, to_regprocedure('public.idr_record_sync_gap(text,text,text)') as new_gap",
+    );
+    expect(probe.rows[0]).toEqual({ v: null, old_gap: "idr_record_sync_gap(text,text)", new_gap: null });
+  });
+});
+

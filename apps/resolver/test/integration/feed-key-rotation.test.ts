@@ -668,6 +668,47 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect(await projected()).toEqual([ids[0], ids[1]]); // obs 3 never arrived, and that is on record
   });
 
+  it("R3-A: the re-check passes, the first replay page fails, retention prunes in what would have been the retry backoff: no retry, and the next run records the gap", async () => {
+    const company = await createCompany(db.pool, "first-page.example");
+    const ids: string[] = [];
+    for (const d of [40, 35, 34]) ids.push((await insertObservation(db.pool, { companyId: company, observedAt: new Date(now - d * DAY) })).id);
+    for (let i = 0; i < 2; i++) ids.push((await insertObservation(db.pool, { companyId: company, observedAt: new Date(now - i * 60_000) })).id);
+    expect((await runSync(cfg(beforeUrl, { maxPages: 1 }), deps(store))).status).toBe("partial"); // obs 1, 2
+    const p = (await syncState())!.cursor;
+    expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 38), { batch: 100 })).deleted).toBe(1); // obs 1: P still within retention
+    const failCursorlessOnce = (): typeof fetch => {
+      let failed = false;
+      return (async (url: string | URL | Request, init?: RequestInit) => {
+        if (!failed && !new URL(String(url)).searchParams.has("after")) {
+          failed = true;
+          return new Response("", { status: 503 });
+        }
+        return fetch(url, init);
+      }) as typeof fetch;
+    };
+    expect((await runSync(cfg(afterUrl), { ...deps(store), fetch: failCursorlessOnce() })).status).toBe("upstream_error"); // 400 -> reset -> 503
+
+    // Next run: the re-check passes (400), the first page 503s; with retries, a prune during the backoff was silent.
+    const sleeps: number[] = [];
+    const r = await runSync(cfg(afterUrl, { maxRetries: 5 }), {
+      ...deps(store),
+      fetch: failCursorlessOnce(),
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        await retention.pruneAllBefore(retentionCutoff(new Date(now), 33), { batch: 100 });
+      },
+    });
+    expect(r.status).toBe("upstream_error");
+    expect(sleeps).toEqual([]);
+    expect((await projection.query("select reset_from_cursor from public.idr_sync_state")).rows[0]).toEqual({ reset_from_cursor: p });
+
+    expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 33), { batch: 100 })).deleted).toBe(2); // obs 2, 3: past P
+    const next = await runSync(cfg(afterUrl), deps(store));
+    expect(next).toMatchObject({ status: "needs_resync", gap: { recorded: true, newGap: true } });
+    expect((await gapRows(projection)).map((g) => g.expired_cursor)).toEqual([p]);
+    expect(await projected()).toEqual([ids[0], ids[1]]);
+  });
+
   it("voluntary resync from a position retention already passed: the next run re-checks it, records the gap, continues the replay and resolves it", async () => {
     const { old, fresh } = await seed();
     expect((await runSync(cfg(afterUrl, { maxPages: 1 }), deps(store))).status).toBe("partial"); // obs 1, 2
