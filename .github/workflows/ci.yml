@@ -48,13 +48,19 @@ jobs:
           /tmp/gitleaks git . --config .gitleaks.toml --redact --no-banner --exit-code 1
 
   verify:
-    name: typecheck and tests
+    name: typecheck and tests (PostgreSQL ${{ matrix.postgres }})
     needs: hygiene
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is the major version the Railway PostgreSQL template deploys; 16
+        # keeps the oldest supported major covered (the feed needs >= 13).
+        postgres: ["16", "18"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: resolver
           POSTGRES_PASSWORD: resolver
