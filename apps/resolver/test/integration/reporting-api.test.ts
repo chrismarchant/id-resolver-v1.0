@@ -108,8 +108,8 @@ describe("reporting API", () => {
         expect(noCred.statusCode).toBe(401);
         // The routes do not exist: the generic unknown-route answer, never data.
         const resolverCred = await bare.inject({ method: "GET", url: "/v1/reporting/companies", headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}` } });
-        expect(resolverCred.statusCode).toBe(400);
-        expect(resolverCred.json()).toEqual({ version: "1", error: "invalid_request" });
+        expect(resolverCred.statusCode).toBe(404);
+        expect(resolverCred.json()).toEqual({ version: "1", error: "not_found" });
         expect(resolverCred.body).not.toContain("example.com");
       } finally {
         await bare.close();

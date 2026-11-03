@@ -163,8 +163,8 @@ describe("black-box service process", () => {
     expect((await post(entrance(QUALIFIED_IP, { occurred_at: new Date(Date.now() - 600_000).toISOString() }))).status).toBe(400);
     // The removed V0.1 route does not exist, even with a valid credential.
     const legacy = await fetch(`${BASE}/v1/resolve`, { method: "POST", headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ website_id: "site-test", ip: QUALIFIED_IP }) });
-    expect(legacy.status).toBe(400);
-    expect(await legacy.json()).toEqual({ version: "1", error: "invalid_request" });
+    expect(legacy.status).toBe(404);
+    expect(await legacy.json()).toEqual({ version: "1", error: "not_found" });
     expect(mock.hits(QUALIFIED_IP)).toBe(hitsBefore);
   });
 

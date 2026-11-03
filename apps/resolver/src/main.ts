@@ -20,6 +20,7 @@ import { assertSchemaCurrent, PendingMigrationsError } from "./db/migrate.js";
 import { createFeedRetention } from "./db/retention.js";
 import { createProvider } from "./provider/index.js";
 import { buildServer } from "./api/server.js";
+import { EVENT_WRITES_MAX_IN_FLIGHT } from "./api/events.js";
 import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner.js";
 import { createMaintenance } from "./runtime/maintenance.js";
 import { installProcessGuards } from "./runtime/process-guards.js";
@@ -37,9 +38,13 @@ async function main(): Promise<void> {
     cap: Number(safe["PERIOD_CALL_CAP"]),
     status: String(safe["PROVIDER_MODE"]),
     ready: safe["REPORTING_ENABLED"] === true,
+    events_enabled: config.EVENTS_ENABLED,
+    event_consent_mode: config.EVENT_CONSENT_MODE,
   });
 
-  const db = createDb({ databaseUrl: config.DATABASE_URL, ssl: config.DATABASE_SSL, max: poolSizeFor(config.MAX_CONCURRENT_JOBS), logger });
+  // Browser-event writes (event.v1) get their own connections when enabled, so they never compete with resolution jobs.
+  const eventWriteSlots = config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0;
+  const db = createDb({ databaseUrl: config.DATABASE_URL, ssl: config.DATABASE_SSL, max: poolSizeFor(config.MAX_CONCURRENT_JOBS, eventWriteSlots), logger });
   // Migrations never run on start (they are the deploy pre-step). Fail closed
   // while this build's migrations are not all applied.
   const schema = await assertSchemaCurrent(db.pool, logger);
@@ -62,14 +67,18 @@ async function main(): Promise<void> {
     // a job still running there means the process state can no longer be trusted.
     onStuck: () => guards.fatal("job_stuck"),
   });
-  const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting });
+  const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting, events: db.events });
 
-  // Expired cache rows and observation retention (the bounded sync buffer, D3),
-  // drained in bounded batches within a per-run budget. Companies, scope stats,
-  // deduplication records and tombstones are never pruned. Started after listen.
+  // Expired cache rows, browser events and observation retention (the bounded
+  // sync buffer, D3), drained in bounded batches within a per-run budget.
+  // Companies, scope stats, deduplication records and tombstones are never
+  // pruned. Started after listen.
   const maintenance = createMaintenance({
     pruneExpiredCache: (limit) => db.cache.pruneExpired(limit),
     retention: createFeedRetention(db.pool, logger),
+    // Browser events (event.v1) share the observation window; pruned even while
+    // EVENTS_ENABLED=false, so rows from an earlier enabled period still age out.
+    pruneEventsBefore: (cutoff, limit) => db.events.pruneBefore(cutoff, limit),
     logger,
     batch: config.CACHE_PRUNE_BATCH,
     retentionDays: config.OBSERVATION_RETENTION_DAYS,

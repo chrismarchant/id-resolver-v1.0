@@ -100,6 +100,38 @@ describe("observation retention (owner decision D3): required, bounded, no defau
   });
 });
 
+describe("browser events (event.v1, CHR-64): off by default, consent required by default, fail closed", () => {
+  it("defaults: EVENTS_ENABLED=false and EVENT_CONSENT_MODE=required", () => {
+    const cfg = loadConfig(REQUIRED);
+    expect(cfg.EVENTS_ENABLED).toBe(false);
+    expect(cfg.EVENT_CONSENT_MODE).toBe("required");
+    expect(describeConfig(cfg)).toMatchObject({ EVENTS_ENABLED: false, EVENT_CONSENT_MODE: "required" });
+  });
+
+  it.each([
+    ["true", true],
+    ["1", true],
+    ["false", false],
+    ["0", false],
+  ])("EVENTS_ENABLED accepts %j", (value, enabled) => {
+    expect(loadConfig({ ...REQUIRED, EVENTS_ENABLED: value }).EVENTS_ENABLED).toBe(enabled);
+  });
+
+  it.each(["yes", "on", "TRUE", "", " true", "2", "enabled-sentinel-value"])("EVENTS_ENABLED refuses %j instead of guessing", (value) => {
+    const message = errorOf(() => loadConfig({ ...REQUIRED, EVENTS_ENABLED: value }));
+    expect(message).toContain("EVENTS_ENABLED");
+    expect(message).not.toContain("enabled-sentinel-value");
+  });
+
+  it.each(["required", "not_required"] as const)("EVENT_CONSENT_MODE accepts %s", (mode) => {
+    expect(loadConfig({ ...REQUIRED, EVENT_CONSENT_MODE: mode }).EVENT_CONSENT_MODE).toBe(mode);
+  });
+
+  it.each(["off", "none", "", "REQUIRED", "optional", "granted"])("EVENT_CONSENT_MODE refuses %j", (value) => {
+    expect(errorOf(() => loadConfig({ ...REQUIRED, EVENT_CONSENT_MODE: value }))).toContain("EVENT_CONSENT_MODE");
+  });
+});
+
 describe("mock provider in production", () => {
   it("is refused when NODE_ENV=production unless ALLOW_MOCK_PROVIDER=true", () => {
     expect(errorOf(() => loadConfig({ ...REQUIRED, NODE_ENV: "production", PROVIDER_MODE: "mock" }))).toContain("ALLOW_MOCK_PROVIDER");

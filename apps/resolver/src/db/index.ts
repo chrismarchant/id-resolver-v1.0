@@ -6,11 +6,13 @@ import type {
   ReportingRepository,
   UsageRepository,
 } from "../contracts/db.js";
+import type { EventRepository } from "../contracts/event.js";
 import type { Logger } from "../log/index.js";
 import { createActivityRepository } from "./activity-repo.js";
 import { createCacheRepository } from "./cache-repo.js";
 import { createCompanyRepository } from "./company-repo.js";
 import { createControlsRepository } from "./controls-repo.js";
+import { createEventRepository } from "./event-repo.js";
 import { createPool, type Pool, type SslMode } from "./pool.js";
 import { createReportingRepository } from "./reporting-repo.js";
 import { createUsageRepository } from "./usage-repo.js";
@@ -25,6 +27,8 @@ export interface Db {
   companies: CompanyRepository;
   activity: ActivityRepository;
   reporting: ReportingRepository;
+  /** Browser events (event.v1): statements on browser_events only. */
+  events: EventRepository;
   /** SELECT 1 with a 1 s timeout; false on any error. */
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -45,6 +49,7 @@ export function createDb(opts: { databaseUrl: string; ssl: SslMode; max?: number
     companies: createCompanyRepository(pool, logger),
     activity: createActivityRepository(pool, logger),
     reporting: createReportingRepository(pool, logger),
+    events: createEventRepository(pool, logger),
     async ping() {
       let timer: NodeJS.Timeout | undefined;
       try {

@@ -13,6 +13,7 @@ import { RunnerOverloadedError, RunnerStoppedError, type ResolutionJob, type Res
 import { createMemoryLogger } from "../../src/log/index.js";
 import type { PipelineDeps } from "../../src/resolution/pipeline.js";
 import { buildPipelineConfig, createRunner, poolSizeFor, sanitiseOutcome, type JobExecutor } from "../../src/runtime/runner.js";
+import { EVENT_WRITES_MAX_IN_FLIGHT } from "../../src/api/events.js";
 import { createFakeRepositories } from "../helpers/fakes.js";
 import { createMockProvider } from "../../src/provider/mock.js";
 
@@ -269,6 +270,11 @@ describe("buildPipelineConfig", () => {
   it("sizes the shared pool like the V0.1 worst case (two per job slot plus four)", () => {
     expect(poolSizeFor(8)).toBe(20);
     expect(poolSizeFor(1)).toBe(6);
+  });
+
+  it("adds one connection per in-flight browser-event write only when events are enabled (event.v1)", () => {
+    expect(poolSizeFor(8, EVENT_WRITES_MAX_IN_FLIGHT)).toBe(20 + EVENT_WRITES_MAX_IN_FLIGHT);
+    expect(poolSizeFor(8, 0)).toBe(20);
   });
 });
 

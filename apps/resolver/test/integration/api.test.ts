@@ -423,8 +423,8 @@ describe("resolver API: POST /v1/entrances", () => {
   it("the V0.1 POST /v1/resolve route no longer exists", async () => {
     const before = runner.jobs.length;
     const r = await app.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
-    expect([400, 404]).toContain(r.statusCode);
-    expect(r.json()).toEqual({ version: "1", error: "invalid_request" });
+    expect(r.statusCode).toBe(404);
+    expect(r.json()).toEqual({ version: "1", error: "not_found" });
     expect(r.body).not.toContain("company");
     expect(runner.jobs.length).toBe(before);
   });
@@ -477,10 +477,25 @@ describe("resolver API: POST /v1/entrances", () => {
     }
   });
 
-  it("rejects unknown routes and methods generically", async () => {
-    const r = await app.inject({ method: "GET", url: ROUTE, headers: auth });
-    expect([400, 404]).toContain(r.statusCode);
-    const r2 = await app.inject({ method: "GET", url: "/admin", headers: auth });
-    expect(r2.statusCode).toBe(400);
+  it("rejects unknown routes and methods generically: 404 not_found with the credential, 401 without (event.v1 section 2)", async () => {
+    const before = runner.jobs.length;
+    const answers: Array<{ status: number; body: string }> = [];
+    for (const [method, url] of [["GET", ROUTE], ["GET", "/admin"], ["POST", "/v1/unknown"], ["DELETE", ROUTE], ["GET", "/v1/reporting/companies"]] as const) {
+      const r = await app.inject({ method, url, headers: auth });
+      expect(r.statusCode, `${method} ${url}`).toBe(404);
+      expect(r.json(), `${method} ${url}`).toEqual({ version: "1", error: "not_found" });
+      expect(r.headers["cache-control"]).toBe("no-store");
+      answers.push({ status: r.statusCode, body: r.body });
+      const bare = await app.inject({ method, url });
+      expect(bare.statusCode, `${method} ${url} without credential`).toBe(401);
+    }
+    // The body is never parsed for an unknown route: an unparseable or oversized one still gets 404, not 400 or 413.
+    for (const payload of ["{not json", "x".repeat(4_096)]) {
+      const r = await app.inject({ method: "POST", url: "/v1/unknown", headers: auth, payload });
+      answers.push({ status: r.statusCode, body: r.body });
+    }
+    // Every unknown route answers byte-for-byte the same: nothing tells an unregistered route from one that never existed.
+    expect(new Set(answers.map((a) => `${a.status} ${a.body}`))).toEqual(new Set(['404 {"version":"1","error":"not_found"}']));
+    expect(runner.jobs.length).toBe(before);
   });
 });
