@@ -17,6 +17,8 @@
  *     rows exist, nothing else is written; a response that gains a field or
  *     an address, a D4 violation written by the event insert, a consent
  *     policy that differs, or a target with events off all FAIL (exit 1);
+ *   - EVENT_CONSENT_MODE=not_required on both sides: the not_required event
+ *     is stored as asserted (three rows);
  *   - disabled: POST /v1/events is byte-identical to an unknown route;
  *   - `--mode rollback-check` passes against a target without the route,
  *     writes nothing, and fails against a target that has it.
@@ -91,7 +93,7 @@ interface SmokeRun {
   stderr: string;
 }
 
-function serviceEnv(port: number, opts: { docs: "true" | "false"; events: "true" | "false" }): Record<string, string> {
+function serviceEnv(port: number, opts: { docs: "true" | "false"; events: "true" | "false"; consent?: "required" | "not_required" }): Record<string, string> {
   return {
     PATH: process.env["PATH"] ?? "",
     NODE_ENV: "production",
@@ -109,6 +111,7 @@ function serviceEnv(port: number, opts: { docs: "true" | "false"; events: "true"
     ALLOW_MOCK_PROVIDER: "true",
     ALLOW_DOCUMENTATION_RANGES: opts.docs,
     EVENTS_ENABLED: opts.events,
+    ...(opts.consent ? { EVENT_CONSENT_MODE: opts.consent } : {}),
     OBSERVATION_RETENTION_DAYS: "30",
     // Each smoke run sends 7 requests without a valid credential; this file runs more than 8 a minute from one peer.
     AUTH_FAILURE_LIMIT_PER_MINUTE: "100000",
@@ -524,5 +527,33 @@ describe("smoke against the real service: documentation ranges and events disabl
       "public edge checks",
     ]);
     expect(await counts()).toEqual(before);
+  });
+});
+
+describe("smoke against the real service: events enabled under EVENT_CONSENT_MODE=not_required, documentation ranges disabled", () => {
+  const port = 21_000 + Math.floor(Math.random() * 500);
+  const base = `http://127.0.0.1:${port}`;
+  const env = serviceEnv(port, { docs: "false", events: "true", consent: "not_required" });
+  let service: { proc: ChildProcess; output: () => string };
+  let db: Db;
+
+  beforeAll(async () => {
+    db = await createTestDb();
+    await resetTestDb(db);
+    service = await startService(env);
+  });
+  afterAll(async () => {
+    service?.proc.kill("SIGKILL");
+    await db.close();
+  });
+
+  it("the not_required event is accepted and stored as asserted: three rows, every events check passes (exit 0)", async () => {
+    const r = await runSmoke({ ...env, SMOKE_BASE_URL: base });
+    expect(r.code, r.stdout + r.stderr).toBe(0);
+    expect(r.summary).toMatchObject({ mode: "documentation_ranges_disabled", events_mode: "events_enabled", event_consent_mode: "not_required", events_phase: "run", checks: 48, passed: 35, failed: 0, skipped: 13 });
+    expect(check(r, "events: consent not_required under EVENT_CONSENT_MODE=not_required -> 200 recorded:true")).toMatchObject({ outcome: "pass", detail: "status 200 recorded=true" });
+    expect(check(r, "events db: browser_events holds exactly this run's accepted events")).toMatchObject({ outcome: "pass", detail: "rows 3, expected 3" });
+    const rows = (await db.pool.query<{ consent: string }>("SELECT consent FROM browser_events WHERE page_key = $1 ORDER BY id", [`/smoke/${String(r.summary?.["run"])}/ev`])).rows;
+    expect(rows.map((x) => x.consent)).toEqual(["granted", "granted", "not_required"]);
   });
 });
