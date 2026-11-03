@@ -9,6 +9,7 @@
 !**/.env.example
 docs
 scripts
+.railway
 **/*.md
 apps/resolver/test
 # Other workspaces: keep only their package.json so `npm ci -w` can validate the lockfile.

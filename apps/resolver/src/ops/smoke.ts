@@ -574,7 +574,7 @@ async function main(): Promise<number> {
       return 2;
     }
   }
-  const pool = ops ? createPool({ databaseUrl: ops.DATABASE_URL, ssl: ops.DATABASE_SSL, max: 2 }) : undefined;
+  const pool = ops ? createPool({ databaseUrl: ops.DATABASE_URL, ssl: ops.DATABASE_TLS, max: 2 }) : undefined;
   try {
     return await fullSuite(ctx, ops, pool);
   } finally {

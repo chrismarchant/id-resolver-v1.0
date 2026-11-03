@@ -83,6 +83,7 @@ export class PostgrestStore implements Store {
         p_next_cursor: a.nextCursor,
         p_items: a.items,
         p_expected_reset_from: a.expectedResetFrom,
+        p_drained: a.drained,
       }),
     );
     if (r["applied"] !== true) return { applied: false, observations: 0, tombstones: 0 };

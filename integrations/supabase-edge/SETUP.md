@@ -21,20 +21,76 @@ causation.
 
 ## 1. Apply the SQL
 
-Run `sql/0001_idr_projection.sql` against the project (SQL editor or `supabase db push`
-after copying it into `supabase/migrations/`). It is idempotent (re-run it to upgrade an
+Run `sql/0001_idr_projection.sql` against the project (see "How to apply it" below). It is idempotent (re-run it to upgrade an
 existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_state` columns
-`resync_requested_at` and `reset_from_cursor`, and replaces `idr_apply_feed_page` and
-`idr_record_sync_gap` with new signatures, so re-run the SQL and redeploy the function together). It creates the
+`resync_requested_at`, `reset_from_cursor` and `drained_generation`, and replaces `idr_apply_feed_page`
+(now with a sixth argument, `p_drained`) and `idr_record_sync_gap` with new signatures, so re-run the
+SQL and redeploy the function together; until both are done the function answers `schema_mismatch`
+and writes nothing). It creates the
 projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
-execution to `service_role` only. The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
-transaction-safe): if any statement fails, nothing is applied and the previous version stays
-intact, even with `psql -f`, which by default continues after an error. `idr_schema_version()` is
-defined last, so it reports the new version only for a completely applied script. Apply it as one
-script (SQL editor or `psql -f`); with a migration runner that wraps each file in its own
-transaction, check how it treats the script's own `BEGIN`/`COMMIT` (not verified for
-`supabase db push`).
+execution to `service_role` only. Privileges are exact (CHR-66 G4-L4): Supabase's default privileges grant
+`ALL` on every new table, view, sequence and function in `public` to `anon`, `authenticated` and
+`service_role`, so the script first revokes everything from those roles (and `PUBLIC`) on each `idr_*`
+object, then grants only this:
+
+| role | `idr_companies`, `idr_observations`, `idr_tombstones`, `idr_sync_state` | `idr_sync_gaps` | `idr_daily_company_activity` (view) | `idr_*` functions |
+| --- | --- | --- | --- | --- |
+| `anon` | nothing | nothing | nothing | nothing |
+| `authenticated` | `SELECT` (rows only with the `idr_reader` claim) | `SELECT` (claim) | `SELECT` | nothing |
+| `service_role` | `SELECT` | `SELECT` | `SELECT` | `EXECUTE` (not on the trigger function `idr_sync_gaps_guard`) |
+
+`service_role` writes **only through the functions** (CHR-66 R2-8). The six that write
+(`idr_apply_feed_page`, `idr_record_sync_status`, `idr_reset_cursor`, `idr_begin_resync`,
+`idr_record_sync_gap`, `idr_resolve_sync_gaps`) are `SECURITY DEFINER`: they run as the owner of the
+tables (the role that applied the script), with an empty `search_path`, no dynamic SQL and
+validated arguments, and only `service_role` may execute them. So a holder of the service-role key
+cannot insert a gap row, mark one resolved, or change `needs_resync`, the generations,
+`reset_from_*` or `drained_generation` directly; the state machine described under "`needs_resync`
+and `idr_sync_gaps`" is the only way. A change by hand (for example deleting projection rows) must
+be made as the owner in the SQL editor; remember that a replay may restore rows the feed still
+holds.
+
+No role but the owner keeps `TRUNCATE`, `REFERENCES`, `TRIGGER` or `MAINTAIN` on any `idr_*` table, write
+access to the view, or any privilege on the `idr_sync_gaps` id sequence (an identity column needs none).
+Re-running the script on an existing project removes those privileges there too.
+
+### How to apply it
+
+The script is **one statement**: a single `DO` block with no `BEGIN`, `COMMIT` or other
+transaction control of its own (every statement inside it is transaction-safe). One statement is
+atomic however it is sent: if anything in it fails, nothing is applied and the previous version
+stays intact. `idr_schema_version()` is defined last as well, so it reports the new version only
+for a completely applied script. Supported methods:
+
+1. **psql** (recommended for a manual apply):
+   `psql -X -v ON_ERROR_STOP=1 --single-transaction -d "<connection string>" -f sql/0001_idr_projection.sql`.
+   `ON_ERROR_STOP=1` makes psql exit with code 3 on an error; without it psql still prints the
+   error but exits 0. `--single-transaction` is harmless (the script never opens or ends a
+   transaction itself). Plain `psql -f` is also atomic.
+2. **SQL editor**: paste the whole file and run it once.
+3. **Migration runners that wrap each file in their own transaction** (for example
+   `supabase migration up` / `supabase db push` after copying the file unchanged into
+   `supabase/migrations/`): the statement runs inside the runner's transaction, so it is applied,
+   or rolled back, together with the runner's own bookkeeping.
+
+> **Warning about wrapping runners.** Releases before Gate 5 (schema 4 and earlier) wrapped the
+> script in their own `BEGIN` … `COMMIT`. Under a runner that wraps the file in a transaction,
+> that `COMMIT` ended the **runner's** transaction early: what the runner had done before the
+> file was committed with it, and what it did afterwards (such as recording the migration) ran
+> outside any transaction. The current script has no transaction control, so this cannot happen.
+> Do **not** add `BEGIN`/`COMMIT` around or inside it, and do not split it into several files or
+> statements. A tool that splits SQL on semicolons without understanding dollar quoting cannot
+> run it (nor any earlier release, whose function bodies are dollar-quoted too).
+
+Verified locally on PostgreSQL 16 (`test/upgrade.test.ts`): plain `psql -f` and the psql command
+above, each twice; that command with a failure injected (exit 3, nothing applied); and a simulated
+runner (`BEGIN`, a bookkeeping table, the file, a bookkeeping row, then `ROLLBACK` or `COMMIT`):
+the rollback undoes the script and the bookkeeping, the commit keeps both. **Not verified:** the
+Supabase CLI's own runner (`supabase migration up` / `db push`) was not run against this script,
+so how it wraps a file is not confirmed here; and nothing was applied to a hosted Supabase project
+(neither its SQL editor nor its PostgreSQL 17). A single statement is atomic in every case above,
+which is why the script has this form.
 
 **Before upgrading an existing project**, check its sync state:
 
@@ -53,7 +109,9 @@ select count(*) as open_gaps from public.idr_sync_gaps where resolved_at is null
 - A gap that was open before the upgrade (even one already resynced) stays open, and keeps
   alerting, until a resync requested after the upgrade has drained: the earlier SQL did not record
   the generation the rules below rely on. If `open_gaps` is not 0, run `idr_begin_resync` once
-  after the upgrade.
+  after the upgrade. (From schema 4 or 5, which do record generations, a gap whose resync was
+  already requested resolves without that step: the first run after the upgrade that reaches the
+  end of the feed records the drain, `drained_generation`, and resolves it.)
 
 ## 2. Set secrets
 
@@ -105,7 +163,7 @@ Follow `sql/schedule.example.sql`: store `idr_sync_url` and `idr_sync_secret` in
 3. `select * from public.idr_daily_company_activity order by day desc limit 10;`
 4. Optional: set `IDR_RECONCILE_DAYS=3`; status `reconcile_mismatch` means the projection
    disagrees with the resolver's `/v1/reporting/summary` for those days (see troubleshooting).
-5. A signed-in user WITH the `idr_reader` claim can read the tables; a signed-in user without it, and `anon`, see nothing; nobody but `service_role` can write.
+5. A signed-in user WITH the `idr_reader` claim can read the tables; a signed-in user without it, and `anon`, see nothing; nothing writes except the `idr_*` functions, which only `service_role` may call.
 
 ### Who may read the projection
 
@@ -143,7 +201,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. The first page after that check is sent at once and only once (no retry or backoff; any failure ends the run with the position kept, so the next run checks again); what remains unchecked is the interval between the resolver's check and that one request (plus, right after a 400, the one store write that keeps the position), each bounded by its timeout | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
-| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 4 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 6 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 
@@ -169,14 +227,18 @@ to run (`schema_mismatch`) unless the installed SQL is the version it requires.
 2. Accept that observations pruned from the resolver buffer in the gap cannot be recovered
    from it. The existing projection is kept (the client owns commercial-history retention).
 3. Restart from the start of the retained buffer:
-   `select public.idr_begin_resync('<installation-id>');` (run as `service_role`, e.g. in the SQL editor).
+   `select public.idr_begin_resync('<installation-id>');` (in the SQL editor, or as `service_role`).
    Replays are idempotent, so overlap with data already stored is harmless.
 4. Let the function run until a run drains the buffer (`status = ok`). That run sets
    `resolved_at` and `resolution = 'full_resync'` on the open gap and reports `"gaps_resolved": 1`.
    Only a replay that started after the resync request can resolve a gap: resyncs, gaps and
    replays are ordered by a generation number under the state row lock (`resync_generation`,
    `detected_generation`, `replay_generation`), not by timestamps, so a gap detected while a
-   replay is running stays open until the next resync.
+   replay is running stays open until the next resync. And only once that replay has **drained**
+   (CHR-66 R2-8): `idr_apply_feed_page` records `drained_generation` in the same transaction as
+   the replay's final page (the feed's `has_more = false`), and `idr_resolve_sync_gaps` resolves
+   nothing until `drained_generation = replay_generation`. Calling the resolve function by hand
+   before then changes nothing.
    **`resolved_at` marks the rebuild from what the resolver still retains, NOT a recovery:**
    observations pruned before the resync are permanently absent from the projection, and the
    row stays as the permanent record of the gap (rows are never deleted; `resolved_at` is set
@@ -191,8 +253,17 @@ to run (`schema_mismatch`) unless the installed SQL is the version it requires.
   `select id, detected_at, last_applied_at from public.idr_sync_gaps where resolved_at is null;`
 - Also alert on `status = 'needs_resync'` in `idr_sync_state`, on HTTP `409` from the function,
   and on a run that reports `"gap_recorded": false`.
-- Readers with the `idr_reader` claim can see the gap log (same RLS as the other tables); only
-  `service_role` can write it, through `idr_record_sync_gap` and `idr_resolve_sync_gaps`.
+- Readers with the `idr_reader` claim can see the gap log (same RLS as the other tables). Nobody
+  writes it directly: only the `SECURITY DEFINER` functions `idr_record_sync_gap`,
+  `idr_begin_resync` and `idr_resolve_sync_gaps` (executable by `service_role` only) insert or
+  resolve rows, and the guard trigger refuses a row inserted already resolved, any change but
+  the one resolution, and every delete, even by the owner.
+- What this does **not** prove: the SQL cannot check that a page came from the resolver. A holder
+  of the service-role key can still call the functions in order with fabricated pages (resync,
+  then a "final" page) and so reach a resolution. Every step of that is then in
+  `idr_sync_state` (`resync_requested_at`, the generations, `drained_generation`, `cursor`), and a
+  fabricated cursor is rejected by the resolver at the next run. Keep the service-role key as
+  secret as the database password.
 
 ### `reconcile_mismatch`
 

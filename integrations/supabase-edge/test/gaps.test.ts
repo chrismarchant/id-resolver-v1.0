@@ -6,9 +6,11 @@
  * once, readable only with the idr_reader claim, writable only through the
  * service_role functions.
  */
+import { readFileSync } from "node:fs";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { INSTALLATION, asRole, gapRows, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
+import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, functionGrants, relationGrants } from "./helpers/acl.ts";
+import { INSTALLATION, SQL_PATH, asRole, freshPublicSchema, gapRows, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
 
@@ -40,9 +42,19 @@ const resolveGaps = async (drained?: string) =>
       [INSTALLATION, drained ?? null],
     )
   ).rows[0]!.r.resolved;
-/** The first page of a replay from the start of the buffer (the stored cursor must be null). */
-const replay = (next: string) =>
-  svc("select public.idr_apply_feed_page($1, null, $2, '[]'::jsonb, (select s.reset_from_cursor from public.idr_sync_state s where s.installation_id = $1))", [INSTALLATION, next]);
+const PENDING = "(select s.reset_from_cursor from public.idr_sync_state s where s.installation_id = $1)";
+/**
+ * The first page of a replay from the start of the buffer (the stored cursor must be null). By default it is
+ * also the replay's final page (has_more = false): the drained flag records the drain, which resolve requires
+ * (R2-8). `final: false` uses the five-argument call of schema 4 and 5; the flag then defaults to false.
+ */
+const replay = (next: string, { final = true }: { final?: boolean } = {}) =>
+  final
+    ? svc(`select public.idr_apply_feed_page($1, null, $2, '[]'::jsonb, ${PENDING}, true)`, [INSTALLATION, next])
+    : svc(`select public.idr_apply_feed_page($1, null, $2, '[]'::jsonb, ${PENDING})`, [INSTALLATION, next]);
+/** A later page of the current replay; final by default. */
+const nextPage = (expected: string, next: string, { final = true }: { final?: boolean } = {}) =>
+  svc("select public.idr_apply_feed_page($1, $2, $3, '[]'::jsonb, null, $4)", [INSTALLATION, expected, next, final]);
 const generations = async () =>
   (await pool.query<{ resync: string; replay: string }>("select resync_generation::text as resync, replay_generation::text as replay from public.idr_sync_state")).rows[0];
 const beginResync = () => svc("select public.idr_begin_resync($1)", [INSTALLATION]);
@@ -88,7 +100,8 @@ describe("recording", () => {
   it("rejects unknown kinds and empty installation ids", async () => {
     await expect(svc("select public.idr_record_sync_gap($1, 'other', null)", [INSTALLATION])).rejects.toThrow(/invalid_arguments/);
     await expect(svc("select public.idr_record_sync_gap('', 'cursor_expired', null)")).rejects.toThrow(/invalid_arguments/);
-    await expect(svc("insert into public.idr_sync_gaps (installation_id, kind) values ($1, 'other')", [INSTALLATION])).rejects.toThrow(/check constraint/);
+    // As the owner (service_role cannot insert at all, R2-8): the table's own check still holds.
+    await expect(pool.query("insert into public.idr_sync_gaps (installation_id, kind) values ($1, 'other')", [INSTALLATION])).rejects.toThrow(/check constraint/);
   });
 });
 
@@ -212,6 +225,121 @@ describe("R2-6: begin_resync never clears needs_resync without a gap on record",
     expect((await svc<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
     const st = (await svc<{ s: { schema_version: number } }>("select public.idr_get_sync_state($1) as s", [INSTALLATION])).rows[0]!.s;
     expect(st.schema_version).toBe(PROJECTION_SCHEMA_VERSION);
+    // The operator documentation names the same version.
+    const setup = readFileSync(new URL("../SETUP.md", import.meta.url), "utf8");
+    expect(setup).toContain(`(\`idr_schema_version()\`, ${PROJECTION_SCHEMA_VERSION} for this release)`);
+  });
+});
+
+describe("R2-8: a gap resolves only after a drained replay; service_role cannot assert a resolution", () => {
+  it("a replay that has started but not drained cannot resolve the gap, even when service_role calls the resolve itself", async () => {
+    await recordGap();
+    await beginResync();
+    await replay("c1", { final: false }); // the replay's first page; more pages to come
+    expect(await generations()).toEqual({ resync: "1", replay: "1" });
+    expect(await resolveGaps()).toBe(0); // earlier releases resolved here, on the caller's word alone
+    expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
+    await nextPage("c1", "c2", { final: false });
+    expect(await resolveGaps()).toBe(0);
+    await nextPage("c2", "c3"); // the final page: the drain is recorded with it
+    expect((await pool.query("select drained_generation::int as d from public.idr_sync_state")).rows[0]).toEqual({ d: 1 });
+    expect(await resolveGaps()).toBe(1);
+    expect((await gapRows(pool))[0]).toMatchObject({ resolution: "full_resync" });
+  });
+
+  it("a drain recorded for an earlier replay does not count for a newer one", async () => {
+    await replay("c1"); // replay of generation 0 drains
+    await recordGap(); // detected at generation 0
+    await beginResync(); // generation 1
+    await replay("k2c1", { final: false }); // the new replay starts but has not drained
+    expect((await pool.query("select drained_generation::int as d, replay_generation::int as r from public.idr_sync_state")).rows[0]).toEqual({ d: 0, r: 1 });
+    expect(await resolveGaps()).toBe(0);
+    await nextPage("k2c1", "k2c2");
+    expect(await resolveGaps()).toBe(1);
+  });
+
+  it("service_role cannot insert or update gap rows, nor write idr_sync_state or the projection tables directly", async () => {
+    await svc("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null)", [
+      INSTALLATION,
+      JSON.stringify([{ type: "observation", observation_id: "1", company_id: 7, domain: "example.com", organisation_name: null, observed_at: "2026-11-02T09:00:00.000Z", method: "cache", page_key: "/", acquisition: null, entrance_contract: null }]),
+    ]);
+    const g = await recordGap();
+    await beginResync();
+    const snapshot = async () => ({
+      state: (await pool.query("select * from public.idr_sync_state")).rows,
+      gaps: await gapRows(pool),
+      counts: (await pool.query("select (select count(*) from public.idr_companies)::int c, (select count(*) from public.idr_observations)::int o, (select count(*) from public.idr_tombstones)::int t")).rows,
+    });
+    const before = await snapshot();
+    const writes: Array<[string, unknown[]]> = [
+      // A fabricated gap, already resolved or open, and a resolution without a replay.
+      ["insert into public.idr_sync_gaps (installation_id, kind, resolved_at, resolution) values ($1, 'cursor_expired', now(), 'full_resync')", [INSTALLATION]],
+      ["insert into public.idr_sync_gaps (installation_id, kind) values ('other', 'cursor_expired')", []],
+      [`update public.idr_sync_gaps set resolved_at = now(), resolution = 'full_resync' where id = ${g.gap_id}`, []],
+      // The resync and gap columns of the state, which decide whether a gap may resolve.
+      ["update public.idr_sync_state set replay_generation = replay_generation + 5", []],
+      ["update public.idr_sync_state set drained_generation = replay_generation", []],
+      ["update public.idr_sync_state set resync_generation = 0, resync_requested_at = now()", []],
+      ["update public.idr_sync_state set needs_resync = false", []],
+      ["update public.idr_sync_state set reset_from_cursor = null, reset_from_generation = null", []],
+      ["update public.idr_sync_state set cursor = 'c9', status = 'ok'", []],
+      ["insert into public.idr_sync_state (installation_id) values ('other')", []],
+      ["delete from public.idr_sync_state", []],
+      // The projection itself.
+      ["insert into public.idr_companies (installation_id, company_id, domain) values ($1, 99, 'example.org')", [INSTALLATION]],
+      ["update public.idr_observations set method = 'x'", []],
+      ["delete from public.idr_companies", []],
+      ["delete from public.idr_tombstones", []],
+    ];
+    for (const [sql, args] of writes) await expect(svc(sql, args), sql).rejects.toThrow(/permission denied/);
+    expect(await snapshot()).toEqual(before);
+    expect(before.gaps[0]!.resolved_at).toBeNull();
+  });
+
+  it("not even the owner (nor so any function) can insert an already resolved gap: the guard checks inserts too", async () => {
+    await expect(
+      pool.query("insert into public.idr_sync_gaps (installation_id, kind, resolved_at, resolution) values ($1, 'cursor_expired', now(), 'full_resync')", [INSTALLATION]),
+    ).rejects.toThrow(/recorded open/);
+    expect(await gapRows(pool)).toHaveLength(0);
+  });
+
+  it("the normal resync-then-drain path still resolves, through the functions alone", async () => {
+    await replay("c2");
+    await recordGap();
+    expect(await resolveGaps()).toBe(0); // needs_resync, no resync requested
+    await beginResync();
+    await replay("c1", { final: false });
+    await nextPage("c1", "c2");
+    expect(await resolveGaps()).toBe(1);
+    expect((await gapRows(pool)).map((x) => [x.resolution, x.detected_generation])).toEqual([["full_resync", 0]]);
+  });
+
+  it("the writing functions refuse malformed arguments and write nothing", async () => {
+    const many = `(select jsonb_agg(jsonb_build_object('type', 'observation')) from generate_series(1, 1001))`;
+    const bad: Array<[string, unknown[]]> = [
+      ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null, null)", [INSTALLATION]],
+      ["select public.idr_apply_feed_page($1, null, 'c1', '{}'::jsonb, null, false)", [INSTALLATION]],
+      ["select public.idr_apply_feed_page($1, null, 'c1', '[1]'::jsonb, null, false)", [INSTALLATION]],
+      [`select public.idr_apply_feed_page($1, null, 'c1', '[{"type":"other"}]'::jsonb, null, false)`, [INSTALLATION]],
+      [`select public.idr_apply_feed_page($1, null, 'c1', '[{"kind":"observation"}]'::jsonb, null, false)`, [INSTALLATION]],
+      [`select public.idr_apply_feed_page($1, null, 'c1', ${many}, null, false)`, [INSTALLATION]],
+      ["select public.idr_apply_feed_page($1, '', 'c1', '[]'::jsonb, null, false)", [INSTALLATION]],
+      ["select public.idr_apply_feed_page($1, null, '', '[]'::jsonb, null, false)", [INSTALLATION]],
+      ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, '', false)", [INSTALLATION]],
+      ["select public.idr_apply_feed_page(repeat('x', 129), null, 'c1', '[]'::jsonb, null, false)", []],
+      ["select public.idr_apply_feed_page($1, null, repeat('c', 4097), '[]'::jsonb, null, false)", [INSTALLATION]],
+      ["select public.idr_begin_resync('')", []],
+      ["select public.idr_begin_resync(null)", []],
+      ["select public.idr_reset_cursor($1, '')", [INSTALLATION]],
+      ["select public.idr_record_sync_status('', 'ok', null)", []],
+      ["select public.idr_record_sync_status($1, null, null)", [INSTALLATION]],
+      ["select public.idr_record_sync_gap($1, 'cursor_expired', '')", [INSTALLATION]],
+      ["select public.idr_resolve_sync_gaps('', 'c1')", []],
+      ["select public.idr_resolve_sync_gaps($1, '')", [INSTALLATION]],
+    ];
+    for (const [sql, args] of bad) await expect(svc(sql, args), sql).rejects.toThrow(/invalid_arguments/);
+    expect((await pool.query("select count(*)::int as n from public.idr_sync_state")).rows[0].n).toBe(0);
+    expect(await gapRows(pool)).toHaveLength(0);
   });
 });
 
@@ -274,5 +402,63 @@ describe("row level security", () => {
       }
     }
     expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
+  });
+});
+
+describe("R2-8 with an ordinary owner: the script applied by a role that is neither superuser nor BYPASSRLS (on Supabase, postgres is not a superuser)", () => {
+  const OWNER = "idr_test_owner";
+  beforeAll(async () => {
+    await freshPublicSchema(pool);
+    await pool.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${OWNER}') then create role ${OWNER} nologin nosuperuser nobypassrls; end if; end $$`);
+    await pool.query(`grant usage, create on schema public to ${OWNER}`);
+    await pool.query(`grant usage on schema auth to ${OWNER}`);
+    // Supabase's default privileges, for objects this role creates.
+    for (const kind of ["tables", "sequences", "functions"]) {
+      await pool.query(`alter default privileges for role ${OWNER} in schema public grant all on ${kind} to anon, authenticated, service_role`);
+    }
+    const c = await pool.connect();
+    try {
+      await c.query(`set role ${OWNER}`);
+      await c.query(readFileSync(SQL_PATH, "utf8"));
+    } finally {
+      await c.query("reset role").catch(() => undefined);
+      c.release();
+    }
+  });
+  afterAll(async () => {
+    await resetDatabase(pool);
+    await pool.query(`drop owned by ${OWNER}`);
+    await pool.query(`drop role ${OWNER}`);
+  });
+
+  it("everything is owned by that role, which has no superuser or BYPASSRLS attribute; the grants are exactly as with any owner", async () => {
+    const owners = await pool.query<{ o: string }>(
+      `select distinct o from (select relowner::regrole::text o from pg_class where relnamespace = 'public'::regnamespace and relname like 'idr\\_%'
+                               union all select proowner::regrole::text from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%') x`,
+    );
+    expect(owners.rows).toEqual([{ o: OWNER }]);
+    expect((await pool.query("select rolsuper, rolbypassrls from pg_roles where rolname = $1", [OWNER])).rows[0]).toEqual({ rolsuper: false, rolbypassrls: false });
+    expect(await relationGrants(pool)).toEqual(EXPECTED_RELATION_GRANTS);
+    expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
+  });
+
+  it("as service_role, through the definer functions only: apply, record, resync, a partial replay (no resolution), the final page, resolve", async () => {
+    const item = { type: "observation", observation_id: "1", company_id: 7, domain: "example.com", organisation_name: null, observed_at: "2026-11-02T09:00:00.000Z", method: "cache", page_key: "/", acquisition: null, entrance_contract: null };
+    expect((await svc<{ r: unknown }>("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null, true) as r", [INSTALLATION, JSON.stringify([item])])).rows[0]!.r).toEqual({ applied: true, observations: 1, tombstones: 0 });
+    expect(await recordGap()).toMatchObject({ recorded: true, new: true });
+    await beginResync();
+    await replay("c1", { final: false });
+    expect(await resolveGaps()).toBe(0);
+    await nextPage("c1", "c2");
+    expect(await resolveGaps()).toBe(1);
+    await svc("select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]);
+    await svc("select public.idr_reset_cursor($1, 'c2')", [INSTALLATION]);
+    expect((await pool.query("select status, cursor, reset_from_cursor from public.idr_sync_state")).rows[0]).toEqual({ status: "ok", cursor: null, reset_from_cursor: "c2" });
+    // The read function is SECURITY INVOKER and works with service_role's SELECT.
+    const st = (await svc<{ s: { gap_open: boolean; schema_version: number } }>("select public.idr_get_sync_state($1) as s", [INSTALLATION])).rows[0]!.s;
+    expect(st).toMatchObject({ gap_open: false });
+    // Direct writes are still refused.
+    await expect(svc("update public.idr_sync_state set needs_resync = false")).rejects.toThrow(/permission denied/);
+    await expect(svc("insert into public.idr_sync_gaps (installation_id, kind) values ($1, 'cursor_expired')", [INSTALLATION])).rejects.toThrow(/permission denied/);
   });
 });

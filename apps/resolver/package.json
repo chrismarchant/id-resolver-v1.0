@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p ../../.railway/tsconfig.json",
     "start": "node dist/main.js",
     "dev": "tsx src/main.ts",
     "migrate": "tsx src/db/migrate.ts",
@@ -17,6 +17,7 @@
     "ops:kill-switch": "tsx src/ops/kill-switch.ts",
     "ops:prune": "tsx src/ops/prune.ts",
     "ops:erase-company": "tsx src/ops/erase-company.ts",
+    "ops:db-tls-fingerprint": "tsx src/ops/db-tls-fingerprint.ts",
     "mock-provider": "tsx src/provider/mock-server.ts",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
