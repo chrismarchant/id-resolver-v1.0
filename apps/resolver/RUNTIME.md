@@ -65,6 +65,20 @@ name variables, never values. See `.env.example` for every variable.
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
   and per-company scope statistics are never pruned.
+* **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
+  rows (IP fingerprints past their TTL) and observations older than the
+  retention window. It runs once at startup (after the server listens, not
+  blocking it) and then every `CACHE_PRUNE_INTERVAL_S` (default 600 s); runs
+  never overlap. A run drains: it repeats batches of `CACHE_PRUNE_BATCH` rows
+  (one statement each) until a batch comes back short, within
+  `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may use half of
+  it, observation retention gets the rest). Each run logs
+  `maintenance_run{cache_rows, observation_rows, backlog, duration_ms}`; a run
+  that stops with rows still due (budget spent, shutdown or a database error)
+  also logs the warning `maintenance_backlog{reason, category}`. Alert on
+  repeated `maintenance_backlog`: the buffer is then growing faster than it
+  is pruned; raise the batch size or the budget. On shutdown a running drain
+  stops after its current batch.
 * `PROVIDER_MODE=mock` is refused when `NODE_ENV=production` unless
   `ALLOW_MOCK_PROVIDER=true` (the isolated development deployment, D7).
   Paid enrichment stays off unless `PROVIDER_MODE=live` and

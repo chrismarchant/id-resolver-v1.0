@@ -24,6 +24,7 @@
 import { FEED_KIND_OBSERVATION, type FeedPosition } from "../contracts/reporting-feed.js";
 import type { ObservationScope } from "../contracts/db.js";
 import type { Logger } from "../log/index.js";
+import { drainBatches, type DrainOptions, type DrainResult } from "./drain.js";
 import { DbError, guarded, type Pool } from "./pool.js";
 
 export const MAX_RETENTION_BATCH = 100_000;
@@ -48,8 +49,12 @@ WHERE installation_id = $1::text AND website_id = $2::text`;
 export interface FeedRetention {
   /** One bounded batch: deletes at most `limit` observations observed before `cutoff`. Returns rows deleted. */
   pruneBefore(cutoff: Date, limit: number): Promise<number>;
-  /** Repeats bounded batches until one deletes nothing or `maxBatches` ran. */
-  pruneAllBefore(cutoff: Date, opts: { batch: number; maxBatches?: number }): Promise<{ deleted: number; batches: number }>;
+  /**
+   * Repeats bounded batches until one comes back short (the backlog is
+   * drained), or stops early at `maxBatches`, the `deadlineAtMs` time budget
+   * or an aborted `signal`, reporting `backlog: true` (src/db/drain.ts).
+   */
+  pruneAllBefore(cutoff: Date, opts: DrainOptions): Promise<DrainResult>;
   /** The scope's retention watermark (always an observation position), or null when nothing was ever pruned. */
   watermark(scope: ObservationScope): Promise<FeedPosition | null>;
 }
@@ -77,17 +82,10 @@ export function createFeedRetention(pool: Pool, logger?: Logger): FeedRetention 
   return {
     pruneBefore,
     async pruneAllBefore(cutoff, opts) {
-      const maxBatches = opts.maxBatches ?? Number.MAX_SAFE_INTEGER;
-      let deleted = 0;
-      let batches = 0;
-      while (batches < maxBatches) {
-        const n = await pruneBefore(cutoff, opts.batch);
-        if (n === 0) break;
-        deleted += n;
-        batches += 1;
-      }
-      if (deleted > 0) logger?.info("observation_prune", { rows: deleted, count: batches });
-      return { deleted, batches };
+      checkBatch(opts.batch);
+      const r = await drainBatches((limit) => pruneBefore(cutoff, limit), opts);
+      if (r.deleted > 0) logger?.info("observation_prune", { rows: r.deleted, count: r.batches });
+      return r;
     },
     async watermark(scope) {
       return guarded(logger, async () => {

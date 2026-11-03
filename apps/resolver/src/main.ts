@@ -4,7 +4,9 @@
  * Loads bounded configuration, installs process-level crash containment and
  * the event-loop watchdog, refuses to start while the database has pending
  * migrations, builds the in-process job runner over one shared database
- * pool, serves the API, runs bounded cache and observation pruning,
+ * pool, serves the API, runs the maintenance loop (expired cache rows and
+ * observation retention, drained in bounded batches within a time budget,
+ * once at startup and then every CACHE_PRUNE_INTERVAL_S; never overlapping),
  * and shuts down gracefully: stop accepting, answer in-flight requests, drain
  * executing jobs within SHUTDOWN_GRACE_MS, close the pool, exit.
  *
@@ -15,9 +17,11 @@ import { loadConfig, describeConfig, ConfigError, scrubSecretEnv } from "./confi
 import { createLogger } from "./log/index.js";
 import { createDb } from "./db/index.js";
 import { assertSchemaCurrent, PendingMigrationsError } from "./db/migrate.js";
+import { createFeedRetention } from "./db/retention.js";
 import { createProvider } from "./provider/index.js";
 import { buildServer } from "./api/server.js";
 import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner.js";
+import { createMaintenance } from "./runtime/maintenance.js";
 import { installProcessGuards } from "./runtime/process-guards.js";
 import { startEventLoopWatchdog } from "./runtime/watchdog.js";
 
@@ -60,23 +64,17 @@ async function main(): Promise<void> {
   });
   const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting });
 
-  const prune = setInterval(() => {
-    db.cache
-      .pruneExpired(config.CACHE_PRUNE_BATCH)
-      .then((rows) => {
-        if (rows > 0) logger.info("cache_prune", { rows });
-      })
-      .catch(() => logger.warn("db_error", { category: "prune" }));
-    // Observation retention: the bounded sync buffer (D3). Companies and scope stats are never pruned.
-    const cutoff = new Date(Date.now() - config.OBSERVATION_RETENTION_DAYS * 86_400_000);
-    db.activity
-      .pruneObservationsBefore(cutoff, config.CACHE_PRUNE_BATCH)
-      .then((rows) => {
-        if (rows > 0) logger.info("observation_prune", { rows });
-      })
-      .catch(() => logger.warn("db_error", { category: "observation_prune" }));
-  }, config.CACHE_PRUNE_INTERVAL_S * 1000);
-  prune.unref();
+  // Expired cache rows and observation retention (the bounded sync buffer, D3),
+  // drained in bounded batches within a per-run budget. Companies, scope stats,
+  // deduplication records and tombstones are never pruned. Started after listen.
+  const maintenance = createMaintenance({
+    pruneExpiredCache: (limit) => db.cache.pruneExpired(limit),
+    retention: createFeedRetention(db.pool, logger),
+    logger,
+    batch: config.CACHE_PRUNE_BATCH,
+    retentionDays: config.OBSERVATION_RETENTION_DAYS,
+    budgetMs: config.CACHE_PRUNE_BUDGET_MS,
+  });
 
   const watchdog = startEventLoopWatchdog({ thresholdMs: config.EVENT_LOOP_BLOCK_EXIT_MS });
 
@@ -91,7 +89,8 @@ async function main(): Promise<void> {
     }, config.SHUTDOWN_GRACE_MS + 2_000);
     hardExit.unref();
     const until = Date.now() + config.SHUTDOWN_GRACE_MS;
-    clearInterval(prune);
+    // Ends the schedule; a running maintenance run stops after its current batch.
+    const maintenanceStopped = maintenance.stop();
     // Keep-alive connections that become idle after close() began would
     // otherwise hold the server open until the client's keep-alive timeout.
     const idleSweep = setInterval(() => app.server.closeIdleConnections(), 100);
@@ -105,6 +104,7 @@ async function main(): Promise<void> {
     clearInterval(idleSweep);
     // Jobs that overran their deadline, and writes that outlived their budget, get the rest of the grace period.
     const drain = await runner.shutdown(Math.max(0, until - Date.now()));
+    await maintenanceStopped;
     await db.close();
     await watchdog.stop();
     logger.info("server_stopped", { outcome: drain.drained ? "drained" : "grace_exceeded", active_jobs: drain.activeJobs });
@@ -116,6 +116,9 @@ async function main(): Promise<void> {
 
   await app.listen({ port: config.PORT, host: config.HOST });
   logger.info("server_started", { route: `${config.HOST}:${config.PORT}`, cap: runner.capacity() });
+  // First run now, without waiting one interval (a service restarted more often
+  // than the interval would otherwise never prune); not awaited, never overlapping.
+  maintenance.start(config.CACHE_PRUNE_INTERVAL_S * 1000);
 }
 
 main().catch((err: unknown) => {
