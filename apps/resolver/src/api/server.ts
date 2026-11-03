@@ -171,7 +171,13 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     return sendError(reply, "internal");
   });
 
-  app.setNotFoundHandler((_req, reply) => sendError(reply, "invalid_request"));
+  // An unknown route (or method) answers 404 not_found, the same for every
+  // path, so a route that is not registered (POST /v1/events while
+  // EVENTS_ENABLED=false, the reporting routes without their credential)
+  // cannot be told apart from one that never existed (event.v1 section 2).
+  // Authentication runs first: without the website credential an unknown
+  // route answers 401 like every other route.
+  app.setNotFoundHandler((_req, reply) => sendError(reply, "not_found"));
 
   // Health probes are unauthenticated and must not share the deployment rate-limit bucket.
   app.get("/healthz", { config: { rateLimit: false } }, async (_req, reply) => reply.code(200).send({ ok: true }));
@@ -202,7 +208,10 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // resolver token never opens reporting and the reporting token never
     // opens /v1/entrances.
     const ok = isReportingRoute(matched) ? checkReportingCredential(req.headers["authorization"]) : checkCredential(req.headers["authorization"]);
-    if (ok) return;
+    // An authenticated request for an unknown route is answered here, before
+    // its body is parsed, so every unknown route answers 404 whatever the
+    // body (a malformed body cannot turn it into a 400).
+    if (ok) return matched === undefined ? sendError(reply, "not_found") : undefined;
     const peer = req.socket?.remoteAddress ?? "unknown";
     const limited = failures.isLimited(peer);
     failures.record(peer);
