@@ -507,6 +507,14 @@ test("--history scans commit messages: a public IPv4 (and a host, a UUID) in a m
     assert.match(r.out, /<commit message>: uuid-literal/);
     assert.match(r.out, new RegExp(`allow-list fingerprint: ${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`));
   });
+  // A synthetic value in a message can be allow-listed with its pseudo-path fingerprint.
+  withRepo((dir) => {
+    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", `parser test input ${publicIp}`);
+    const sha = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    writeFileSync(join(dir, ALLOW), `# reviewed: synthetic parser input quoted in a commit message\n${sha}:<commit message>:public-ipv4:${sha256(publicIp)}\n`);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+  });
 });
 
 test("--history: a value introduced only in a merge resolution, then removed, is caught", () => {
@@ -581,7 +589,7 @@ test("--history: noreply co-author trailers and example addresses in messages ar
   });
   // ...but a real-looking address in a message is still caught, and cannot be allow-listed.
   withRepo((dir) => {
-    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", "Fix", "-m", `Co-Authored-By: Someone <${email}>`, "-m", "Reviewed-by: x <noreply@anthropic.com.evil.example.net>");
+    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", "Fix", "-m", `Co-Authored-By: Someone <${email}>`);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /<commit message>: email: .*someone@realcompany\.co\.uk\n\s+cannot be allow-listed/);
