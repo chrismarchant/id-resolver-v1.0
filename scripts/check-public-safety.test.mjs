@@ -596,6 +596,7 @@ test("--history: noreply co-author trailers and example addresses in messages ar
       "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
       "Co-authored-by: Someone <12345+someone@users.noreply.github.com>",
       "Committed-via: GitHub <noreply@github.com>",
+      "Signed-off-by: dependabot[bot] <support@github.com>",
       "Reported-by: Ops <ops@mail.example.com>, QA <qa@ci.example.org>, Dev <dev@build.test>",
     ].join("\n"));
     const r = runGate(dir, "--history");
@@ -617,7 +618,7 @@ test("the e-mail rule allows example subdomains and git noreply addresses in fil
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  for (const bad of [["xnoreply", "anthropic.com"].join("@"), ["noreply", "anthropic.com.evil.net"].join("@"), ["ops", "example.com.evil.net"].join("@")]) {
+  for (const bad of [["xnoreply", "anthropic.com"].join("@"), ["noreply", "anthropic.com.evil.net"].join("@"), ["ops", "example.com.evil.net"].join("@"), ["xsupport", "github.com"].join("@"), ["support", "github.com.evil.net"].join("@")]) {
     expectFinding({ "a.md": `${bad}\n` }, "email");
   }
 });

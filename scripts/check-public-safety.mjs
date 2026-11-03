@@ -17,8 +17,8 @@
  *   - a UUID literal (Railway project/service/environment/deployment ids are UUIDs)
  *   - a public IPv4 literal outside private, reserved and RFC 5737 documentation ranges
  *   - an e-mail address outside RFC 2606 reserved/example domains (git noreply
- *     addresses such as noreply@anthropic.com and *@users.noreply.github.com
- *     are allowed)
+ *     addresses such as noreply@anthropic.com and *@users.noreply.github.com,
+ *     and GitHub's own service sign-off support@github.com, are allowed)
  *   - a public IPv6 literal (global unicast, first three bits 001, outside
  *     documentation 2001:db8::/32, 3fff::/20 and the 2001::/23 protocol block; link-local, ULA, loopback, "::" and mapped
  *     private IPv4 are never reported)
@@ -219,14 +219,17 @@ class GateError extends Error {}
 /**
  * E-mail addresses that are never personal data: RFC 2606 / RFC 6761 reserved
  * names (any subdomain of example.com/.org/.net, and the .example, .invalid,
- * .test and .localhost TLDs), and fixed git "noreply" identities, which appear
- * in commit trailers such as `Co-Authored-By: Claude <noreply@anthropic.com>`.
+ * .test and .localhost TLDs), fixed git "noreply" identities, which appear
+ * in commit trailers such as `Co-Authored-By: Claude <noreply@anthropic.com>`,
+ * and GitHub's service address in Dependabot's `Signed-off-by: dependabot[bot]
+ * <support@github.com>` trailer (exact match only).
  */
 const ALLOWED_EMAILS = [
   /@(?:[a-z0-9-]+\.)*(?:example|invalid|test|localhost)$/i,
   /@(?:[a-z0-9-]+\.)*example\.(?:com|org|net)$/i,
   /@users\.noreply\.github\.com$/i,
   /^noreply@(?:anthropic\.com|github\.com)$/i,
+  /^support@github\.com$/i,
 ];
 
 function isAllowedEmail(address) {
