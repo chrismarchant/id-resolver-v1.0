@@ -69,17 +69,25 @@ const TLS_URL_PARAMS = new Set([
   "uselibpqcompat",
 ]);
 
-/** Removes every TLS-related parameter so DATABASE_SSL alone controls TLS. Never throws, never logs the URL. */
+/**
+ * Removes every TLS-related parameter so DATABASE_SSL alone controls TLS.
+ * Fails closed (G5R2-L2): a connection string that WHATWG URL cannot parse
+ * (e.g. the libpq form with an empty host and `?host=`) is refused with
+ * DbError("INVALID_URL"), never passed on unstripped, because node-postgres
+ * parses such strings itself and their `sslmode=disable` would override the
+ * explicit TLS option. Never logs or echoes the URL.
+ */
 export function stripSslMode(databaseUrl: string): string {
+  let u: URL;
   try {
-    const u = new URL(databaseUrl);
-    const drop = [...u.searchParams.keys()].filter((k) => TLS_URL_PARAMS.has(k.toLowerCase()));
-    if (drop.length === 0) return databaseUrl;
-    for (const k of drop) u.searchParams.delete(k);
-    return u.toString();
+    u = new URL(databaseUrl);
   } catch {
-    return databaseUrl;
+    throw new DbError("INVALID_URL");
   }
+  const drop = [...u.searchParams.keys()].filter((k) => TLS_URL_PARAMS.has(k.toLowerCase()));
+  if (drop.length === 0) return databaseUrl;
+  for (const k of drop) u.searchParams.delete(k);
+  return u.toString();
 }
 
 /**

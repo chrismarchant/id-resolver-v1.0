@@ -216,8 +216,19 @@ The feed guards of migrations 0006/0007 are triggers. Only the table owner
 (`ALTER TABLE ... DISABLE TRIGGER`) or a superuser (`SET
 session_replication_role = replica`) can bypass them, and `TRUNCATE` skips
 row triggers. The runtime role has none of that, so a leaked runtime
-credential cannot rewrite, silently delete or truncate feed items, move the
-retention watermark or remove a tombstone.
+credential cannot rewrite, silently delete or truncate feed items, write the
+retention watermark (INSERT, UPDATE and DELETE on it are refused) or remove a
+tombstone.
+
+What a leaked runtime credential **can** still do to the feed (G5R2-L4): it
+holds DELETE and INSERT on `company_observations`, because retention and the
+entrance path need them. Deleting observations, including the newest ones,
+advances the scope's watermark through the 0006 trigger (which runs as its
+owner since migration 0009): every consumer whose cursor is below it then
+gets `410 cursor_expired` and must resynchronise, and the deleted buffer
+contents are gone from the resolver. Inserting adds observations that the
+feed serves. Both are visible to consumers (a watermark move, feed items);
+neither is silent.
 
 **Runtime grants** (`RUNTIME_GRANTS`; every other privilege in the schema is
 revoked on every migrate run):
@@ -252,6 +263,14 @@ every ops command connects with `DATABASE_URL`. `ops:usage` and `ops:prune`
 also run as the owner (one rule for every ops command); `ops:prune` deletes
 through the same triggers.
 
+**Scope of the separation.** The owner `DATABASE_URL` (on Railway the
+template's superuser) is in the service's own environment, because the
+pre-deploy migrate shares the service's variables; `process.env` is scrubbed
+at startup but `/proc/<pid>/environ` keeps it. Role separation therefore
+contains SQL-level abuse and a leaked runtime password, not a compromise of
+the service process (a separate migrator service would be the structural
+answer).
+
 **Provisioning** (`node dist/db/migrate.js`, after the migrations, under the
 migration advisory lock, one transaction, on every run, only when
 `DATABASE_RUNTIME_PASSWORD` is set):
@@ -260,17 +279,27 @@ migration advisory lock, one transaction, on every run, only when
    NOREPLICATION NOBYPASSRLS NOINHERIT`), or updates it when it exists;
    refuses (the deploy fails, nothing changes) if a role of that name exists
    with an elevated attribute, a membership or owned objects: it never
-   demotes a role it did not create;
+   demotes a role it did not create. An existing role of that name without
+   any of these is taken over (password reset, grants replaced), so
+   `DATABASE_RUNTIME_ROLE` must name a role nothing else uses;
 2. sets its password as a SCRAM-SHA-256 verifier computed in the migrate
    process, so the plaintext never appears in SQL text, server logs or
-   `pg_stat_activity`;
+   `pg_stat_activity` (the verifier itself is in the statement text, so it can
+   reach server logs with `log_statement = ddl`, or `pg_stat_statements`; it
+   does not reveal the password);
 3. revokes every privilege it holds in the schema and grants exactly the
    table above. Objects created by future migrations get their grants from
    this map, re-applied on every run (no `ALTER DEFAULT PRIVILEGES`). An
    object without an entry gets no privilege and is named in a warning;
    `test/integration/runtime-role.test.ts` fails while any object the
    migrations create has no entry;
-4. checks the result is least privilege (fails otherwise, e.g. CREATE on
+4. removes every session default stored on the role (`ALTER ROLE ...
+   RESET ALL`, for all databases and `IN DATABASE` this one). A role can set
+   its own defaults, so a leaked runtime credential could otherwise make every
+   later service session read-only (`default_transaction_read_only`) or
+   change its timeouts or durability (G5R2-L3); the service's session settings
+   live in code (`src/db/pool.ts`), never on the role;
+5. checks the result is least privilege (fails otherwise, e.g. CREATE on
    `public` granted to PUBLIC on PostgreSQL 14 and older).
 
 The owner needs CREATEROLE (or superuser, as on Railway) for step 1.
@@ -282,7 +311,12 @@ connection it opens after the migrate fails authentication.
 **Startup.** With `DATABASE_RUNTIME_PASSWORD` set the service logs in as the
 runtime role and checks its own login (`database_role_check`): it refuses to
 start (exit 1, naming the excess, e.g. `owns_objects`, `superuser`) if the
-login can do anything listed under "Not granted". A wrong password exits 1
+login can do anything listed under "Not granted", or if the role carries
+session defaults for all databases or this one (`role_settings`, set after
+the last migrate run, e.g. with a leaked credential; a redeploy runs the
+migrate step, which resets them). The runtime role can also change its own
+password: new connections then fail authentication until the next migrate
+run sets it again. A wrong password exits 1
 with `database authentication failed (28P01)` and a hint that the pre-deploy
 migrate must have run with the same value. Without `DATABASE_RUNTIME_PASSWORD`
 the service logs in as the owner: refused when `NODE_ENV=production` unless
@@ -297,6 +331,11 @@ warning on every start). `config_loaded` reports `db_role: runtime|owner`.
 | Development (Railway), target | `verify-pinned` | `DATABASE_TLS_PIN_SHA256` | `DATABASE_RUNTIME_PASSWORD` (sealed) | `ALLOW_MOCK_PROVIDER` only |
 | Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them; steps in `docs/RAILWAY_IAC.md`) |
 | Local development / tests | `disable` with `NODE_ENV=development` or `test` | — | optional | — |
+
+`NODE_ENV` must stay `production` (the image's default) on every deployed
+service: `development` or `test` silently switches off all three production
+refusals (`disable`, unverified TLS, the owner login), and `config_loaded`
+does not report `NODE_ENV`.
 
 **Rollback.** The previous build (no role separation) connects as the owner
 with `DATABASE_URL`, which still works: migration 0009 changes no table,

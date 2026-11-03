@@ -13,9 +13,10 @@
  * with the ops helper first.
  */
 import { spawn } from "node:child_process";
+import net from "node:net";
 import { resolve } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { createPool, type Pool } from "../../src/db/pool.js";
+import { createPool, DbError, type Pool } from "../../src/db/pool.js";
 import { DbTlsError, fetchServerCertificate, type DbTlsConfig } from "../../src/db/tls.js";
 import { fingerprintReport } from "../../src/ops/db-tls-fingerprint.js";
 import { createScratchDatabase, getTestDatabaseUrl } from "../helpers/db.js";
@@ -284,6 +285,84 @@ describe("ops/db-tls-fingerprint (discovery helper)", () => {
     expect(r.stderr.trim()).toBe("ops:db-tls-fingerprint: DB_TLS_REFUSED");
     const none = await run("src/ops/db-tls-fingerprint.ts", [], {});
     expect(none.stderr.trim()).toBe("ops:db-tls-fingerprint: DATABASE_URL is required");
+  });
+});
+
+/**
+ * A TCP listener that records what each client sends first (an SSLRequest, or a
+ * plaintext startup message carrying the user name) and closes the connection.
+ */
+async function startRecorder(): Promise<{ port: number; firsts: string[]; close: () => Promise<void> }> {
+  const firsts: string[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((s) => {
+    sockets.add(s);
+    s.on("error", () => undefined);
+    s.once("data", (d: Buffer) => {
+      firsts.push(d.length >= 8 && d.readUInt32BE(0) === 8 && d.readUInt32BE(4) === 80877103 ? "ssl-request" : `plaintext(${d.length} bytes)`);
+      s.destroy();
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    firsts,
+    close: async () => {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((r) => server.close(() => r()));
+    },
+  };
+}
+
+describe("G5R2-L2: a DATABASE_URL that WHATWG URL cannot parse never connects (no plaintext downgrade)", () => {
+  const libpqUrl = (port: number) => `postgres://owner:l2-secret-pw@/id_resolver_test?host=127.0.0.1&port=${port}&sslmode=disable`;
+
+  it("createPool refuses it in every mode before connecting (it used to connect in plaintext in require mode)", async () => {
+    const rec = await startRecorder();
+    try {
+      for (const mode of ["require", "no-verify", "verify-pinned"] as const) {
+        const ssl: DbTlsConfig = mode === "verify-pinned" ? { mode, pins: [makeCertificate({ cn: "localhost" }).sha256] } : { mode };
+        let err: unknown;
+        try {
+          const p = createPool({ databaseUrl: libpqUrl(rec.port), ssl, max: 1 });
+          pools.push(p);
+          await p.query("SELECT 1");
+        } catch (e) {
+          err = e;
+        }
+        expect(err, mode).toBeInstanceOf(DbError);
+        expect((err as DbError).code, mode).toBe("INVALID_URL");
+      }
+      expect(rec.firsts).toEqual([]);
+    } finally {
+      await rec.close();
+    }
+  });
+
+  it("the migrate CLI (NODE_ENV=production, DATABASE_SSL=require) and the ops entry points refuse it by name, before any connection", async () => {
+    const rec = await startRecorder();
+    try {
+      const url = libpqUrl(rec.port);
+      const env = { DATABASE_URL: url, DATABASE_SSL: "require", INSTALLATION_ID: "inst-l2", WEBSITE_ID: "site-l2" };
+      const results = [
+        await run("src/db/migrate.ts", [], env),
+        await run("src/ops/usage.ts", [], env),
+        await run("src/ops/kill-switch.ts", ["on", "--reason", "l2"], env),
+        await run("src/ops/erase-company.ts", ["--company-id", "1"], env),
+        await run("src/ops/prune.ts", [], { ...env, OBSERVATION_RETENTION_DAYS: "30" }),
+        await run("src/ops/db-tls-fingerprint.ts", [], env),
+      ];
+      for (const r of results) {
+        expect(r.code, r.stderr).toBe(1);
+        expect(r.stderr).toMatch(/DATABASE_URL/);
+        expect(r.stdout + r.stderr).not.toContain("l2-secret-pw");
+        expect(r.stdout + r.stderr).not.toContain(url);
+      }
+      // Nothing reached the server: in particular no plaintext startup message with the owner's user name.
+      expect(rec.firsts).toEqual([]);
+    } finally {
+      await rec.close();
+    }
   });
 });
 

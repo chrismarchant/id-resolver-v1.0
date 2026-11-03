@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ConfigError, configOverrides, describeConfig, loadConfig, loadDatabaseTls, resolveDatabaseTls } from "../../src/config/index.js";
-import { stripSslMode, withCredentials } from "../../src/db/pool.js";
+import { DbError, stripSslMode, withCredentials } from "../../src/db/pool.js";
 import { DbTlsError, parseCaCert, parseTlsPins, pgTlsOptions, PinnedTlsSocket } from "../../src/db/tls.js";
 import { loadOpsConfig } from "../../src/ops/env.js";
 import { targetOf } from "../../src/ops/db-tls-fingerprint.js";
@@ -168,7 +168,23 @@ describe("node-postgres options per mode", () => {
     const url = "postgres://u:p@db.invalid:5432/x?ssl=0&sslmode=disable&SSLROOTCERT=/etc/x&sslcert=a&sslkey=b&sslnegotiation=direct&uselibpqcompat=true&application_name=keep&options=-c%20x%3Dy";
     const out = new URL(stripSslMode(url));
     expect([...out.searchParams.keys()].sort()).toEqual(["application_name", "options"]);
-    expect(stripSslMode("not a url")).toBe("not a url");
+  });
+
+  it("G5R2-L2: a connection string WHATWG URL cannot parse is refused (fail closed), never passed on unstripped", () => {
+    // libpq form with an empty authority host: node-postgres parses it (and its sslmode=disable would override
+    // the explicit ssl option), WHATWG URL does not, so the TLS parameters could not be stripped.
+    const libpq = "postgres://owner:ownerpw@/db?host=db.invalid&sslmode=disable";
+    for (const url of [libpq, "not a url", ""]) {
+      let err: unknown;
+      try {
+        stripSslMode(url);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, url).toBeInstanceOf(DbError);
+      expect((err as DbError).code).toBe("INVALID_URL");
+      expect((err as Error).message).not.toContain("ownerpw");
+    }
   });
 
   it("withCredentials replaces user and password reversibly and keeps host, port and database", () => {

@@ -104,7 +104,8 @@ All commands from the repository root, with `RAILWAY_TOKEN` set as above.
    list only changes you intend. A plan that shows any of these is wrong and
    must not be applied: a destroy of a service, database, volume or variable; a
    change to the PostgreSQL image, volume or networking; a TCP proxy or domain
-   added anywhere; a change of `id-resolver`'s source. Values are redacted in
+   added anywhere; the removal of `id-resolver`'s generated public domain; a
+   change of `id-resolver`'s source. Values are redacted in
    plan output (`«hidden»`); do not use `--show-values` in a shared terminal.
 
 3. **Apply only a reviewed plan**:
@@ -129,36 +130,55 @@ against the live environment (the cell that wrote the file has no Railway
 access). The first plan is the verification; expect to adjust the image tag,
 region key or memory value if the live values differ.
 
-### Optional: plan-only CI (for the owner to enable)
+### Optional: plan in CI (for the owner to enable)
 
-No workflow is committed. If the owner wants a plan on pull requests, a
-plan-only job (never `apply`) that is skipped while no `RAILWAY_TOKEN` secret
-exists looks like this; pin the action by commit SHA as the other workflows
-do, and use a token scoped to the development environment:
+No workflow is committed. Before enabling one (G5R2-L7):
+
+* `railway config plan` **executes** `.railway/railway.ts` (TypeScript) with
+  the token in its environment, and a Railway project token is **not
+  plan-only**: it can apply, delete resources and read the non-sealed
+  variables of its environment. Never hand it to code from a pull request: no
+  `pull_request` (and never `pull_request_target`) trigger, because a branch
+  of this repository can change both `railway.ts` and the workflow itself.
+* Plan only code that is already merged: on `push` to `main` (paths
+  `.railway/**`) and/or `workflow_dispatch` run from `main`.
+* Keep the token in a GitHub **Environment** (for example `railway-dev`) with
+  required reviewers and a deployment-branch rule that allows `main` only,
+  not in a repository secret, so every run is approved and no other branch's
+  workflow can read it.
+* The token is an environment-scoped project token for the development
+  environment only, and only the plan step receives it.
+* Never `apply` from CI. The `railwayapp/config` action is referenced by
+  Railway's documentation; its behaviour was not verified here.
 
 ```yaml
 name: railway-config-plan
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths: [".railway/**"]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
   plan:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # Required reviewers; deployment branches: main only; holds RAILWAY_TOKEN.
+    environment: railway-dev
     env:
-      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      HAS_TOKEN: ${{ secrets.RAILWAY_TOKEN != '' }}
     steps:
-      - name: Skip without a token
-        if: env.RAILWAY_TOKEN == ''
-        run: echo "RAILWAY_TOKEN is not configured; skipping the plan."
       - uses: actions/checkout@<sha> # pin
-        if: env.RAILWAY_TOKEN != ''
         with:
           persist-credentials: false
-      - uses: railwayapp/config@<sha> # pin; command: plan only
-        if: env.RAILWAY_TOKEN != ''
+      - uses: actions/setup-node@<sha> # pin
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - name: Plan only (skipped while the environment has no RAILWAY_TOKEN)
+        if: env.HAS_TOKEN == 'true'
+        uses: railwayapp/config@<sha> # pin; command: plan only
         with:
           command: plan
           railway-token: ${{ secrets.RAILWAY_TOKEN }}
