@@ -10,14 +10,18 @@
  *   the applied set is re-read after the lock is taken, so a loser of the race
  *   sees the winner's work and does nothing.
  *
- * CLI: `npm run migrate` needs only DATABASE_URL (and optionally DATABASE_SSL,
- * default "require").
+ * CLI: `npm run migrate` / `node dist/db/migrate.js` needs DATABASE_URL (the
+ * owner) and follows the service's database TLS policy (DATABASE_SSL, default
+ * "require"; DATABASE_TLS_PIN_SHA256; DATABASE_CA_CERT; NODE_ENV=production,
+ * the default, refuses disable and unverified TLS).
  */
 import { readdir, readFile } from "node:fs/promises";
 import type { QueryConfig, QueryResultRow } from "pg";
 import { pathToFileURL } from "node:url";
 import type { Logger } from "../log/index.js";
-import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from "./pool.js";
+import { ConfigError, loadDatabaseTls } from "../config/index.js";
+import { createPool, DbError, guarded, toDbError, type Pool } from "./pool.js";
+import type { DbTlsConfig } from "./tls.js";
 
 /** Arbitrary constant namespace for the migration advisory lock. */
 const MIGRATION_LOCK_KEY = "7262021001";
@@ -146,12 +150,6 @@ export class MigrationError extends DbError {
   }
 }
 
-function parseSsl(raw: string | undefined): SslMode {
-  const v = raw ?? "require";
-  if (v === "require" || v === "disable" || v === "no-verify") return v;
-  throw new Error("DATABASE_SSL must be one of: require, disable, no-verify");
-}
-
 async function main(): Promise<void> {
   const databaseUrl = process.env["DATABASE_URL"];
   if (!databaseUrl) {
@@ -159,11 +157,14 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  let ssl: SslMode;
+  let ssl: DbTlsConfig;
   try {
-    ssl = parseSsl(process.env["DATABASE_SSL"]);
+    const loaded = loadDatabaseTls(process.env);
+    for (const w of loaded.warnings) console.error(`migrate: ${w}`);
+    ssl = loaded.tls;
   } catch (e) {
-    console.error(`migrate: ${(e as Error).message}`);
+    // ConfigError messages name variables only, never values.
+    console.error(`migrate: ${e instanceof ConfigError ? e.message : "invalid configuration"}`);
     process.exitCode = 1;
     return;
   }

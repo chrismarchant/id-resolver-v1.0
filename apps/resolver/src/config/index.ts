@@ -7,6 +7,7 @@
 import { z } from "zod";
 import { IDENTIFIER_PATTERN } from "../contracts/api.js";
 import { EVENT_CONSENT_MODES } from "../contracts/event.js";
+import { parseCaCert, parseTlsPins, SSL_MODES, type DbTlsConfig } from "../db/tls.js";
 
 const intInRange = (min: number, max: number, def: number) =>
   z.coerce.number().int().min(min).max(max).default(def);
@@ -47,7 +48,16 @@ export const ConfigSchema = z.object({
   IP_HMAC_KEY_VERSION: intInRange(1, 1_000_000, 1),
   ENRICH_API_KEY: z.string().max(512).default(""),
   DATABASE_URL: z.string().url().max(2048),
-  DATABASE_SSL: z.enum(["require", "disable", "no-verify"]).default("require"),
+
+  // Database TLS (src/db/tls.ts; RUNTIME.md "Database TLS")
+  DATABASE_SSL: z.enum(SSL_MODES).default("require"),
+  /** verify-pinned only: SHA-256 fingerprint(s) of the server's leaf certificate, "current" or "current,next". */
+  DATABASE_TLS_PIN_SHA256: z.string().max(400).optional(),
+  /** PEM CA bundle: trust anchors for require; an additional chain check for verify-pinned. Not a secret. */
+  DATABASE_CA_CERT: z.string().max(65_536).optional(),
+  /** DATABASE_SSL=no-verify is refused when NODE_ENV=production unless this is set (development deployment only). */
+  ALLOW_UNVERIFIED_DATABASE_TLS: boolFromString(false),
+
 
   // Provider
   PROVIDER_MODE: z.enum(["live", "mock", "disabled"]).default("disabled"),
@@ -122,6 +132,9 @@ export const SHUTDOWN_DRAIN_MARGIN_MS = 500;
 
 export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL"] as const;
 
+/** Kept out of describeConfig (not secret, but large and of no use in a log line). */
+const UNLOGGED_KEYS = ["DATABASE_CA_CERT"] as const;
+
 /**
  * Variables that existed in V0.1 / before CHR-70 and no longer have any
  * effect. Setting one is refused rather than silently ignored, so an operator
@@ -152,6 +165,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(`invalid configuration: ${names.join("; ")}`);
   }
   const cfg = parsed.data;
+  resolveDatabaseTls(cfg);
   if (cfg.PROVIDER_MODE === "mock" && cfg.NODE_ENV === "production" && !cfg.ALLOW_MOCK_PROVIDER) {
     throw new ConfigError("invalid configuration: PROVIDER_MODE=mock is refused when NODE_ENV=production unless ALLOW_MOCK_PROVIDER=true");
   }
@@ -176,6 +190,94 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return cfg;
 }
 
+/** The variables the database TLS policy reads (shared by the service, migrate and the ops commands). */
+export type DatabaseTlsSettings = Pick<Config, "NODE_ENV" | "DATABASE_SSL" | "DATABASE_TLS_PIN_SHA256" | "DATABASE_CA_CERT" | "ALLOW_UNVERIFIED_DATABASE_TLS">;
+
+/**
+ * The validated TLS configuration for every database connection path.
+ * Production (NODE_ENV=production, the default) refuses `disable` always and
+ * `no-verify` unless ALLOW_UNVERIFIED_DATABASE_TLS=true. Throws ConfigError
+ * naming variables only.
+ */
+export function resolveDatabaseTls(cfg: DatabaseTlsSettings): DbTlsConfig {
+  const mode = cfg.DATABASE_SSL;
+  const production = cfg.NODE_ENV === "production";
+  if (production && mode === "disable") {
+    throw new ConfigError("invalid configuration: DATABASE_SSL=disable is refused when NODE_ENV=production (use verify-pinned or require)");
+  }
+  if (production && mode === "no-verify" && !cfg.ALLOW_UNVERIFIED_DATABASE_TLS) {
+    throw new ConfigError(
+      "invalid configuration: DATABASE_SSL=no-verify is refused when NODE_ENV=production unless ALLOW_UNVERIFIED_DATABASE_TLS=true (development deployment only; use verify-pinned)",
+    );
+  }
+  if (cfg.DATABASE_TLS_PIN_SHA256 !== undefined && mode !== "verify-pinned") {
+    throw new ConfigError("invalid configuration: DATABASE_TLS_PIN_SHA256 is only used with DATABASE_SSL=verify-pinned");
+  }
+  if (cfg.DATABASE_CA_CERT !== undefined && mode !== "require" && mode !== "verify-pinned") {
+    throw new ConfigError("invalid configuration: DATABASE_CA_CERT is only used with DATABASE_SSL=require or verify-pinned");
+  }
+  let pins: string[] | undefined;
+  let caCert: string | undefined;
+  try {
+    if (mode === "verify-pinned") {
+      if (cfg.DATABASE_TLS_PIN_SHA256 === undefined) throw new Error("DATABASE_SSL=verify-pinned requires DATABASE_TLS_PIN_SHA256");
+      pins = parseTlsPins(cfg.DATABASE_TLS_PIN_SHA256);
+    }
+    if (cfg.DATABASE_CA_CERT !== undefined) caCert = parseCaCert(cfg.DATABASE_CA_CERT);
+  } catch (e) {
+    // The parsers' messages name variables only.
+    throw new ConfigError(`invalid configuration: ${(e as Error).message}`);
+  }
+  return { mode, ...(pins ? { pins } : {}), ...(caCert ? { caCert } : {}) };
+}
+
+const DatabaseTlsSchema = ConfigSchema.pick({
+  NODE_ENV: true,
+  DATABASE_SSL: true,
+  DATABASE_TLS_PIN_SHA256: true,
+  DATABASE_CA_CERT: true,
+  ALLOW_UNVERIFIED_DATABASE_TLS: true,
+});
+
+/**
+ * For the CLIs (migrate, ops commands): the same TLS policy as the service,
+ * read from the environment (NODE_ENV defaults to production there too), and
+ * one warning line per dev-only override that is set. Throws ConfigError
+ * naming variables only.
+ */
+export function loadDatabaseTls(env: NodeJS.ProcessEnv = process.env): { tls: DbTlsConfig; warnings: string[] } {
+  const parsed = DatabaseTlsSchema.safeParse(env);
+  if (!parsed.success) {
+    const names = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);
+    throw new ConfigError(`invalid configuration: ${names.join("; ")}`);
+  }
+  const tls = resolveDatabaseTls(parsed.data);
+  const warnings: string[] = [];
+  if (parsed.data.ALLOW_UNVERIFIED_DATABASE_TLS) {
+    warnings.push(
+      parsed.data.NODE_ENV === "production" && parsed.data.DATABASE_SSL === "no-verify"
+        ? "warning: override ALLOW_UNVERIFIED_DATABASE_TLS is active: the database certificate is not verified (development deployment only)"
+        : "warning: override ALLOW_UNVERIFIED_DATABASE_TLS is set but has no effect; remove it",
+    );
+  }
+  return { tls, warnings };
+}
+
+export interface OverrideState {
+  variable: "ALLOW_MOCK_PROVIDER" | "ALLOW_UNVERIFIED_DATABASE_TLS";
+  /** active: it is relaxing a production control right now; inert: set but without effect (remove it). */
+  state: "active" | "inert";
+}
+
+/** Every dev-only override that is set, and whether it is in effect. Logged as warnings at startup (names only). */
+export function configOverrides(cfg: Config): OverrideState[] {
+  const production = cfg.NODE_ENV === "production";
+  const out: OverrideState[] = [];
+  if (cfg.ALLOW_MOCK_PROVIDER) out.push({ variable: "ALLOW_MOCK_PROVIDER", state: production && cfg.PROVIDER_MODE === "mock" ? "active" : "inert" });
+  if (cfg.ALLOW_UNVERIFIED_DATABASE_TLS) out.push({ variable: "ALLOW_UNVERIFIED_DATABASE_TLS", state: production && cfg.DATABASE_SSL === "no-verify" ? "active" : "inert" });
+  return out;
+}
+
 /**
  * Removes the secrets from the live process environment once the validated
  * configuration holds them, so no later code path (a dependency reading
@@ -191,7 +293,7 @@ export function scrubSecretEnv(env: NodeJS.ProcessEnv = process.env): void {
 export function describeConfig(cfg: Config): Record<string, string | number | boolean | string[]> {
   const out: Record<string, string | number | boolean | string[]> = {};
   for (const [k, v] of Object.entries(cfg)) {
-    if ((SECRET_KEYS as readonly string[]).includes(k)) continue;
+    if ((SECRET_KEYS as readonly string[]).includes(k) || (UNLOGGED_KEYS as readonly string[]).includes(k)) continue;
     if (v === undefined) continue;
     out[k] = v as string | number | boolean | string[];
   }

@@ -13,9 +13,10 @@
  * Exit codes: 0 graceful stop; 1 startup failure or shutdown overrun;
  * 70 fatal fault (process_fatal); 137 (SIGKILL) event loop blocked.
  */
-import { loadConfig, describeConfig, ConfigError, scrubSecretEnv } from "./config/index.js";
+import { loadConfig, describeConfig, ConfigError, scrubSecretEnv, resolveDatabaseTls, configOverrides } from "./config/index.js";
 import { createLogger } from "./log/index.js";
 import { createDb } from "./db/index.js";
+import { DbError } from "./db/pool.js";
 import { assertSchemaCurrent, PendingMigrationsError } from "./db/migrate.js";
 import { createFeedRetention } from "./db/retention.js";
 import { createProvider } from "./provider/index.js";
@@ -40,11 +41,19 @@ async function main(): Promise<void> {
     ready: safe["REPORTING_ENABLED"] === true,
     events_enabled: config.EVENTS_ENABLED,
     event_consent_mode: config.EVENT_CONSENT_MODE,
+    tls_mode: config.DATABASE_SSL,
   });
+  // Dev-only overrides (names only): "active" relaxes a production control now, "inert" is set without effect.
+  for (const o of configOverrides(config)) logger.warn("config_override", { variable: o.variable, outcome: o.state });
 
   // Browser-event writes (event.v1) get their own connections when enabled, so they never compete with resolution jobs.
   const eventWriteSlots = config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0;
-  const db = createDb({ databaseUrl: config.DATABASE_URL, ssl: config.DATABASE_SSL, max: poolSizeFor(config.MAX_CONCURRENT_JOBS, eventWriteSlots), logger });
+  const db = createDb({
+    databaseUrl: config.DATABASE_URL,
+    ssl: resolveDatabaseTls(config),
+    max: poolSizeFor(config.MAX_CONCURRENT_JOBS, eventWriteSlots),
+    logger,
+  });
   // Migrations never run on start (they are the deploy pre-step). Fail closed
   // while this build's migrations are not all applied.
   const schema = await assertSchemaCurrent(db.pool, logger);
@@ -130,10 +139,20 @@ async function main(): Promise<void> {
   maintenance.start(config.CACHE_PRUNE_INTERVAL_S * 1000);
 }
 
+/** Startup failure text: names variables, files or fixed codes, never a value, a host or a URL. */
+function startupFailureDetail(err: unknown): string {
+  if (err instanceof ConfigError || err instanceof PendingMigrationsError) return err.message;
+  if (err instanceof DbError && err.code.startsWith("DB_TLS_")) {
+    return (
+      `database TLS verification failed (${err.code}): check DATABASE_SSL, DATABASE_TLS_PIN_SHA256 and DATABASE_CA_CERT ` +
+      "(node dist/ops/db-tls-fingerprint.js prints the certificate the server presents)"
+    );
+  }
+  return "startup failed (check configuration and database connectivity)";
+}
+
 main().catch((err: unknown) => {
-  // ConfigError messages name variables, never values; PendingMigrationsError
-  // names migration files only; anything else is generic.
-  const detail = err instanceof ConfigError || err instanceof PendingMigrationsError ? err.message : "startup failed (check configuration and database connectivity)";
+  const detail = startupFailureDetail(err);
   process.stderr.write(`id-resolver: ${detail}\n`);
   process.exit(1);
 });

@@ -38,6 +38,7 @@ export const LOG_EVENTS = [
   "maintenance_run",
   "maintenance_backlog",
   "event_prune",
+  "config_override",
 ] as const;
 
 export type LogEvent = (typeof LOG_EVENTS)[number];
@@ -74,6 +75,8 @@ export const LOG_FIELDS = [
   "backlog",
   "events_enabled",
   "event_consent_mode",
+  "variable",
+  "tls_mode",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];

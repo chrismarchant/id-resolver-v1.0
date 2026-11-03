@@ -90,20 +90,31 @@ association.
 * **Retention and cache pruning** run once at startup and then every
   interval, draining in bounded batches within `CACHE_PRUNE_BUDGET_MS`. A run
   that cannot finish logs `maintenance_backlog` (alert on repeats).
-* **Database TLS (`DATABASE_SSL`).** `require` (the default) verifies the
-  server certificate against the system CA store. `no-verify` encrypts without
-  verifying the certificate. `disable` sends plaintext and must never be used
-  outside local tests.
-  * **Development (temporary):** `no-verify`. The connection runs over
-    Railway's private network (WireGuard-encrypted between services), and the
-    Railway PostgreSQL template presents a self-signed certificate.
-  * **Production (required before Gate 6):** a verified connection, plus a
-    private-network-only database with no public TCP proxy. Either pin the
-    instance's own certificate (a planned `verify-pinned` mode with
-    `DATABASE_CA_CERT`, plus a renewal runbook because the template
-    certificate expires), or use a PostgreSQL provider whose certificate
-    chains to a public CA and keep `require`. `no-verify` is not acceptable
-    in production.
+* **Database TLS (`DATABASE_SSL`)** *(Gate 5)*, applied to every connection
+  path (the service pool, `migrate.js` and every ops command; TLS parameters
+  in `DATABASE_URL` are stripped). Details and runbooks:
+  [RUNTIME.md, "Database TLS"](../apps/resolver/RUNTIME.md#database-tls).
+  * `verify-pinned`: the server's leaf certificate must match a SHA-256 pin
+    (`DATABASE_TLS_PIN_SHA256`, `current[,next]` for rotation), optionally
+    also chaining to `DATABASE_CA_CERT`. Built for the Railway PostgreSQL
+    template, whose self-generated certificate chains to nothing public and
+    whose names need not match the private host name. The pin is checked
+    before node-postgres sends a byte; a mismatch fails closed.
+  * `require` (default): chain to the system CAs or `DATABASE_CA_CERT`, plus
+    the host name.
+  * `no-verify`: encrypted, unauthenticated. **Refused in production** unless
+    the dev-only override `ALLOW_UNVERIFIED_DATABASE_TLS=true` is set (logged
+    as a `config_override` warning on every start).
+  * `disable`: plaintext. **Always refused in production**; local
+    development and tests only.
+  * `node dist/ops/db-tls-fingerprint.js` discovers the pin (unverified
+    handshake only, no credentials sent; trust on first use, so confirm it
+    against the certificate file on the database volume).
+  * **Development:** switch from `no-verify` to `verify-pinned` (until then
+    the build refuses `no-verify` unless `ALLOW_UNVERIFIED_DATABASE_TLS=true`).
+    **Production (before Gate 6):** `verify-pinned` (or `require` with a
+    CA-issued certificate) and a private-network-only database with no TCP
+    proxy or public domain.
 * **Paid enrichment is off unless** `PROVIDER_MODE=live` and
   `ENRICHMENT_ENABLED=true`.
 * **Spend controls:** an atomic period cap and a runtime kill switch

@@ -37,7 +37,7 @@ async function main(): Promise<void> {
   try {
     const target = parseEraseArgs(process.argv.slice(2));
     const cfg = loadOpsConfig();
-    const db = createDb({ databaseUrl: cfg.DATABASE_URL, ssl: cfg.DATABASE_SSL, max: 1 });
+    const db = createDb({ databaseUrl: cfg.DATABASE_URL, ssl: cfg.DATABASE_TLS, max: 1 });
     try {
       const r = await eraseCompany(db.pool, target);
       console.log(

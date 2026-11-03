@@ -95,6 +95,107 @@ name variables, never values. See `.env.example` for every variable.
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
 
+## Database TLS
+
+`DATABASE_SSL` governs **every** database connection: the service pool,
+`node dist/db/migrate.js` and every `ops:*` command (all go through
+`createPool`, `src/db/pool.ts`; the policy is `resolveDatabaseTls` in
+`src/config/index.ts`, the mechanics are in `src/db/tls.ts`). TLS parameters
+inside `DATABASE_URL` (`sslmode`, `ssl`, `sslrootcert`, `sslcert`, `sslkey`,
+`sslnegotiation`, `uselibpqcompat`, ...) are stripped, so the URL can neither
+weaken nor redirect TLS.
+
+| `DATABASE_SSL` | Encrypted | Verified | Production (`NODE_ENV=production`, the default) |
+|---|---|---|---|
+| `verify-pinned` | yes | the server's leaf certificate has a SHA-256 fingerprint listed in `DATABASE_TLS_PIN_SHA256` (one, or two during a rotation); with `DATABASE_CA_CERT` also the chain and the validity period. The host name is not checked. | allowed (the target for the Railway PostgreSQL template) |
+| `require` (default) | yes | chain to the system CAs, or to `DATABASE_CA_CERT` when set, **and** the host name | allowed |
+| `no-verify` | yes | nothing (encrypted, not authenticated) | **refused** unless `ALLOW_UNVERIFIED_DATABASE_TLS=true` (development deployment only; a `config_override` warning is logged at every start) |
+| `disable` | no | — | **refused**, also with the override; local development and tests only (`NODE_ENV=development` or `test`) |
+
+`DATABASE_TLS_PIN_SHA256` with a mode other than `verify-pinned`, and
+`DATABASE_CA_CERT` with `no-verify` or `disable`, are refused rather than
+ignored. Errors name variables only.
+
+**Why a pin.** The Railway `postgres-ssl` template creates its own root CA
+(`CN=root-ca`) and a server certificate (`CN=localhost`, SAN `DNS:localhost`
+and, in recent template versions, the private host name) on the data volume
+at first start. It chains to nothing public, so `require` fails without the
+template's CA, and the host name may not be in it. Pinning the exact leaf
+certificate needs neither: only a server holding that certificate's private
+key can complete the handshake. The cost: the pin changes whenever the
+certificate is regenerated (rotation, below). If the certificate's SANs
+include the private host name, `require` with `DATABASE_CA_CERT` set to the
+template's `root.crt` is an equivalent alternative (full host-name check);
+the template regenerates that CA together with the leaf, so it needs the same
+rotation.
+
+**How the pin is enforced.** Node calls a `checkServerIdentity` override only
+after the chain verified, so for a self-signed certificate it is never
+called, even with `rejectUnauthorized: false`: a pin check there would accept
+any certificate. Instead the service hands node-postgres its own socket
+(`PinnedTlsSocket`, node-postgres's `stream` option, node-postgres TLS off):
+it sends the SSLRequest, completes the handshake, compares the leaf
+fingerprint with the pins (constant-time) and only then lets node-postgres
+start. On a mismatch not one protocol byte (no startup message, user name or
+password) is sent; the connection fails with `DB_TLS_PIN_MISMATCH`. A server
+that answers the SSLRequest with anything but a single `S` is refused
+(`DB_TLS_REFUSED` / `DB_TLS_PROTOCOL`). With `DATABASE_CA_CERT`, OpenSSL also
+verifies the chain and validity (`DB_TLS_VERIFY_FAILED`). In pin-only mode
+the validity period is not enforced: an expired but pinned certificate still
+proves possession of the pinned key; renew it before it expires (the template
+regenerates it at a restart within 30 days of expiry, which changes the pin).
+
+At startup a failed verification exits 1 with `database TLS verification
+failed (<code>): check DATABASE_SSL, DATABASE_TLS_PIN_SHA256 and
+DATABASE_CA_CERT`. While running, existing connections stay up and new ones
+fail closed: requests answer `unavailable` and `/readyz` turns 503 until the
+pin is corrected.
+
+### Discovering the fingerprint
+
+```
+node dist/ops/db-tls-fingerprint.js      # in the service (Railway: railway ssh into id-resolver)
+npm run ops:db-tls-fingerprint           # locally
+```
+
+It reads only the host and port of `DATABASE_URL`, performs the SSLRequest
+and an **unverified** TLS handshake, and closes: it never sends the startup
+message, so no user name, password or database name leaves the process and
+nothing is read from the database. It prints one JSON object: `sha256` (the
+value for `DATABASE_TLS_PIN_SHA256`), `subject_cn`, `subject_alt_names`,
+`valid_from`, `valid_to`, and `matches_configured_pin` when
+`DATABASE_TLS_PIN_SHA256` is set. Errors print a fixed code only.
+`subject_alt_names` may contain the private host name: keep the output in
+private notes, never in this repository.
+
+**Trust on first use.** The first reading is only as trustworthy as the path
+it was read over. Run it inside the service, over the private network (which
+Railway encrypts between services), never through a public TCP proxy, and
+confirm it with a second, independent reading taken on the database's own
+volume (Railway shell of the PostgreSQL service):
+`openssl x509 -noout -fingerprint -sha256 -in /var/lib/postgresql/data/certs/server.crt`
+(the colon-separated output is accepted as a pin as is).
+
+### Rotation (two pins)
+
+`DATABASE_TLS_PIN_SHA256` takes `current,next` for the window in which the
+server may present either certificate:
+
+1. Obtain the next certificate's fingerprint (planned renewal: from the new
+   `server.crt` on the volume before it is activated; unplanned: the
+   template already switched, see below).
+2. Set `DATABASE_TLS_PIN_SHA256=<current>,<next>` on the service (this
+   redeploys; migrate and the service accept either certificate).
+3. Activate the next certificate (`SELECT pg_reload_conf()` as the owner
+   after the files were replaced, or a restart of the PostgreSQL service).
+4. Confirm with the helper (`matches_configured_pin: true`, new `sha256`),
+   then set `DATABASE_TLS_PIN_SHA256=<next>`.
+
+Unplanned regeneration (the template restarted within 30 days of expiry, or
+the volume was replaced): new connections fail closed. Take both readings
+above, set the new pin, redeploy. Put `valid_to` minus 45 days in the
+operations calendar to keep renewals planned.
+
 ## Browser events (CHR-64)
 
 Contract `event.v1` (`docs/contracts/event.v1.md`), owner decision D4:

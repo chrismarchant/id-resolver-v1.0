@@ -305,7 +305,7 @@ async function main(): Promise<number> {
     for (const check of [KS_PRIOR, KS_ENGAGED, KS_DISABLED, KS_RESTORED, KS_CACHE_HIT, KS_CONTROL]) record(check, true, why);
   } else {
     const installationId = ops.INSTALLATION_ID;
-    const db = createDb({ databaseUrl: ops.DATABASE_URL, ssl: ops.DATABASE_SSL, max: 1 });
+    const db = createDb({ databaseUrl: ops.DATABASE_URL, ssl: ops.DATABASE_TLS, max: 1 });
     // While the switch may be held engaged, a signal must not skip the restore:
     // it is noted, the phase finishes (bounded), and the run exits 2.
     const onSignal = () => {

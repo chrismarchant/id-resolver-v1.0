@@ -1,18 +1,27 @@
 /**
  * Startup refusals of the real service process (src/main.ts), from the
  * outside: pending migrations (migrations never run on start), the mock
- * provider in production, the required retention window (D3) and removed
- * pre-CHR-70 variables. Every refusal exits non-zero before listening, names
- * the problem, and never prints a secret or the database URL.
+ * provider in production, the required retention window (D3), removed
+ * pre-CHR-70 variables and the production database TLS policy (Gate 5).
+ * Every refusal exits non-zero before listening, names the problem, and
+ * never prints a secret or the database URL.
+ *
+ * The service runs in its production posture: NODE_ENV=production with
+ * verified (pinned) TLS through a runtime-generated TLS terminator in front
+ * of the test database (production refuses plaintext and unverified TLS).
  */
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createScratchDatabase, createTestDb, getTestDatabaseUrl } from "../helpers/db.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
+import { startProductionDb } from "../helpers/prod-db.js";
+import { makeCertificate } from "../helpers/tls.js";
 import type { Db } from "../../src/db/index.js";
 
 const ROOT = resolve(import.meta.dirname, "..", "..");
+const prodDb = await startProductionDb();
+afterAll(() => prodDb.close());
 
 function baseEnv(over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
@@ -25,8 +34,7 @@ function baseEnv(over: Record<string, string | undefined> = {}): NodeJS.ProcessE
     WEBSITE_ID: "site-test",
     RESOLVER_AUTH_TOKEN: TEST_AUTH_TOKEN,
     IP_HMAC_SECRET: TEST_HMAC_SECRET,
-    DATABASE_URL: getTestDatabaseUrl(),
-    DATABASE_SSL: "disable",
+    ...prodDb.env(),
     PROVIDER_MODE: "disabled",
     OBSERVATION_RETENTION_DAYS: "30",
   };
@@ -61,7 +69,7 @@ function runService(env: NodeJS.ProcessEnv, opts: { stopAfterStart?: boolean } =
 }
 
 function expectNoSecrets(output: string, databaseUrl: string) {
-  for (const needle of [TEST_AUTH_TOKEN, TEST_HMAC_SECRET, databaseUrl, "resolver:resolver"]) expect(output).not.toContain(needle);
+  for (const needle of [TEST_AUTH_TOKEN, TEST_HMAC_SECRET, databaseUrl, prodDb.url(), "resolver:resolver", "127.0.0.1:"]) expect(output).not.toContain(needle);
 }
 
 describe("service startup refusals", () => {
@@ -77,7 +85,7 @@ describe("service startup refusals", () => {
   });
 
   it("refuses to start while the database has pending migrations, naming them, and creates nothing", async () => {
-    const r = await runService(baseEnv({ DATABASE_URL: scratch.url }));
+    const r = await runService(baseEnv({ DATABASE_URL: prodDb.url(scratch.url) }));
     expect(r.code, r.output).toBe(1);
     expect(r.started).toBe(false);
     expect(r.output).toContain("pending migration(s): 0001_initial.sql");
@@ -92,12 +100,52 @@ describe("service startup refusals", () => {
     }
   });
 
-  it("starts on a current database and stops cleanly", async () => {
+  it("starts on a current database over pinned TLS and stops cleanly", async () => {
     const r = await runService(baseEnv(), { stopAfterStart: true });
     expect(r.started, r.output).toBe(true);
     expect(r.code).toBe(0);
     expect(r.output).toContain('"event":"migration_check"');
+    expect(r.output).toContain('"tls_mode":"verify-pinned"');
+    expect(r.output).not.toContain('"event":"config_override"');
     expectNoSecrets(r.output, getTestDatabaseUrl());
+  });
+
+  it("production refuses DATABASE_SSL=disable, even with the override", async () => {
+    for (const over of [{}, { ALLOW_UNVERIFIED_DATABASE_TLS: "true" }]) {
+      const r = await runService(baseEnv({ DATABASE_URL: getTestDatabaseUrl(), DATABASE_SSL: "disable", DATABASE_TLS_PIN_SHA256: undefined, ...over }));
+      expect(r.code).toBe(1);
+      expect(r.started).toBe(false);
+      expect(r.output).toContain("DATABASE_SSL=disable is refused when NODE_ENV=production");
+      expectNoSecrets(r.output, getTestDatabaseUrl());
+    }
+  });
+
+  it("production refuses DATABASE_SSL=no-verify unless ALLOW_UNVERIFIED_DATABASE_TLS=true, and then warns by name on every start", async () => {
+    const env = { DATABASE_SSL: "no-verify", DATABASE_TLS_PIN_SHA256: undefined };
+    const refused = await runService(baseEnv(env));
+    expect(refused.code).toBe(1);
+    expect(refused.output).toContain("DATABASE_SSL=no-verify is refused when NODE_ENV=production unless ALLOW_UNVERIFIED_DATABASE_TLS=true");
+    const allowed = await runService(baseEnv({ ...env, ALLOW_UNVERIFIED_DATABASE_TLS: "true" }), { stopAfterStart: true });
+    expect(allowed.started, allowed.output).toBe(true);
+    expect(allowed.code).toBe(0);
+    const override = allowed.output.split("\n").find((l) => l.includes('"event":"config_override"'));
+    expect(override).toBeDefined();
+    expect(JSON.parse(override!)).toMatchObject({ level: "warn", variable: "ALLOW_UNVERIFIED_DATABASE_TLS", outcome: "active" });
+    expectNoSecrets(refused.output + allowed.output, getTestDatabaseUrl());
+  });
+
+  it("refuses to start when the server's certificate is not pinned, naming the variables and never a value", async () => {
+    const wrongPin = makeCertificate({ cn: "localhost" }).sha256;
+    const r = await runService(baseEnv({ DATABASE_TLS_PIN_SHA256: wrongPin }));
+    expect(r.code).toBe(1);
+    expect(r.started).toBe(false);
+    expect(r.output).toContain("database TLS verification failed (DB_TLS_PIN_MISMATCH): check DATABASE_SSL, DATABASE_TLS_PIN_SHA256 and DATABASE_CA_CERT");
+    expect(r.output).not.toContain(wrongPin);
+    expect(r.output).not.toContain(prodDb.cert.sha256);
+    expectNoSecrets(r.output, getTestDatabaseUrl());
+    // During a rotation window both pins are accepted.
+    const rotation = await runService(baseEnv({ DATABASE_TLS_PIN_SHA256: `${wrongPin},${prodDb.cert.sha256}` }), { stopAfterStart: true });
+    expect(rotation.started, rotation.output).toBe(true);
   });
 
   it("refuses PROVIDER_MODE=mock in production unless ALLOW_MOCK_PROVIDER=true", async () => {
