@@ -10,8 +10,14 @@
  * activity then id, stable under concurrent inserts. Date ranges: inclusive
  * UTC calendar dates, converted to the half-open instant range
  * [from 00:00:00Z, to + 1 day 00:00:00Z); at most REPORTING_MAX_RANGE_DAYS days.
+ *
+ * The observation feed (reporting-feed.v1, GET /v1/reporting/observations) is
+ * registered only when `feed.cursorKey` is supplied: its cursors are
+ * integrity-protected (HMAC) positions, see encodeFeedCursor below.
  */
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyReply } from "fastify";
+import { z } from "zod";
 import {
   REPORTING_API_VERSION,
   REPORTING_MAX_RANGE_DAYS,
@@ -24,16 +30,39 @@ import {
   type ReportingSummaryResponse,
 } from "../contracts/api.js";
 import type { CompaniesCursor, CompanyActivitySummary, CompanyOrder, ObservationItem, ObservationsCursor, ReportingRepository } from "../contracts/db.js";
+import {
+  FEED_CONTRACT,
+  FEED_CURSOR_EXPIRED_STATUS,
+  FEED_DEFAULT_LIMIT,
+  FEED_KIND_OBSERVATION,
+  FEED_KIND_TOMBSTONE,
+  FEED_MAX_LIMIT,
+  FEED_START,
+  FEED_VERSION,
+  type FeedCursorExpiredResponse,
+  type FeedItemWire,
+  type FeedPosition,
+  type FeedRecord,
+  type ReportingFeedResponse,
+} from "../contracts/reporting-feed.js";
 import type { Logger } from "../log/index.js";
 import { CompaniesQuerySchema, CompanyIdParamSchema, ObservationsQuerySchema, SummaryQuerySchema } from "./schema.js";
 
 export const REPORTING_PREFIX = "/v1/reporting";
+export const FEED_ROUTE = `${REPORTING_PREFIX}/observations`;
+
+export interface ReportingFeedOptions {
+  /** 32-byte key for the cursor MAC; derive it with deriveFeedCursorKey from a server-only secret. */
+  cursorKey: Buffer;
+}
 
 export interface ReportingDeps {
   scope: ReportingScope;
   reporting: ReportingRepository;
   logger: Logger;
   sendError: (reply: FastifyReply, error: ErrorCode) => FastifyReply;
+  /** Enables GET /v1/reporting/observations. Absent: the route does not exist (fail closed). */
+  feed?: ReportingFeedOptions;
 }
 
 const DAY_MS = 86_400_000;
@@ -111,6 +140,102 @@ export function dateRange(from: string, to: string): { from: Date; to: Date } | 
   return { from: new Date(a), to: new Date(b + DAY_MS) };
 }
 
+// ---- feed cursors (reporting-feed.v1) ----------------------------------------
+//
+// A cursor is base64url(payload || tag) where payload is 18 bytes:
+//   [0] format version (1) | [1..8] txid u64 BE | [9] kind | [10..17] id u64 BE
+// and tag is the first 16 bytes of HMAC-SHA-256(key, label | scope | payload).
+// The scope is bound into the tag, so a cursor from another deployment scope is
+// rejected. 34 bytes encode to exactly 46 base64url characters. Positions are
+// not secret (a consumer could infer them); the tag only makes a tampered or
+// fabricated position detectable (400) instead of silently skipping data.
+
+const FEED_CURSOR_FORMAT = 1;
+const FEED_CURSOR_PAYLOAD_BYTES = 18;
+const FEED_CURSOR_TAG_BYTES = 16;
+const FEED_CURSOR_PATTERN = /^[A-Za-z0-9_-]{46}$/;
+const FEED_CURSOR_KEY_LABEL = "id-resolver/reporting-feed.v1/cursor-key";
+const FEED_CURSOR_TAG_LABEL = "id-resolver/reporting-feed.v1/cursor";
+const U64_MAX = 0xffff_ffff_ffff_ffffn;
+const I64_MAX = 0x7fff_ffff_ffff_ffffn;
+
+/**
+ * Derives the cursor MAC key from an existing server-only secret (MAIN wires
+ * IP_HMAC_SECRET; the reporting token is unsuitable because the consumer holds
+ * it). Domain-separated from every other use of that secret by its label, so
+ * the derived key reveals nothing about the fingerprint key. Rotating the
+ * secret invalidates outstanding cursors (400); consumers then resynchronise
+ * from the start of the buffer, which is safe because they apply idempotently.
+ */
+export function deriveFeedCursorKey(secret: string): Buffer {
+  if (typeof secret !== "string" || secret.length < 32) throw new Error("feed cursor key: secret too short");
+  return createHmac("sha256", Buffer.from(secret, "utf8")).update(FEED_CURSOR_KEY_LABEL, "utf8").digest();
+}
+
+function feedCursorTag(key: Buffer, scope: ReportingScope, payload: Buffer): Buffer {
+  const h = createHmac("sha256", key);
+  for (const part of [FEED_CURSOR_TAG_LABEL, scope.installation_id, scope.website_id]) {
+    const b = Buffer.from(part, "utf8");
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(b.length, 0);
+    h.update(len).update(b);
+  }
+  h.update(payload);
+  return h.digest().subarray(0, FEED_CURSOR_TAG_BYTES);
+}
+
+export function encodeFeedCursor(position: FeedPosition, key: Buffer, scope: ReportingScope): string {
+  if (position.txid < 0n || position.txid > U64_MAX || position.id < 0n || position.id > I64_MAX) throw new Error("feed cursor: position out of range");
+  const payload = Buffer.alloc(FEED_CURSOR_PAYLOAD_BYTES);
+  payload.writeUInt8(FEED_CURSOR_FORMAT, 0);
+  payload.writeBigUInt64BE(position.txid, 1);
+  payload.writeUInt8(position.kind, 9);
+  payload.writeBigUInt64BE(position.id, 10);
+  return Buffer.concat([payload, feedCursorTag(key, scope, payload)]).toString("base64url");
+}
+
+/** The position a cursor encodes, or undefined when it is malformed, tampered with or issued for another scope or key. */
+export function decodeFeedCursor(raw: string, key: Buffer, scope: ReportingScope): FeedPosition | undefined {
+  if (typeof raw !== "string" || !FEED_CURSOR_PATTERN.test(raw)) return undefined;
+  const buf = Buffer.from(raw, "base64url");
+  // Reject non-canonical encodings (stray low bits in the last character).
+  if (buf.length !== FEED_CURSOR_PAYLOAD_BYTES + FEED_CURSOR_TAG_BYTES || buf.toString("base64url") !== raw) return undefined;
+  const payload = buf.subarray(0, FEED_CURSOR_PAYLOAD_BYTES);
+  const tag = buf.subarray(FEED_CURSOR_PAYLOAD_BYTES);
+  if (!timingSafeEqual(tag, feedCursorTag(key, scope, payload))) return undefined;
+  if (payload.readUInt8(0) !== FEED_CURSOR_FORMAT) return undefined;
+  const kind = payload.readUInt8(9);
+  if (kind !== FEED_KIND_OBSERVATION && kind !== FEED_KIND_TOMBSTONE) return undefined;
+  const id = payload.readBigUInt64BE(10);
+  if (id > I64_MAX) return undefined;
+  return { txid: payload.readBigUInt64BE(1), kind, id };
+}
+
+export const FeedQuerySchema = z
+  .object({
+    after: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(),
+    limit: z.coerce.number().int().min(1).max(FEED_MAX_LIMIT).default(FEED_DEFAULT_LIMIT),
+  })
+  .strict();
+
+function toFeedItem(r: FeedRecord): FeedItemWire {
+  if (r.type === "company_erased") {
+    return { type: "company_erased", tombstone_id: r.tombstoneId.toString(), company_id: r.companyId, erased_at: r.erasedAt.toISOString() };
+  }
+  return {
+    type: "observation",
+    observation_id: r.observationId.toString(),
+    company_id: r.companyId,
+    domain: r.domain,
+    organisation_name: r.organisationName,
+    observed_at: r.observedAt.toISOString(),
+    method: r.method,
+    page_key: r.pageKey,
+    acquisition: r.acquisition,
+    entrance_contract: r.entranceContract,
+  };
+}
+
 // ---- projections -----------------------------------------------------------
 
 function toCompany(c: CompanyActivitySummary): ReportingCompany {
@@ -136,6 +261,8 @@ function toObservation(o: ObservationItem): ReportingObservation {
 
 export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDeps): void {
   const { scope, reporting, logger, sendError } = deps;
+  // Validate before registering anything, so a bad key never leaves a half-registered API.
+  if (deps.feed && (!Buffer.isBuffer(deps.feed.cursorKey) || deps.feed.cursorKey.length < 32)) throw new Error("feed cursor key must be at least 32 bytes");
   const rejected = (reply: FastifyReply, route: string, error: ErrorCode, http: number) => {
     logger.warn("request_rejected", { route, error_code: error, http_status: http });
     return sendError(reply, error);
@@ -217,6 +344,59 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
       return reply.code(200).send(body);
     } catch {
       return dbFailed(reply, route);
+    }
+  });
+
+  if (deps.feed) registerFeedRoute(app, deps, deps.feed);
+}
+
+/**
+ * GET /v1/reporting/observations?after=&limit= (reporting-feed.v1). Shares the
+ * reporting credential check and the separate "reporting" rate-limit bucket
+ * with the other reporting routes (both keyed on the /v1/reporting prefix in
+ * the server). All ordering and commit-safety guarantees live in one database
+ * statement (src/db/reporting-repo.ts, FEED_SQL); this handler only validates,
+ * signs and projects.
+ */
+function registerFeedRoute(app: FastifyInstance, deps: ReportingDeps, feed: ReportingFeedOptions): void {
+  const { scope, reporting, logger, sendError } = deps;
+  const key = Buffer.from(feed.cursorKey);
+  const s = { installationId: scope.installation_id, websiteId: scope.website_id };
+
+  app.get(FEED_ROUTE, async (req, reply) => {
+    const route = FEED_ROUTE;
+    const q = FeedQuerySchema.safeParse(req.query ?? {});
+    if (!q.success) {
+      logger.warn("request_rejected", { route, error_code: "invalid_request", http_status: 400 });
+      return sendError(reply, "invalid_request");
+    }
+    const after = q.data.after === undefined ? null : decodeFeedCursor(q.data.after, key, scope);
+    if (after === undefined) {
+      logger.warn("request_rejected", { route, error_code: "invalid_request", http_status: 400 });
+      return sendError(reply, "invalid_request");
+    }
+    try {
+      const page = await reporting.feed(s, { after, limit: q.data.limit });
+      if (page.expired) {
+        logger.warn("request_rejected", { route, error_code: "cursor_expired", http_status: FEED_CURSOR_EXPIRED_STATUS });
+        const expired: FeedCursorExpiredResponse = { version: FEED_VERSION, error: "cursor_expired" };
+        return reply.code(FEED_CURSOR_EXPIRED_STATUS).send(expired);
+      }
+      const last = page.items[page.items.length - 1];
+      const position = last ? last.position : (after ?? FEED_START);
+      const body: ReportingFeedResponse = {
+        version: FEED_VERSION,
+        contract: FEED_CONTRACT,
+        scope,
+        items: page.items.map(toFeedItem),
+        next_cursor: encodeFeedCursor(position, key, scope),
+        has_more: page.hasMore,
+      };
+      logger.info("request_completed", { route, http_status: 200, count: body.items.length });
+      return reply.code(200).send(body);
+    } catch {
+      logger.error("request_rejected", { route, error_code: "internal", http_status: 500 });
+      return sendError(reply, "internal");
     }
   });
 }
