@@ -22,7 +22,10 @@ official page; the page itself was not read) or **UNVERIFIED**, with the URL and
 pages before approving costs or relying on a limit. The single most important one: Cloudflare's header reference is
 inconsistent about whether a Worker subrequest to a **non-Cloudflare** host carries the visitor's IP in
 `CF-Connecting-IP` / `X-Real-IP`. The Cloudflare plan therefore **measures** this (T5) and makes it a hard gate,
-instead of relying on "the resolver is outside the site's zone" alone (G4-I8).
+instead of relying on "the resolver is outside the site's zone" alone (G4-I8). The owner's decision of 3 Nov 2026
+makes T5 a mandatory staging gate with six requirements (inspection at the receiving boundary on the real edge, all
+headers, explicit outbound headers, no visitor IP in retained evidence, stop on propagation, no D4 claim from local
+tests): section 4 of that plan. T5 has not been run.
 
 ## What needs separate owner approval
 
@@ -65,8 +68,8 @@ Every item below is an owner action. None of them may be done by a cell, and eac
 
 1. **Review and approve these plans** (this gate). Confirm the SEARCH-ONLY facts on the live pages.
 2. **Cloudflare first, canary only** (CLOUDFLARE_TEST_SITE.md 5.1 steps 1 and 2): provision the site and the
-   canary, run `preflight` and `ttfb`. **Stop if T5 (G4-I8) fails** and decide one of the options in section 4
-   of that plan before going on.
+   canary, run `preflight` and `ttfb`. **If T5 (G4-I8) observes visitor-IP propagation, stop staging acceptance**
+   and the owner decides one of the options in section 4 of that plan before anything else runs.
 3. The rest of the Cloudflare plan: T3, T6 to T10, the real browsers (T8), then T11 and T12 against the development
    resolver.
 4. **Hosted Supabase** (independent of step 3, but it uses the same development resolver): HU, H0 to H8, H13 to H15;
@@ -80,13 +83,19 @@ Every item below is an owner action. None of them may be done by a cell, and eac
 
 ## Findings made while preparing
 
-* **G5-D-F1** (low, documentation): with only `POST` registered on the collector route, as the README documents, a
-  `GET` to the route path is served by TanStack Start (200, an empty route page), not by `createCollectorRoute`
-  (whose check 1 promises 405). Nothing is forwarded. A browser navigation to that path would be reported as an
-  entrance unless the path is excluded. Found by running `cf-site-check.mjs` against the local probe. Proposed fix
-  (later cell): README note, and `excludePaths: ["/idr/e"]` in the setup examples.
+* **G5-D-F1** (low): with only `POST` registered on the collector route, as the README documents, a `GET` to the
+  route path is served by TanStack Start (200, an empty route page), not by `createCollectorRoute` (whose check 1
+  promised 405). Nothing is forwarded. A browser navigation to that path was reported as an entrance. Found by
+  running `cf-site-check.mjs` against the local probe. **Status: remediated in the adapter (Gate 5 cell E), pending
+  independent review.** The entrance middleware never reports the collector path (`collectorPath`, default
+  `/idr/e`), for every method and every spelling the router routes there, with no site configuration; the README
+  explains what a client sees for `GET`. `excludePaths: ["/idr/e"]` is no longer required. Phase `route` checks it on
+  the edge.
 * **G4-I8 strengthened**: "outside the site's zone" may not be sufficient for a non-Cloudflare resolver host
-  (section 4 of the Cloudflare plan); the canary test decides.
+  (section 4 of the Cloudflare plan); the canary test decides. Gate 5 cell E added the code-side evidence (the
+  adapter's exact outbound header set on both paths, `packages/tanstack/test/outbound-headers.test.ts`) and
+  hardened the canary (every header and copy, any spelling of the IP, nothing retained). That is not T5: only the
+  real edge can show what Cloudflare adds.
 * **npm readiness**: no licence (`UNLICENSED`), no `repository` field, tanstack `engines` capped below Node 23, a
   stale vocabulary status in the collector README, repository-relative links in the tanstack README
   (NPM_PUBLISHING.md section 3).

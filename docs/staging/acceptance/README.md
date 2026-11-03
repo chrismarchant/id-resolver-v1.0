@@ -21,7 +21,14 @@ They are not part of `npm run verify` or CI.
   did not repeat the target on the command line with `--confirm-target <site host | project ref>`.
 * **No secrets in output.** Output lines and result files (`--out`, written with mode 600) never contain a token,
   key, IP address, user id or e-mail address; hosts appear as `<site>`, `<canary>`, `<resolver>`, `<project>`.
-  The canary stores no IP and no header value: it keeps booleans and header **names**.
+  The canary stores no IP and no header value: it keeps booleans, counts and header **names**, and replaces any IP
+  literal in the body strings it keeps (page key, event name, ids) with `[ip]`. Every output line and result file
+  also passes a redactor that removes every IP literal in any spelling. A phase that stops on a network error
+  reports the error's code, not its text, and a canary answer that is not JSON is reported by a fixed message.
+* **The header canary (G4-I8, T5).** The canary inspects every request header, every repeated copy included, and
+  recognises the tester's IP in any spelling (case, compressed or expanded IPv6, with a port or brackets, IPv4
+  embedded in IPv6, also in hex). A match is a FAIL in every mode. With `--local-probe` a clean result is only INFO:
+  local workerd is not the edge, and no D4 claim is made from it.
 * **Enter secrets without echo**, for example `read -rs ACCEPT_CANARY_TOKEN && export ACCEPT_CANARY_TOKEN`; never on
   the command line and never in a file in the repository.
 * `--dry-run` validates the configuration and prints the plan without sending anything.
@@ -81,10 +88,16 @@ node supabase-hosted-check.mjs --confirm-target <PROJECT_REF> --checks auth,sync
 
 ## Executed so far (3 Nov 2026)
 
-* `self-test.mjs`: 9 of 9 pass.
+* `self-test.mjs`: 9 of 9 pass (Gate 5 cell D); 14 of 14 since cell E, including end-to-end runs in which a stand-in
+  site leaks the tester's IPv4 or IPv6 address in many headers and spellings: G4-I8 FAILs with the header names,
+  and no output holds the IP.
 * `cf-site-check.mjs --local-probe --phase all` against the local workerd probe: 53 PASS, 0 FAIL, 1 SKIP (no
   ceiling route in the probe); `--phase down`: 2 PASS. Details and the finding G5-D-F1 in
   [../CLOUDFLARE_TEST_SITE.md](../CLOUDFLARE_TEST_SITE.md) section 7.
+* Cell E, after the G5-D-F1 remediation and the canary changes, `--local-probe --phase all --samples 40`: 55 PASS,
+  0 FAIL, 12 INFO, 2 SKIP (ceiling route; bundle token search without `ACCEPT_BUNDLE_SCAN_TOKEN`), including the new
+  route-phase check that a navigation to the collector path produces no entrance. No IP literal in the output or the
+  result file.
 * `supabase-hosted-check.mjs`: refusals and `--dry-run` only (self-test). The hosted checks are **unexecuted**;
   the `--local-stack` mode was not run (no Docker daemon in that session).
 * Nothing was run against Cloudflare, Supabase, Railway or npm.

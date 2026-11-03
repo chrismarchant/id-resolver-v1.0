@@ -208,3 +208,28 @@ Not verified here:
 * a real consent platform;
 * a real resolver `POST /v1/events`: the stand-in sink answers 200 for any body. The resolver side of `event.v1` is
   another cell's work.
+
+## Gate 5 (G5-D-F1, G4-I8): the collector path through the real stack, and what local runs cannot show
+
+Run date: 3 Nov 2026, same probe and versions, local workerd (`wrangler dev --local`). The probe is unchanged: its
+middleware has no `collectorPath` option and does not exclude `/idr/e`, and its collector route registers only
+`POST`. The test `test/hygiene.test.ts` ("real stack") builds the probe and sends browser navigations
+(`Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate`, `Accept: text/html`, a browser user agent):
+
+| request | answer (TanStack Start router) | entrance at the sink, before the fix | after the fix (G5-E) |
+|---|---|---|---|
+| `GET /idr/e` | `200 text/html` (empty route page) | yes, `page_key` `/idr/e` | none: `skipped/eligibility:collector_path` |
+| `HEAD /idr/e` | `200 text/html` | none (`eligibility:method`) | none: `eligibility:collector_path` |
+| `GET /IDR/E` | `200 text/html` (case-insensitive routing) | yes, `/IDR/E` | none |
+| `GET /idr/%65`, `GET /%69dr/e` | `200 text/html` (percent-decoded) | yes, both | none |
+| `GET /idr/e/`, `GET /idr//e` | `307` to `/idr/e` | none (not 2xx) | none |
+| `GET //idr/e` | `308` (TanStack Start, before the middleware runs) | none | none |
+| `GET /idr/ex` | `404` | none | none |
+| `GET /landing/<page>` (control) | `200 text/html` | yes | yes, still delivered |
+
+Not verified here, and why it matters for G4-I8: local workerd, miniflare and the Node target show only what the
+adapter sets on its outbound request (exactly `Authorization`, `Content-Type`, `Accept`). In cell E's local run of the
+acceptance script (`cf-site-check.mjs --local-probe --phase all`), the header names that arrived at the canary were
+`accept`, `authorization`, `cf-worker`, `content-length`, `content-type` and `host`, on 40 entrances and 600 events;
+none carried the injected test IP. They cannot show what the Cloudflare production edge adds to a Worker subrequest. No D4 transport
+isolation is claimed from these runs. T5 on the real edge decides (`docs/staging/CLOUDFLARE_TEST_SITE.md`, section 4).

@@ -137,9 +137,21 @@ Secrets handling:
 
 **The finding.** On Cloudflare, a Worker subrequest can carry the original visitor's IP in headers that the
 **platform** adds, not the adapter. The adapter's own request carries only `Authorization`, `Content-Type` and
-`Accept` (verified, RESULTS.md F5 and G4), and the resolver never reads or logs request headers (`trustProxy:
-false`; its log lines hold route, status and error code only). But a proxy or an access log in front of the
-resolver could record such a header.
+`Accept` (verified, RESULTS.md F5 and G4, and asserted on both paths by `packages/tanstack/test/outbound-headers.test.ts`),
+and the resolver never reads or logs request headers (`trustProxy: false`; its log lines hold route, status and
+error code only). But a proxy or an access log in front of the resolver could record such a header.
+
+**Owner decision (3 Nov 2026): T5 is a mandatory staging gate.** These six points are **requirements** of the
+plan, not options:
+
+| # | requirement | how the plan meets it |
+|---|---|---|
+| R1 | Inspect the actual outbound Worker → Railway request **at the receiving boundary, on the real edge** | the canary (`acceptance/canary-sink.mjs`) runs where the resolver runs (a temporary service in the Railway development project, outside the site's zone) and receives the site's real subrequests from the Cloudflare production edge, on `/v1/entrances` (phase `ttfb`) and `/v1/events` (phases `route` and `browser`), from at least two client networks |
+| R2 | Check whether `CF-Connecting-IP`, `X-Real-IP` **or any other header** contains the visitor's IP | the canary inspects **every** request header, every repeated copy included (raw headers), and recognises the IP in any spelling: upper or lower case, compressed or expanded IPv6, with a port or brackets, and an IPv4 address embedded in IPv6 (also in hex). It reports every header name that arrived, and the names of those that carried the IP. It also checks event bodies for a copy of the IP |
+| R3 | Explicit outbound header construction; never clone incoming browser request headers | code-side evidence: the adapter builds `Authorization`, `Content-Type` and `Accept` from scratch for entrances, events and `checkConnectivity`, and never copies, clones or forwards the incoming request. `packages/tanstack/test/outbound-headers.test.ts` asserts the exact header set on both paths for a request carrying the visitor's IP in `CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `True-Client-IP`, `CF-IPCountry`, `Cookie`, `User-Agent`, `Referer`, `Origin`, `Sec-GPC` and `X-Custom`. The test-only ceiling route of Appendix A also builds its headers explicitly. This shows what the adapter sets; only R1 shows what the platform adds |
+| R4 | Canary evidence must not expose real visitor IPs in retained logs | the canary compares in memory and keeps only booleans, counts and header **names**; strings it keeps from bodies have IP literals replaced by `[ip]`; it logs nothing per request. `cf-site-check.mjs` passes every output line and the `--out` file through a redactor that removes the tester's IP and every other IP literal in any spelling; a non-JSON answer or a network error is reported by a fixed message or its error code, never by its text. `acceptance/self-test.mjs` proves it (IPv4 and IPv6 leaks: FAIL with the header names, no IP in stdout, stderr or the result file). Railway's own HTTP logs of the canary service are outside these scripts: the owner checks their fields during T5 (layer 3 below); a visitor IP found there counts as observed propagation (R5). Workers Logs hold only the adapter's outcome lines (Appendix A) |
+| R5 | If visitor-IP propagation is observed: **stop staging acceptance** and present the mitigation options for owner decision | see "If T5 observes propagation: stop" below. No cell or operator chooses an option |
+| R6 | Do not claim D4 transport isolation from local workerd tests alone | local runs (section 7, the adapter's tests, the probe app under `wrangler dev --local`) show only what the adapter and the local runtime send. In `--local-probe` mode a header leak is still a FAIL, but a clean result is printed as INFO "no claim". Only T5 on the real edge, from two networks, can support the claim |
 
 **Why "outside the zone" alone may not be enough.** G4-I8 suggested hosting the resolver outside the site's zone.
 Cloudflare's header reference, as found by search (section 1), describes three cases, and its versions disagree:
@@ -157,23 +169,26 @@ If the third row holds, a resolver on Railway receives the visitor's IP in heade
 * on `/v1/events` it would deliver the visitor's IP to the resolver's host with each browser event. Owner decision
   D4 says no IP is forwarded for browser events. The adapter forwards none, but the platform would.
 
-**How the plan guarantees the requirement.** Three layers; the second one is the gate.
+**How the plan checks the requirement.** Three layers; the second one is the gate.
 
 1. **Placement rule (necessary).** The resolver's hostname, and the canary's, must not be the staging zone or any
    name below it, neither proxied nor DNS-only, and must not be served by a Worker or route of the site's own zone.
    The `preflight` phase checks `ACCEPT_RESOLVER_URL` and `ACCEPT_CANARY_URL` against `ACCEPT_SITE_ZONE` and fails
    otherwise.
 2. **Evidence rule (the gate).** On the **production edge**, the canary, placed where the resolver is, must show
-   that **no request header** of the site's subrequests contains the tester's IP: on `/v1/entrances` (phase
-   `ttfb`) **and** on `/v1/events` (phase `route`), and for the real browsers of T8 (phase `browser`). The canary
-   compares header values with the tester's IP in memory and keeps only the header **names** that matched. Any
-   match is a FAIL.
+   that **no request header** of the site's subrequests contains the tester's IP, in any spelling: on
+   `/v1/entrances` (phase `ttfb`) **and** on `/v1/events` (phase `route`), and for the real browsers of T8 (phase
+   `browser`). The canary compares every header value (every copy) with the tester's IP in memory and keeps only
+   the header **names** that matched. Any match is a FAIL.
 3. **Resolver side (already true).** The resolver neither reads nor logs headers. Whether Railway's edge or its
    HTTP logs record `CF-Connecting-IP`, `X-Real-IP` or `X-Forwarded-For` values is **UNVERIFIED**; the owner checks
    the development project's HTTP log fields during T5 and records the answer.
 
-**If the gate fails: stop.** Do not point a production site at the resolver. The options, each needing an owner
-decision (and for code, a new cell and an independent review):
+**If T5 observes propagation: stop.** Any header carrying the visitor's IP (a FAIL in `ttfb`, `route` or
+`browser`), or a visitor IP found in the canary service's Railway HTTP logs, **stops staging acceptance**: no further
+phase is run as acceptance evidence, nothing is pointed at a production site, and the observation (header names and
+counts only) goes to the owner with the options below for a **decision**. Each option needs that decision (and for
+code, a new cell and an independent review):
 
 * **(a)** Front the resolver with a **separate Cloudflare zone owned by the operator** (not the site's), so the
   subrequest is cross-zone between Cloudflare customer zones (fixed Worker address per the header reference), and
@@ -198,9 +213,11 @@ node cf-site-check.mjs --phase preflight,ttfb --confirm-target idr-staging.<STAG
 ```
 
 Expected: `PASS ... G4-I8: the resolver host is outside the site's zone` and
-`PASS ... G4-I8, no request header at the resolver's hosting position carries the visitor's IP`, plus the INFO line
-with the header presence counts (`cf-connecting-ip n/N, x-real-ip n/N, cf-worker n/N`). Run it from two networks
-(IPv4 and IPv6 if available), and repeat it in phase `route` and after T8.
+`PASS ... G4-I8, no request header at the resolver's hosting position carries the visitor's IP`, plus the INFO lines
+with the header presence counts (`cf-connecting-ip n/N, x-real-ip n/N, cf-worker n/N`) and every header name that
+arrived. Run it from two networks (IPv4 and IPv6 if available), and repeat it in phase `route` and after T8. Before
+filing the result, check that the `--out` file and the terminal output contain no IP address (the scripts print
+`[ip]` or `[redacted]` in its place). **T5 has not been run**: nothing is provisioned yet.
 
 ## 5. Test plan
 
@@ -215,27 +232,34 @@ acceptance criteria.
 | T2 | non-blocking delivery on the production edge, resolver healthy | `ttfb` | canary mode `ok`; 100 interleaved pairs: a reported page (`/landing/...`) and an excluded control page (`/control/...`) of the same Worker, random order within each pair | median paired TTFB difference **<= 10 ms** and p95 **<= 50 ms**; **>= 99%** of reported pages deliver exactly one entrance, with one attempt; no control page reported; body keys exactly the `entrance.v1` keys |
 | T3 | delivery under resolver faults | `faults`, then `down` | the canary answers 500, 503, 429 (Retry-After 1), 401, hangs, or resets the connection (behind Railway's edge a reset may arrive as a 502); then the owner sets `IDR_RESOLVER_URL=https://resolver.invalid` and redeploys for `down` | the T2 TTFB criteria hold **in every mode**; attempts per entrance: 500 and 401 → 1; 503, 429, hang, reset → 2 (one retry); hang: about 5.25 s between the attempts; `down`: nothing reaches the canary |
 | T4 | trust policy `cloudflare` with the real `CF-Connecting-IP` | `ttfb` | the canary compares the entrance's `ip` with the tester's IP from `/cdn-cgi/trace` (or `ACCEPT_TESTER_IP`); one request forges `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP` and `True-Client-IP` | every entrance carries the tester's real IP; the forged request's entrance carries the real IP, not the forged one (Cloudflare overwrote it). If Cloudflare refuses the forged request instead, record it: that is also safe |
-| T5 | **G4-I8** | `ttfb`, `route`, `browser` | section 4 | no header containing the tester's IP, on entrances and events, from at least two client networks. **Hard gate** |
+| T5 | **G4-I8** (owner requirements R1 to R6, section 4) | `ttfb`, `route`, `browser` | section 4: the canary at the receiving boundary inspects every header of every subrequest, in any spelling of the IP; the owner checks the canary service's Railway HTTP log fields | no header containing the tester's IP, on entrances and events, from at least two client networks; no event body containing it; no IP in the retained output or result files; no visitor IP in the canary's Railway HTTP logs. **Hard gate**: any observed propagation stops staging acceptance for an owner decision (section 4). Not run yet |
 | T6 | bundle safety of the deployed client bundle | `bundle` | fetch the HTML of two pages and every same-origin script and module preload they reference (recursively), scan them | none of: `createIdrServerMiddleware`, `createCollectorRoute`, `idr-tanstack`, `/v1/entrances`, `/v1/events`, `entrance.v1`, `event.v1`, `cf-connecting-ip`, `x-forwarded-for`, `sec-gpc`, `resolverUrl`, `allowInsecureHttp`, `replayCacheSize`, `maxClockSkewMs`, the `IDR_*` names, the resolver and canary hosts, the token (with `ACCEPT_BUNDLE_SCAN_TOKEN`); positive control: `data-idr-event` present |
-| T7 | first-party route on the edge | `route` | a valid event with hostile headers; replay; GET; foreign or missing `Origin`; `Sec-Fetch-Site: cross-site`; wrong content type; `Content-Length` and a chunked body above 1 KiB; malformed JSON; an `ip` field; a path with a query; an unknown and a non-allowlisted name; `Sec-GPC: 1`; consent `not_required` under `required`; a failing server-side consent check; `occurred_at` 10 min old; a burst of `rateLimit.events + 20` | each answer as in the README's table: 204 accepted; 409 replay; 403 for `Origin`, `Sec-Fetch-Site`, a non-allowlisted name, GPC and consent; 415 type; 413 size; 400 for JSON, schema, path, vocabulary and `occurred_at`; 429 rate; GET is never a 204 (finding G5-D-F1 below); the 204 is bare with `Cache-Control: no-store`; the resolver side receives exactly one `event.v1` body per accepted event, exactly the 8 keys, `page_key` mapped, no `ip`; T5 holds. **Replay and rate are per route instance**: a replay may reach another isolate and get 204 (the resolver's unique `event_id` still stores one row), and a burst may spread over isolates; both outcomes are recorded, not failed |
+| T7 | first-party route on the edge | `route` | a valid event with hostile headers; replay; GET; foreign or missing `Origin`; `Sec-Fetch-Site: cross-site`; wrong content type; `Content-Length` and a chunked body above 1 KiB; malformed JSON; an `ip` field; a path with a query; an unknown and a non-allowlisted name; `Sec-GPC: 1`; consent `not_required` under `required`; a failing server-side consent check; `occurred_at` 10 min old; a burst of `rateLimit.events + 20` | each answer as in the README's table: 204 accepted; 409 replay; 403 for `Origin`, `Sec-Fetch-Site`, a non-allowlisted name, GPC and consent; 415 type; 413 size; 400 for JSON, schema, path, vocabulary and `occurred_at`; 429 rate; GET is never a 204, and a navigation (GET, HEAD, upper case) to the collector path produces no entrance at the canary (G5-D-F1 below); the 204 is bare with `Cache-Control: no-store`; the resolver side receives exactly one `event.v1` body per accepted event, exactly the 8 keys, `page_key` mapped, no `ip`; T5 holds. **Replay and rate are per route instance**: a replay may reach another isolate and get 204 (the resolver's unique `event_id` still stores one row), and a burst may spread over isolates; both outcomes are recorded, not failed |
 | T8 | collector in real browsers under the site CSP | `browser` (manual) | Chrome, Firefox and Safari (macOS), plus iOS Safari and Android Chrome if available; the checklist the phase prints: consent (test banner), withdrawal, GPC, SPA navigation, marked click, marked form with values typed in | per browser: no CSP violation and no exception from the collector in the console; no POST before consent or with GPC on; one `page_view` per path change; nothing but the 7 contract fields in any POST; the canary receives the expected names and no form value; T5 holds |
 | T9 | the `waitUntil` ceiling, measured | `ceiling` | the test-only probe route (Appendix A) schedules pings at +1, 5, 10, 15, 20, 25, 28, 29, 30, 31, 32, 35, 45 and 60 s with `waitUntil`; three runs, one of them with the client disconnecting right after the headers | every ping up to **+25 s** arrives in all runs (the adapter's worst case is 2 x 5 s + 0.25 s = 10.25 s by default, 20.25 s at the maximum `timeoutMs` of 10000); the observed ceiling (last ping received) is recorded |
 | T10 | cold starts | `cold` | the owner deploys a new version immediately before the phase (new isolates), and again after 30 min idle | the first request answers 200 and its entrance is delivered; first-request TTFB and the warm median are recorded (no threshold: Cloudflare does not promise a number) |
 | T11 | the real development resolver end to end | manual + `ttfb` without canary checks | point the site at `https://<resolver-dev-host>` with the staging-only token; run `checkConnectivity` (README "Confirm connectivity"); load pages in a browser; with `EVENTS_ENABLED=true`, accept consent | `checkConnectivity` → `ok`, `ineligible`; Workers Logs show `delivered` for browser page loads; the resolver's usage counters move; browser events are stored (`recorded`); page TTFB as in T2 |
 | T12 | fail-open with a wrong token on the real resolver | manual | set a wrong `IDR_RESOLVER_TOKEN`, load pages | pages unchanged; Workers Logs show `dropped/http_4xx`, one attempt; restore afterwards |
 
-**Finding G5-D-F1 (from running the script against the local probe, section 7).** With only `POST` registered on
-the collector route, as the README documents, a `GET /idr/e` never reaches `createCollectorRoute`: TanStack Start
-renders an empty route page with **200**. The README's check 1 (`405`, `Allow: POST`) is therefore not what a
-client sees. Nothing is forwarded, so this is not a security issue; but a browser navigation to that path is an
-eligible document request and would be reported as an entrance with `page_key` `/idr/e` unless excluded. The test
-site excludes it (Appendix A). Recommendation for a later cell: say so in the README (or register the handler for
-other methods too) and recommend `excludePaths: ["/idr/e"]`.
+**Finding G5-D-F1 (from running the script against the local probe, section 7). Status: remediated in the adapter
+(Gate 5 cell E), pending independent review.** With only `POST` registered on the collector route, as the README
+documents, a `GET /idr/e` never reaches `createCollectorRoute`: TanStack Start renders an empty route page with
+**200**. The README's check 1 (`405`, `Allow: POST`) was therefore not what a client sees. Nothing is forwarded, so
+this was not a security issue; but a browser navigation to that path was an eligible document request and was
+reported as an entrance with `page_key` `/idr/e`. The remediation (owner approval of 3 Nov 2026): the entrance
+middleware now never reports the collector path (`collectorPath`, default `/idr/e`), for every method and in every
+spelling the router routes there, without any site configuration; the hook shows
+`skipped/eligibility:collector_path`. Application routing is unchanged (the framework still serves its page), and
+the README now says what a client sees for `GET`. Regression tests include the probe app under local workerd: a
+`GET /idr/e` navigation through the real router no longer reaches the sink, while an ordinary page still does
+(`packages/tanstack/verification/RESULTS.md`, Gate 5). `excludePaths: ["/idr/e"]` is no longer required. The phase
+`route` now checks on the edge that a navigation to the collector path produces no entrance.
 
 ### 5.1 Order of a run
 
 1. Owner provisions (section 8, steps 1 to 6). Site points at the canary.
-2. `preflight` → `ttfb` (T1, T2, T4, T5). **Stop here if T5 fails** (section 4).
+2. `preflight` → `ttfb` (T1, T2, T4, T5). **Stop staging acceptance here if T5 observes propagation** (section 4):
+   the owner decides between the options there before anything else runs.
 3. `faults` (T3), `route` (T7), `bundle` (T6), `ceiling` (T9), `browser` (T8, manual).
 4. Owner switches `IDR_RESOLVER_URL` to `https://resolver.invalid`, redeploys → `down` (T3).
 5. Owner redeploys → `cold` (T10); again after 30 min idle.
@@ -251,8 +275,9 @@ names) is written later as `docs/staging/results/` by MAIN and checked with the 
 The staging site **passes** when, on Variant A (and on Variant B if it is run):
 
 1. T1 to T7, T9 and T10 have no FAIL line, from at least two client networks;
-2. **T5 (G4-I8) passes**; a failure blocks any production use until one of the options in section 4 is decided
-   and re-tested;
+2. **T5 (G4-I8) passes** in `ttfb`, `route` and `browser`, from at least two client networks, with no IP in the
+   retained evidence; any observed propagation stops staging acceptance and blocks any production use until the
+   owner has decided one of the options in section 4 and T5 has been re-run;
 3. T8 is completed for Chrome, Firefox and Safari with no CSP violation, no exception, consent and GPC respected,
    and the results are written down per browser;
 4. T11 and T12 behave as stated, and the Workers Logs show only non-identifying outcome lines;
@@ -264,14 +289,17 @@ The staging site **passes** when, on Variant A (and on Variant B if it is run):
 No Cloudflare resource exists. The acceptance script was run **locally**, against the repository's probe app under
 local workerd (`wrangler dev --local`, `cf-lifecycle` built for `cloudflare-module`) with the canary on
 127.0.0.1, using the probe's own synthetic token. `--local-probe` skips the edge-only checks (cf-ray, the forged
-header overwrite, the G4-I8 gate, the ceiling route). Result on 3 Nov 2026:
+header overwrite, the ceiling route). The G4-I8 header canary still runs there: since Gate 5 cell E a header carrying
+the tester's IP is a FAIL in this mode too, and a clean result is INFO, because local workerd is not the edge (no D4
+claim, R6). Result on 3 Nov 2026 (cell D, before the G5-D-F1 remediation):
 
 | run | result |
 |---|---|
-| first run, `faults`, `route`, `bundle`, `cold` | 1 FAIL: `GET /idr/e` answered 200 instead of the README's 405. This is finding G5-D-F1 (section 5); the check now asserts what matters ("GET is never accepted as an event") and reports where the answer came from |
+| first run, `faults`, `route`, `bundle`, `cold` | 1 FAIL: `GET /idr/e` answered 200 instead of the README's 405. This is finding G5-D-F1 (section 5, since remediated in the adapter); the check now asserts what matters ("GET is never accepted as an event") and reports where the answer came from |
 | final run, `--phase all` (`preflight`, `ttfb` 40 pairs, `faults` 30 pairs per mode, `route`, `bundle`, `ceiling`) | **53 PASS, 0 FAIL, 10 INFO, 1 SKIP** (ceiling: the probe has no probe route). TTFB paired difference median 0 ms, p95 3.3 ms (`ok`); medians 0.3 to 0.7 ms and p95 at most 3.8 ms under 500, 503, 429, 401, hang and reset. 40 of 40 entrances delivered with one attempt, the injected IP delivered 40 of 40. Attempts: 500 and 401 one, the others two; hang retry after a median 5252 ms. Route: every refusal as documented; 600 of 620 burst events accepted, then 429 (one instance, budget 600); 600 distinct `event_id`s forwarded with exactly the 8 keys and no `ip`. Bundle: 4 files, no marker, collector present |
 | `down` (nothing listening on the resolver port) | 2 PASS (TTFB unchanged) |
 | `cold` | 2 PASS (a local restart is not an edge cold start) |
+| cell E (after the G5-D-F1 remediation and the canary changes), `--phase all`, 40 pairs | **55 PASS, 0 FAIL, 12 INFO, 2 SKIP** (ceiling: no probe route; bundle token search: `ACCEPT_BUNDLE_SCAN_TOKEN` not set). New: `G5-D-F1: a browser navigation to the collector path (GET, HEAD, upper case) produced no entrance` PASS (the framework answered 200 to each, 0 entrances at the canary); event bodies carry no copy of the tester's IP; header names at the canary: `accept`, `authorization`, `cf-worker`, `content-length`, `content-type`, `host` (40 entrances, 600 events), none with the test IP (INFO: local, no claim). The terminal output and the result file contain no IP literal |
 
 Local workerd is not the production edge: these runs show that the script works, not that the edge behaves.
 
@@ -329,6 +357,10 @@ Based on the SEARCH-ONLY figures of section 1 (Cloudflare Workers pricing page, 
   process (many isolates). The resolver's unique `event_id` bounds replays; nothing bounds a scripted client that
   sets `Origin` (G4-I1: browser events are forgeable telemetry).
 * The test site's consent banner is a stand-in, not a consent platform.
+* The canary recognises the tester's IP as text (any spelling, embedded in IPv6). It cannot recognise a value
+  derived from it in another way (a hash, an integer form, Cloudflare's Pseudo IPv4 for an IPv6 visitor, which is
+  why Pseudo IPv4 stays off). The header-names INFO line lists every header that arrived, so an unexpected header
+  can still be looked at by hand.
 * Network conditions of the tester's location dominate absolute TTFB; the paired comparison measures only the
   added cost.
 
@@ -349,8 +381,10 @@ const idr = createMiddleware().server(
     token: process.env.IDR_RESOLVER_TOKEN ?? "",
     websiteId: process.env.IDR_WEBSITE_ID ?? "",
     trustPolicy: { mode: "cloudflare" },
-    // control pages, the collector route and the probe route are never reported (G5-D-F1)
-    eligibility: { excludePaths: ["/control/*", "/idr/e", "/staging-probe/*"] },
+    // control pages and the probe route are never reported. The collector route (/idr/e) needs no entry: the
+    // adapter excludes collectorPath by default (G5-D-F1), and phase `route` checks exactly that on the edge.
+    // A production site may still list "/idr/e" here as belt and braces; it is not required.
+    eligibility: { excludePaths: ["/control/*", "/staging-probe/*"] },
     // non-identifying outcome only; visible in Workers Logs
     onDeliveryResult: (r) => { if (r.outcome !== "skipped") console.log("idr", r.outcome, r.reason, r.mode, r.attempts); },
   })),
