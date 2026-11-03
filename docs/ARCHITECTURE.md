@@ -129,7 +129,11 @@ association.
   and grants exactly what the runtime paths need: no TRUNCATE, no DDL, no
   ownership, no trigger control, no `session_replication_role`, no write to
   tombstones, the retention watermark or the kill switch. The 0006/0007 feed
-  guards therefore cannot be bypassed with a leaked runtime credential.
+  guards therefore cannot be bypassed with a leaked runtime credential. It
+  keeps DELETE and INSERT on observations (retention and entrances need
+  them): deleting recent observations advances the watermark through the
+  trigger, so consumers behind it get `410 cursor_expired`; visible, never
+  silent.
   Production refuses to run as the owner unless the dev-only
   `ALLOW_OWNER_DATABASE_ROLE=true` is set, and refuses a runtime login that
   is not least-privilege. Erasure and the kill switch are owner operations.

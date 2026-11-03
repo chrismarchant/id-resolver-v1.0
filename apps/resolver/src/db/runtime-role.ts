@@ -70,7 +70,10 @@ export interface TableGrant {
  *    anyway (a no-op SET id = id is the most it allows).
  *  - feed_retention_watermarks is SELECT only: the 0006 watermark trigger
  *    runs as its owner (migration 0009, SECURITY DEFINER), so retention
- *    deletes still advance it but the runtime role cannot write it at all.
+ *    deletes still advance it but the runtime role cannot write it directly.
+ *    It can still advance it by deleting recent observations (DELETE on
+ *    company_observations is needed for retention): visible to consumers as
+ *    410 cursor_expired, never silent (RUNTIME.md, G5R2-L4).
  *  - feed_tombstones is SELECT only, and companies, company_observation_refs
  *    and company_scope_stats have no DELETE: erasure (ops:erase-company) is
  *    an owner operation, so a leaked runtime credential can neither forge nor

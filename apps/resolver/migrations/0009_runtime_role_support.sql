@@ -10,8 +10,10 @@
 -- company_observations still advances the scope's retention watermark in the
 -- same statement, whoever deletes; but the runtime role needs no INSERT or
 -- UPDATE privilege on feed_retention_watermarks at all, so a leaked runtime
--- credential cannot move the watermark (forward, which would force 410
--- cursor_expired on every consumer, or backward, which 0007 rejects anyway).
+-- credential cannot write the watermark directly (backward moves 0007
+-- rejects anyway). It can still advance it by deleting recent observations,
+-- since retention needs DELETE on company_observations; consumers behind it
+-- then get 410 cursor_expired (visible, never silent; G5R2-L4, RUNTIME.md).
 -- Behaviour for the owner is unchanged; a rollback to a build without role
 -- separation keeps working (it connects as the owner).
 --

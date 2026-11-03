@@ -216,8 +216,19 @@ The feed guards of migrations 0006/0007 are triggers. Only the table owner
 (`ALTER TABLE ... DISABLE TRIGGER`) or a superuser (`SET
 session_replication_role = replica`) can bypass them, and `TRUNCATE` skips
 row triggers. The runtime role has none of that, so a leaked runtime
-credential cannot rewrite, silently delete or truncate feed items, move the
-retention watermark or remove a tombstone.
+credential cannot rewrite, silently delete or truncate feed items, write the
+retention watermark (INSERT, UPDATE and DELETE on it are refused) or remove a
+tombstone.
+
+What a leaked runtime credential **can** still do to the feed (G5R2-L4): it
+holds DELETE and INSERT on `company_observations`, because retention and the
+entrance path need them. Deleting observations, including the newest ones,
+advances the scope's watermark through the 0006 trigger (which runs as its
+owner since migration 0009): every consumer whose cursor is below it then
+gets `410 cursor_expired` and must resynchronise, and the deleted buffer
+contents are gone from the resolver. Inserting adds observations that the
+feed serves. Both are visible to consumers (a watermark move, feed items);
+neither is silent.
 
 **Runtime grants** (`RUNTIME_GRANTS`; every other privilege in the schema is
 revoked on every migrate run):
