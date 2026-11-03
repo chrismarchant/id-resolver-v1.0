@@ -60,7 +60,12 @@ switch (mode) {
       onStuck: () => guards.fatal("job_stuck"),
       execute: () => new Promise(() => undefined),
     });
-    void runner.run({ ip: "203.0.113.5", deadlineAtMs: Date.now() + 100, observationRef: "obsref-0123456789abcdef" });
+    void runner.run({
+      ip: "203.0.113.5",
+      deadlineAtMs: Date.now() + 100,
+      observationRef: "obsref-0123456789abcdef",
+      context: { pageKey: "/", acquisition: "direct", entranceContract: "entrance.v1", eligibility: "tsa-1" },
+    });
     break;
   }
   default:

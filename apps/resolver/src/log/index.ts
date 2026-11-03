@@ -39,7 +39,6 @@ export const LOG_EVENTS = [
 export type LogEvent = (typeof LOG_EVENTS)[number];
 
 export const LOG_FIELDS = [
-  "request_id",
   "job_id",
   "status",
   "reason",

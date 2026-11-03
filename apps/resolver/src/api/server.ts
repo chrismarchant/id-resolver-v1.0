@@ -3,19 +3,35 @@
  * paid processing, then hands exactly one job to the in-process runner
  * (src/runtime/runner.ts). Nothing here computes fingerprints or touches the
  * provider.
+ *
+ * Website route: POST /v1/entrances (contract entrance.v1, owner decision
+ * D2). The response is an acknowledgement `{version, status, source,
+ * recorded}`: it never carries company identity, a company id, an IP, a
+ * fingerprint or provider data.
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import rateLimit from "@fastify/rate-limit";
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { Config } from "../config/index.js";
 import type { Logger } from "../log/index.js";
-import { API_VERSION, RESOLUTION_STATUSES, type ErrorCode, type ErrorResponse, type ResolveResponse } from "../contracts/api.js";
+import {
+  API_VERSION,
+  ENTRANCE_CONTRACT,
+  OCCURRED_AT_MAX_SKEW_MS,
+  parseOccurredAt,
+  RESOLUTION_STATUSES,
+  type EntranceResponse,
+  type ErrorCode,
+  type ErrorResponse,
+} from "../contracts/api.js";
 import type { ReportingRepository } from "../contracts/db.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
 import { registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
-import { ResolveBodySchema } from "./schema.js";
+import { EntranceBodySchema } from "./schema.js";
+
+export const ENTRANCES_ROUTE = "/v1/entrances";
 
 export interface ServerDeps {
   config: Config;
@@ -26,11 +42,6 @@ export interface ServerDeps {
   /** Read-only reporting repository; reporting routes are registered only when both this and REPORTING_AUTH_TOKEN are present. */
   reporting?: ReportingRepository;
   now?: () => number;
-}
-
-/** Server-generated observation reference when the caller omits one: 16 random bytes, base64url (22 chars). */
-export function generateObservationRef(): string {
-  return randomBytes(16).toString("base64url");
 }
 
 const STATUS_BY_ERROR: Record<ErrorCode, number> = {
@@ -45,43 +56,25 @@ const STATUS_BY_ERROR: Record<ErrorCode, number> = {
   internal: 500,
 };
 
-function errorBody(error: ErrorCode, requestId?: string): ErrorResponse {
-  return requestId ? { version: API_VERSION, error, request_id: requestId } : { version: API_VERSION, error };
+function errorBody(error: ErrorCode): ErrorResponse {
+  return { version: API_VERSION, error };
 }
 
-function sendError(reply: FastifyReply, error: ErrorCode, requestId?: string): FastifyReply {
-  return reply.code(STATUS_BY_ERROR[error]).send(errorBody(error, requestId));
+function sendError(reply: FastifyReply, error: ErrorCode): FastifyReply {
+  return reply.code(STATUS_BY_ERROR[error]).send(errorBody(error));
 }
 
-/** Defensive: only pass through fields the contract allows. */
-function toResponse(outcome: ResolutionOutcome, requestId: string | undefined): ResolveResponse {
+/**
+ * Defensive: the response is rebuilt from four allowlisted fields, so nothing
+ * else in an outcome (activity block, company id, reason) can reach the
+ * website. `recorded` is true only for a qualified outcome whose observation
+ * for this entrance_id is durably recorded.
+ */
+function toResponse(outcome: ResolutionOutcome): EntranceResponse {
   const status = (RESOLUTION_STATUSES as readonly string[]).includes(outcome.status) ? outcome.status : "unavailable";
-  let company: ResolveResponse["company"] = null;
-  if (status === "qualified" && outcome.company && typeof outcome.company.domain === "string") {
-    const c = outcome.company;
-    company = {
-      domain: c.domain,
-      organisation_name: typeof c.organisation_name === "string" ? c.organisation_name : null,
-      qualification: {
-        category: typeof c.qualification?.category === "string" ? c.qualification.category : "unknown",
-        source: "provider_usage_type",
-      },
-      resolved_at: typeof c.resolved_at === "string" ? c.resolved_at : new Date(0).toISOString(),
-    };
-  }
   const source = outcome.source === "cache" || outcome.source === "provider" ? outcome.source : "none";
-  const base: ResolveResponse = { version: API_VERSION, status, company, source };
-  const withId = requestId ? { ...base, request_id: requestId } : base;
-  // Activity fields exist only on qualified responses (server-to-server data).
-  const a = outcome.activity;
-  if (status !== "qualified" || !a || typeof a.company_id !== "number") return withId;
-  return {
-    ...withId,
-    company_id: a.company_id,
-    previously_seen_company: a.previously_seen === true ? true : a.previously_seen === false ? false : null,
-    activity_recorded: a.recorded === true,
-    observation_ref: a.observation_ref,
-  };
+  const recorded = status === "qualified" && outcome.activity?.recorded === true;
+  return { version: API_VERSION, status, source, recorded };
 }
 
 /**
@@ -91,7 +84,7 @@ function toResponse(outcome: ResolutionOutcome, requestId: string | undefined): 
  */
 function answerByDeadline(run: Promise<ResolutionOutcome>, remainingMs: number): Promise<ResolutionOutcome> {
   return new Promise<ResolutionOutcome>((resolve, reject) => {
-    const t = setTimeout(() => resolve({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" }), Math.max(0, remainingMs));
+    const t = setTimeout(() => resolve({ status: "unavailable", source: "none", reason: "deadline_exceeded" }), Math.max(0, remainingMs));
     t.unref();
     run.then(
       (o) => {
@@ -147,7 +140,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     global: true,
     max: config.RATE_LIMIT_PER_MINUTE,
     timeWindow: 60_000,
-    // Reporting traffic has its own bucket so it can never starve the website's resolve calls.
+    // Reporting traffic has its own bucket so it can never starve the website's entrance calls.
     keyGenerator: (req) => (isReportingRoute(req.routeOptions?.url) ? "reporting" : "deployment"),
     addHeaders: { "x-ratelimit-limit": false, "x-ratelimit-remaining": false, "x-ratelimit-reset": false, "retry-after": true },
     addHeadersOnExceeding: { "x-ratelimit-limit": false, "x-ratelimit-remaining": false, "x-ratelimit-reset": false },
@@ -205,7 +198,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // shared proxy address is not locked out by someone else's failures.
     // Each route group accepts exactly its own credential: the website's
     // resolver token never opens reporting and the reporting token never
-    // opens /v1/resolve.
+    // opens /v1/entrances.
     const ok = isReportingRoute(matched) ? checkReportingCredential(req.headers["authorization"]) : checkCredential(req.headers["authorization"]);
     if (ok) return;
     const peer = req.socket?.remoteAddress ?? "unknown";
@@ -219,57 +212,57 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     return sendError(reply, "unauthorized");
   });
 
-  app.post("/v1/resolve", async (req: FastifyRequest, reply: FastifyReply) => {
-    const startedAt = now();
-    const parsed = ResolveBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      logger.warn("request_rejected", { route: "/v1/resolve", error_code: "invalid_request", http_status: 400 });
-      return sendError(reply, "invalid_request");
-    }
-    const body = parsed.data;
-    const requestId = body.request_id;
+  const reject = (reply: FastifyReply, error: ErrorCode, reason?: string): FastifyReply => {
+    logger.warn("request_rejected", { route: ENTRANCES_ROUTE, error_code: error, http_status: STATUS_BY_ERROR[error], ...(reason ? { reason } : {}) });
+    return sendError(reply, error);
+  };
 
-    if (body.website_id !== config.WEBSITE_ID) {
-      logger.warn("request_rejected", { route: "/v1/resolve", error_code: "forbidden", http_status: 403, ...(requestId ? { request_id: requestId } : {}) });
-      return sendError(reply, "forbidden", requestId);
-    }
+  app.post(ENTRANCES_ROUTE, async (req: FastifyRequest, reply: FastifyReply) => {
+    const startedAt = now();
+    const parsed = EntranceBodySchema.safeParse(req.body);
+    if (!parsed.success) return reject(reply, "invalid_request", "schema");
+    const body = parsed.data;
+
+    if (body.website_id !== config.WEBSITE_ID) return reject(reply, "forbidden");
 
     // Syntax check only; eligibility and canonical form are decided by the pipeline.
-    const ipCheck = canonicaliseIp(body.ip);
-    if (!ipCheck.ok) {
-      logger.warn("request_rejected", { route: "/v1/resolve", error_code: "invalid_request", http_status: 400, ...(requestId ? { request_id: requestId } : {}) });
-      return sendError(reply, "invalid_request", requestId);
-    }
+    if (!canonicaliseIp(body.ip).ok) return reject(reply, "invalid_request", "ip");
+
+    // Bounds replay of a captured request to a window around resolver time.
+    const occurredAt = parseOccurredAt(body.occurred_at);
+    if (occurredAt === null || Math.abs(startedAt - occurredAt) > OCCURRED_AT_MAX_SKEW_MS) return reject(reply, "invalid_request", "occurred_at");
 
     const deadlineAtMs = startedAt + config.REQUEST_DEADLINE_MS;
-    // The observation reference is the caller's idempotency key; a generated
-    // one makes every request a separate observation (documented behaviour).
-    const observationRef = body.observation_ref ?? generateObservationRef();
     let outcome: ResolutionOutcome;
     try {
-      outcome = await answerByDeadline(runner.run({ ip: body.ip, deadlineAtMs, observationRef }), deadlineAtMs - now());
+      outcome = await answerByDeadline(
+        runner.run({
+          ip: body.ip,
+          deadlineAtMs,
+          // The entrance_id is the observation idempotency key: a repeat never records a second observation.
+          observationRef: body.entrance_id,
+          context: { pageKey: body.page_key, acquisition: body.acquisition, entranceContract: ENTRANCE_CONTRACT, eligibility: body.eligibility },
+        }),
+        deadlineAtMs - now(),
+      );
     } catch (err) {
-      if (err instanceof RunnerOverloadedError) {
-        logger.warn("request_rejected", { route: "/v1/resolve", error_code: "overloaded", http_status: 503 });
-        return sendError(reply, "overloaded", requestId);
-      }
-      if (err instanceof RunnerStoppedError) {
-        return sendError(reply, "not_ready", requestId);
-      }
-      logger.error("request_rejected", { route: "/v1/resolve", error_code: "internal", http_status: 500 });
-      return sendError(reply, "internal", requestId);
+      if (err instanceof RunnerOverloadedError) return reject(reply, "overloaded");
+      if (err instanceof RunnerStoppedError) return sendError(reply, "not_ready");
+      logger.error("request_rejected", { route: ENTRANCES_ROUTE, error_code: "internal", http_status: 500 });
+      return sendError(reply, "internal");
     }
 
-    const response = toResponse(outcome, requestId);
+    const response = toResponse(outcome);
     logger.info("request_completed", {
-      route: "/v1/resolve",
+      route: ENTRANCES_ROUTE,
       http_status: 200,
       status: response.status,
       source: response.source,
+      recorded: response.recorded,
       duration_ms: now() - startedAt,
       ...(outcome.reason ? { reason: outcome.reason } : {}),
-      ...(requestId ? { request_id: requestId } : {}),
-      ...(response.company_id !== undefined ? { company_id: response.company_id, recorded: response.activity_recorded === true } : {}),
+      // Internal correlation with activity_recorded; never part of the response.
+      ...(response.status === "qualified" && outcome.activity ? { company_id: outcome.activity.company_id } : {}),
     });
     return reply.code(200).send(response);
   });
@@ -279,7 +272,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       scope: { installation_id: config.INSTALLATION_ID, website_id: config.WEBSITE_ID },
       reporting: deps.reporting,
       logger,
-      sendError: (reply, error) => sendError(reply, error),
+      sendError,
     });
   }
 

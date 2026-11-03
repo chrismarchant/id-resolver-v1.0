@@ -5,9 +5,11 @@
  * deadline (src/runtime/runner.ts). The API layer depends only on `Runner`.
  *
  * Nothing in an outcome may carry a raw IP, a fingerprint, a secret, free
- * text or a raw provider payload: only allowlisted statuses and reasons.
+ * text, a raw provider payload or company identity beyond the internal
+ * company id: only allowlisted statuses and reasons (owner decision D2).
  */
-import type { CompanyContext, ResolutionSource, ResolutionStatus } from "./api.js";
+import type { ResolutionSource, ResolutionStatus } from "./api.js";
+import type { ObservationContext } from "./db.js";
 
 /** Policy and secrets the pipeline needs; built once from the validated configuration. */
 export interface PipelineConfig {
@@ -55,8 +57,10 @@ export interface ResolutionJob {
   ip: string;
   /** Absolute wall-clock deadline (ms since epoch). */
   deadline_at_ms: number;
-  /** Opaque idempotency reference for the observation this job may record; never the IP. */
+  /** Opaque idempotency reference for the observation this job may record (the entrance_id); never the IP. */
   observation_ref: string;
+  /** Entrance evidence stored with the observation. */
+  context: ObservationContext;
   /**
    * Aborted by the runner at the deadline. The pipeline stops at its next
    * checkpoint, aborts an in-flight provider call and never starts the
@@ -76,7 +80,6 @@ export interface ObservationActivity {
 
 export interface ResolutionOutcome {
   status: ResolutionStatus;
-  company: CompanyContext | null;
   source: ResolutionSource;
   /** Allowlisted diagnostic reason; never free text from the provider. */
   reason?: OutcomeReason;
@@ -119,8 +122,10 @@ export interface JobRequest {
   ip: string;
   /** Absolute wall-clock deadline in ms since epoch. */
   deadlineAtMs: number;
-  /** Opaque observation reference (validated by the API layer); never the IP. */
+  /** Opaque observation reference (the validated entrance_id); never the IP. */
   observationRef: string;
+  /** Validated entrance evidence. */
+  context: ObservationContext;
 }
 
 export class RunnerOverloadedError extends Error {
@@ -147,7 +152,7 @@ export interface Runner {
    * synchronously when every slot is taken, or RunnerStoppedError after
    * shutdown began. Otherwise the promise ALWAYS resolves, never later than
    * the job's deadline: a throwing, rejecting, malformed or overrunning job
-   * resolves to `{ status: "unavailable", company: null, source: "none", reason }`.
+   * resolves to `{ status: "unavailable", source: "none", reason }`.
    * The slot stays taken until the job itself settles, so a job that
    * overruns its deadline still counts against capacity.
    */

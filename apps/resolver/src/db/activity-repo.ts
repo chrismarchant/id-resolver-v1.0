@@ -15,7 +15,8 @@
  * Nothing in this module receives or stores an IP, a fingerprint, a provider
  * payload or a header.
  */
-import type { ActivityRepository, RecordObservationInput, RecordObservationResult } from "../contracts/db.js";
+import { ACQUISITION_CLASSES, ELIGIBILITY_PATTERN, ENTRANCE_CONTRACT_PATTERN, isValidPageKey } from "../contracts/api.js";
+import type { ActivityRepository, ObservationContext, RecordObservationInput, RecordObservationResult } from "../contracts/db.js";
 import type { Logger } from "../log/index.js";
 import { DbError, guarded, type Pool } from "./pool.js";
 
@@ -34,9 +35,11 @@ SELECT $1::text, $2::text, $3::text, $4::bigint, $5::timestamptz,
 ON CONFLICT (installation_id, website_id, observation_ref) DO NOTHING
 RETURNING previously_seen`;
 
+/** The observation row with its entrance evidence (0005 columns; NULL when the caller supplied no context). */
 export const INSERT_OBSERVATION_SQL = `
-INSERT INTO company_observations (installation_id, website_id, company_id, observed_at, observation_ref, source)
-VALUES ($1::text, $2::text, $3::bigint, $4::timestamptz, $5::text, $6::text)
+INSERT INTO company_observations (installation_id, website_id, company_id, observed_at, observation_ref, source,
+                                  page_key, acquisition, entrance_contract, eligibility)
+VALUES ($1::text, $2::text, $3::bigint, $4::timestamptz, $5::text, $6::text, $7::text, $8::text, $9::text, $10::text)
 RETURNING id`;
 
 /**
@@ -81,12 +84,27 @@ RETURNING 1`;
 
 const REF_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
+/** Same rules as the API schema and the 0005 CHECK constraints; a bad value never reaches SQL. */
+function validContext(c: ObservationContext): boolean {
+  return (
+    typeof c.pageKey === "string" &&
+    isValidPageKey(c.pageKey) &&
+    (ACQUISITION_CLASSES as readonly string[]).includes(c.acquisition) &&
+    typeof c.entranceContract === "string" &&
+    ENTRANCE_CONTRACT_PATTERN.test(c.entranceContract) &&
+    typeof c.eligibility === "string" &&
+    ELIGIBILITY_PATTERN.test(c.eligibility)
+  );
+}
+
 export function createActivityRepository(pool: Pool, logger?: Logger): ActivityRepository {
   return {
     async recordObservation(input: RecordObservationInput): Promise<RecordObservationResult> {
       if (!REF_PATTERN.test(input.observationRef)) throw new DbError("INVALID_REF");
       if (!Number.isSafeInteger(input.companyId) || input.companyId < 1) throw new DbError("INVALID_COMPANY");
       if (input.source !== "cache" && input.source !== "provider") throw new DbError("INVALID_SOURCE");
+      if (input.context !== undefined && !validContext(input.context)) throw new DbError("INVALID_CONTEXT");
+      const ctx = input.context;
       const scopeParams = [input.scope.installationId, input.scope.websiteId];
       return guarded(logger, async () => {
         const client = await pool.connect();
@@ -125,6 +143,10 @@ export function createActivityRepository(pool: Pool, logger?: Logger): ActivityR
               input.observedAt,
               input.observationRef,
               input.source,
+              ctx?.pageKey ?? null,
+              ctx?.acquisition ?? null,
+              ctx?.entranceContract ?? null,
+              ctx?.eligibility ?? null,
             ]);
             await client.query(UPSERT_STATS_SQL, [...scopeParams, input.companyId, input.observedAt, input.observationRef]);
             await client.query(TOUCH_COMPANY_SQL, [input.companyId, input.observedAt]);

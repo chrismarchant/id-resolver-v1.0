@@ -21,7 +21,7 @@
  *   runner; logs carry only a random job id, never the IP or a secret.
  */
 import { randomUUID } from "node:crypto";
-import { OBSERVATION_REF_PATTERN, RESOLUTION_STATUSES, type CompanyContext, type ResolutionSource } from "../contracts/api.js";
+import { OBSERVATION_REF_PATTERN, RESOLUTION_STATUSES, type ResolutionSource } from "../contracts/api.js";
 import {
   OUTCOME_REASONS,
   RunnerOverloadedError,
@@ -111,33 +111,6 @@ export function buildPipelineConfig(config: Config): PipelineConfig {
 // ---- outcome allowlist -------------------------------------------------------
 
 const SOURCES: readonly ResolutionSource[] = ["cache", "provider", "none"];
-const isStr = (v: unknown, max: number): v is string => typeof v === "string" && v.length > 0 && v.length <= max;
-
-function sanitiseCompany(value: unknown): CompanyContext | null | undefined {
-  if (value === null) return null;
-  if (typeof value !== "object") return undefined;
-  const c = value as Record<string, unknown>;
-  const q = c["qualification"] as Record<string, unknown> | null | undefined;
-  const org = c["organisation_name"];
-  if (
-    !isStr(c["domain"], 253) ||
-    !(org === null || isStr(org, 200)) ||
-    typeof q !== "object" ||
-    q === null ||
-    !isStr(q["category"], 32) ||
-    q["source"] !== "provider_usage_type" ||
-    !isStr(c["resolved_at"], 40) ||
-    Number.isNaN(Date.parse(c["resolved_at"]))
-  ) {
-    return undefined;
-  }
-  return {
-    domain: c["domain"],
-    organisation_name: org,
-    qualification: { category: q["category"], source: "provider_usage_type" },
-    resolved_at: c["resolved_at"],
-  };
-}
 
 /** Activity is optional and only meaningful on qualified outcomes; any malformed shape invalidates the outcome. */
 function sanitiseActivity(value: unknown): ObservationActivity | null | undefined {
@@ -157,8 +130,8 @@ function sanitiseActivity(value: unknown): ObservationActivity | null | undefine
 /**
  * Rebuilds an allowlisted outcome, or null if the shape is invalid. Defence in
  * depth: the pipeline already produces only allowlisted values, but nothing
- * outside this allowlist (free text, an IP, a payload) can reach a response
- * or a log line even if a future change gets that wrong.
+ * outside this allowlist (free text, an IP, a payload, company identity) can
+ * reach a response or a log line even if a future change gets that wrong.
  */
 export function sanitiseOutcome(value: unknown): ResolutionOutcome | null {
   if (typeof value !== "object" || value === null) return null;
@@ -169,15 +142,11 @@ export function sanitiseOutcome(value: unknown): ResolutionOutcome | null {
   if (!(RESOLUTION_STATUSES as readonly unknown[]).includes(status)) return null;
   if (!(SOURCES as readonly unknown[]).includes(source)) return null;
   if (reason !== undefined && !(OUTCOME_REASONS as readonly unknown[]).includes(reason)) return null;
-  const company = sanitiseCompany(o["company"]);
-  if (company === undefined) return null;
-  if ((status === "qualified") !== (company !== null)) return null;
   const activity = sanitiseActivity(o["activity"]);
   if (activity === undefined) return null;
   if (activity !== null && status !== "qualified") return null;
   return {
     status: status as ResolutionOutcome["status"],
-    company,
     source: source as ResolutionSource,
     ...(reason !== undefined ? { reason: reason as OutcomeReason } : {}),
     ...(activity !== null ? { activity } : {}),
@@ -186,7 +155,6 @@ export function sanitiseOutcome(value: unknown): ResolutionOutcome | null {
 
 const failure = (reason: "internal_error" | "deadline_exceeded"): ResolutionOutcome => ({
   status: "unavailable",
-  company: null,
   source: "none",
   reason,
 });
@@ -225,6 +193,7 @@ export function createRunner(opts: RunnerOptions): Runner {
       ip: req.ip,
       deadline_at_ms: req.deadlineAtMs,
       observation_ref: req.observationRef,
+      context: req.context,
       signal: controller.signal,
     };
     logger.debug("job_started", { job_id: jobId, active_jobs: active });

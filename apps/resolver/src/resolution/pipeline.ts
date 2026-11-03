@@ -14,7 +14,6 @@
  * The outcome never carries free text: only allowlisted statuses/reasons.
  * The raw IP and error messages never leave this function and are never logged.
  */
-import type { CompanyContext } from "../contracts/api.js";
 import type {
   ActivityRepository,
   CacheCompany,
@@ -111,25 +110,19 @@ async function repo<T>(fn: () => Promise<T>): Promise<T> {
 
 const outcome = (status: ResolutionOutcome["status"], reason: OutcomeReason, source: ResolutionOutcome["source"] = "none"): ResolutionOutcome => ({
   status,
-  company: null,
   source,
   reason,
 });
 
-function companyContext(c: CacheCompany, checkedAt: Date): CompanyContext {
-  return {
-    domain: c.domain,
-    organisation_name: c.organisationName,
-    qualification: { category: c.qualificationCategory, source: "provider_usage_type" },
-    resolved_at: checkedAt.toISOString(),
-  };
-}
-
+/**
+ * Outcomes carry no company identity (D2): the company association lives in
+ * the cache row and the observation; the caller learns only the status.
+ */
 export function outcomeFromCacheRow(row: CacheRow): ResolutionOutcome {
   switch (row.status) {
     case "qualified":
       if (!row.company || row.companyId === null) return outcome("unknown", "cache_fresh", "cache");
-      return { status: "qualified", company: companyContext(row.company, row.checkedAt), source: "cache", reason: "cache_fresh" };
+      return outcome("qualified", "cache_fresh", "cache");
     case "provider_error":
       return outcome("unavailable", "cache_fresh", "cache");
     case "uncertain":
@@ -158,7 +151,7 @@ function planFor(p: ProviderOutcome, policy: PipelineConfig["policy"], checkedAt
         const company: CacheCompany = { domain: p.domain, organisationName: p.organisationName, qualificationCategory: q.category };
         return {
           commit: { status: "qualified", company, ttlMs: policy.ttl_qualified_ms },
-          result: { status: "qualified", company: companyContext(company, checkedAt), source: "provider", reason: q.reason },
+          result: outcome("qualified", q.reason, "provider"),
           counters: ["domain_resolutions", "qualified_matches"],
           credits,
         };
@@ -306,6 +299,7 @@ export async function runJob(
         observationRef: job.observation_ref,
         source,
         observedAt,
+        context: job.context,
       });
       const r = await new Promise<RecordObservationResult>((resolve, reject) => {
         const t = setTimeout(() => {

@@ -42,7 +42,9 @@ function makeConfig(overrides: { policy?: Partial<PipelineConfig["policy"]>; pro
 }
 
 const REF = "obsref-0123456789abcdef";
+const CONTEXT = { pageKey: "/pricing", acquisition: "search", entranceContract: "entrance.v1", eligibility: "tsa-1" } as const;
 const job = (ip = IP, deadlineInMs = 4_000, observationRef = REF): ResolutionJob => ({
+  context: { ...CONTEXT },
   job_id: "job-1",
   ip,
   deadline_at_ms: Date.now() + deadlineInMs,
@@ -87,7 +89,7 @@ describe("runJob: eligibility", () => {
   ])("%s -> ineligible (%s) without cache or provider access", async (ip, reason) => {
     const t = setup();
     const o = await runJob(t.deps, t.config, job(ip));
-    expect(o).toEqual({ status: "ineligible", company: null, source: "none", reason });
+    expect(o).toEqual({ status: "ineligible", source: "none", reason });
     expect(t.repos.cache.calls.reserve + t.repos.cache.calls.readFresh).toBe(0);
     expect(t.mock.calls).toBe(0);
     expect((await t.snapshot()).resolver_requests).toBe(1);
@@ -98,12 +100,10 @@ describe("runJob: provider outcomes", () => {
   it("acquired -> qualified: commits with qualified TTL and company, counts", async () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toMatchObject({
-      status: "qualified",
-      source: "provider",
-      company: { domain: "example.com", organisation_name: "Example Ltd", qualification: { category: "COM", source: "provider_usage_type" } },
-    });
-    expect(Date.parse(o.company!.resolved_at)).not.toBeNaN();
+    expect(o).toMatchObject({ status: "qualified", source: "provider", reason: "provider_resolved" });
+    // D2: the outcome carries no company identity; the association lives in the cache row and the observation.
+    expect(Object.keys(o).sort()).toEqual(["activity", "reason", "source", "status"]);
+    expect(JSON.stringify(o)).not.toMatch(/example\.com|Example Ltd|COM"/);
     const e = t.repos.cache.inspect(keyFor(t.config))!;
     expect(e.status).toBe("qualified");
     expect(e.expiresAt.getTime() - e.checkedAt!.getTime()).toBeGreaterThanOrEqual(t.config.policy.ttl_qualified_ms); // expiry is clock time + ttl, checkedAt is metadata
@@ -127,7 +127,8 @@ describe("runJob: provider outcomes", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     await runJob(t.deps, t.config, job());
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toMatchObject({ status: "qualified", source: "cache", reason: "cache_fresh", company: { domain: "example.com" } });
+    expect(o).toMatchObject({ status: "qualified", source: "cache", reason: "cache_fresh" });
+    expect(o.activity!.company_id).toBe(t.repos.cache.companyIdFor("example.com"));
     expect(t.mock.calls).toBe(1);
     expect((await t.snapshot()).cache_hits).toBe(1);
   });
@@ -141,7 +142,7 @@ describe("runJob: provider outcomes", () => {
   ] as const)("%s -> %s", async (_label, outcome, status, reason, ttlKey, counter) => {
     const t = setup({ [IP]: { outcome } });
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toEqual({ status, company: null, source: "provider", reason });
+    expect(o).toEqual({ status, source: "provider", reason });
     const e = t.repos.cache.inspect(keyFor(t.config))!;
     expect(e.status).toBe(status);
     expect(e.company).toBeNull();
@@ -158,13 +159,13 @@ describe("runJob: provider outcomes", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM"), delayMs: 10_000 } });
     const config = makeConfig({ provider: { timeout_ms: 250 } });
     const o = await runJob(t.deps, config, job());
-    expect(o).toEqual({ status: "uncertain", company: null, source: "provider", reason: "provider_timeout" });
+    expect(o).toEqual({ status: "uncertain", source: "provider", reason: "provider_timeout" });
     const e = t.repos.cache.inspect(keyFor(config))!;
     expect(e.status).toBe("uncertain");
     expect(e.expiresAt.getTime() - e.checkedAt!.getTime()).toBeGreaterThanOrEqual(config.policy.ttl_uncertain_ms); // expiry is clock time + ttl, checkedAt is metadata
     expect(e.expiresAt.getTime() - e.checkedAt!.getTime()).toBeLessThan(config.policy.ttl_uncertain_ms + 1_000);
     const again = await runJob(t.deps, config, job());
-    expect(again).toEqual({ status: "uncertain", company: null, source: "cache", reason: "cache_fresh" });
+    expect(again).toEqual({ status: "uncertain", source: "cache", reason: "cache_fresh" });
     expect(t.mock.calls).toBe(1);
     const s = await t.snapshot();
     expect(s).toMatchObject({ uncertain_outcomes: 1, provider_attempts: 1, providerCreditsEstimated: 100, providerCreditsReported: 0 });
@@ -182,14 +183,14 @@ describe("runJob: provider outcomes", () => {
   ] as const)("provider error %s -> unavailable with provider_error TTL", async (category, retryAfterMs, ttl) => {
     const t = setup({ [IP]: { outcome: { kind: "error", category, retryAfterMs } } });
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toEqual({ status: "unavailable", company: null, source: "provider", reason: `provider_error_${category}` });
+    expect(o).toEqual({ status: "unavailable", source: "provider", reason: `provider_error_${category}` });
     const e = t.repos.cache.inspect(keyFor(t.config))!;
     expect(e.status).toBe("provider_error");
     expect(e.expiresAt.getTime() - e.checkedAt!.getTime()).toBeGreaterThanOrEqual(ttl); // expiry is clock time + ttl, checkedAt is metadata
     expect(e.expiresAt.getTime() - e.checkedAt!.getTime()).toBeLessThan(ttl + 1_000);
     expect((await t.snapshot()).failures).toBe(1);
     const again = await runJob(t.deps, t.config, job());
-    expect(again).toEqual({ status: "unavailable", company: null, source: "cache", reason: "cache_fresh" });
+    expect(again).toEqual({ status: "unavailable", source: "cache", reason: "cache_fresh" });
     expect(t.mock.calls).toBe(1);
   });
 });
@@ -199,7 +200,7 @@ describe("runJob: controls and caps", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     const config = makeConfig({ policy: { period_call_cap: 0 } });
     const o = await runJob(t.deps, config, job());
-    expect(o).toEqual({ status: "disabled", company: null, source: "none", reason: "cap_exhausted" });
+    expect(o).toEqual({ status: "disabled", source: "none", reason: "cap_exhausted" });
     expect(t.mock.calls).toBe(0);
     const e = t.repos.cache.inspect(keyFor(config))!;
     expect(e.leaseExpiresAt).toBeNull();
@@ -225,7 +226,7 @@ describe("runJob: controls and caps", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     await t.repos.controls.setEnrichmentEnabled(t.config.installation_id, false, "test");
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toEqual({ status: "disabled", company: null, source: "none", reason: "kill_switch" });
+    expect(o).toEqual({ status: "disabled", source: "none", reason: "kill_switch" });
     expect(t.mock.calls).toBe(0);
     expect(t.repos.cache.inspect(keyFor(t.config))!.token).toBeNull();
     expect((await t.snapshot()).provider_attempts).toBe(0);
@@ -243,7 +244,7 @@ describe("runJob: controls and caps", () => {
     const t = setup();
     const config = makeConfig({ provider: { mode: "disabled" } });
     const o = await runJob(t.deps, config, job());
-    expect(o).toEqual({ status: "disabled", company: null, source: "none", reason: "provider_disabled" });
+    expect(o).toEqual({ status: "disabled", source: "none", reason: "provider_disabled" });
     expect(t.mock.calls).toBe(0);
     expect((await t.snapshot()).provider_attempts).toBe(0);
     expect(t.repos.cache.inspect(keyFor(config))!.token).toBeNull();
@@ -259,7 +260,7 @@ describe("runJob: controls and caps", () => {
   it("deadline too short -> deadline_exceeded, no provider call, attempt still counted", async () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     const o = await runJob(t.deps, t.config, job(IP, 300));
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "deadline_exceeded" });
     expect(t.mock.calls).toBe(0);
     expect((await t.snapshot()).provider_attempts).toBe(1);
     expect(t.repos.cache.inspect(keyFor(t.config))!.token).toBeNull();
@@ -295,7 +296,7 @@ describe("runJob: concurrency and fencing", () => {
     await t.repos.cache.reserve(keyFor(config), { leaseMs: 10_000 });
     const started = Date.now();
     const o = await runJob(t.deps, config, job());
-    expect(o).toEqual({ status: "pending", company: null, source: "none", reason: "pending_other_worker" });
+    expect(o).toEqual({ status: "pending", source: "none", reason: "pending_other_worker" });
     expect(Date.now() - started).toBeLessThan(600);
     expect(t.mock.calls).toBe(0);
   });
@@ -325,7 +326,8 @@ describe("runJob: concurrency and fencing", () => {
       });
     }, 100);
     const o = await runJob(t.deps, config, job());
-    expect(o).toMatchObject({ status: "qualified", source: "cache", company: { domain: "example.com" } });
+    expect(o).toMatchObject({ status: "qualified", source: "cache" });
+    expect(o.activity!.company_id).toBe(t.repos.cache.companyIdFor("example.com"));
     expect(t.mock.calls).toBe(0);
     expect((await t.snapshot()).cache_hits).toBe(1);
   });
@@ -355,7 +357,8 @@ describe("runJob: concurrency and fencing", () => {
     const outcomes = await Promise.all(Array.from({ length: 20 }, () => runJob(t.deps, config, job())));
     expect(t.mock.calls).toBe(1);
     expect(outcomes.filter((o) => o.source === "provider")).toHaveLength(1);
-    expect(outcomes.every((o) => o.status === "qualified" && o.company?.domain === "example.com")).toBe(true);
+    const companyId = t.repos.cache.companyIdFor("example.com");
+    expect(outcomes.every((o) => o.status === "qualified" && o.activity?.company_id === companyId)).toBe(true);
     const s = await t.snapshot();
     expect(s.provider_attempts).toBe(1);
     expect(s.resolver_requests).toBe(20);
@@ -376,7 +379,7 @@ describe("runJob: failures and hygiene", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     t.repos.cache.failures[method] = true;
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "database_error" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "database_error" });
   });
 
   it("usage reservation throwing -> database_error and the reservation is released", async () => {
@@ -413,7 +416,7 @@ describe("runJob: failures and hygiene", () => {
     };
     const t = setup({}, provider);
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "internal_error" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "internal_error" });
     expect(JSON.stringify(o)).not.toContain(IP);
   });
 
@@ -455,6 +458,8 @@ describe("runJob: company activity", () => {
     expect(o.activity).toEqual({ company_id: companyId, previously_seen: false, recorded: true, observation_ref: ref(1) });
     expect(t.repos.activity.observations).toHaveLength(1);
     expect(t.repos.activity.observations[0]).toMatchObject({ installationId: "inst-test", websiteId: "site-test", companyId, source: "provider", observationRef: ref(1), companyFirst: true });
+    // The entrance evidence travels with the observation, unchanged.
+    expect(t.repos.activity.observations[0]!.context).toEqual(CONTEXT);
     expect(activityLogs(t)).toEqual([expect.objectContaining({ event: "activity_recorded", company_id: companyId, recorded: true, previously_seen: false, source: "provider" })]);
     expect(JSON.stringify(activityLogs(t))).not.toMatch(/example\.com|203\.0\.113/);
   });
@@ -549,7 +554,7 @@ describe("runJob: company activity", () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     t.repos.activity.failures.recordObservation = true;
     const o = await runJob(t.deps, t.config, job());
-    expect(o).toMatchObject({ status: "qualified", source: "provider", company: { domain: "example.com" }, activity: { previously_seen: null, recorded: false, observation_ref: REF } });
+    expect(o).toMatchObject({ status: "qualified", source: "provider", activity: { previously_seen: null, recorded: false, observation_ref: REF } });
     expect(t.repos.cache.inspect(keyFor(t.config))!.status).toBe("qualified");
     expect(activityLogs(t)).toEqual([expect.objectContaining({ event: "activity_write_failed", reason: "database_error", source: "provider" })]);
     expect((await t.snapshot()).qualified_matches).toBe(1);
@@ -644,7 +649,7 @@ describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
   it("an already-aborted job stops before the cache is touched and before any provider call", async () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     const o = await runJob(t.deps, t.config, withSignal(job(), AbortSignal.abort()));
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "deadline_exceeded" });
     expect(t.repos.cache.calls.reserve).toBe(0);
     expect(t.mock.calls).toBe(0);
     expect((await t.snapshot()).provider_attempts).toBe(0);
@@ -690,7 +695,7 @@ describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
       return isEnabled(id);
     };
     const o = await runJob(t.deps, t.config, withSignal(job(), controller.signal));
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "deadline_exceeded" });
     expect((await t.snapshot()).provider_attempts).toBe(0);
     expect(t.mock.calls).toBe(0);
     expect(t.repos.cache.calls.release).toBe(1);
@@ -705,7 +710,7 @@ describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
     setTimeout(() => controller.abort(), 100);
     const started = Date.now();
     const o = await runJob(t.deps, config, withSignal(job(), controller.signal));
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "deadline_exceeded" });
     expect(Date.now() - started).toBeLessThan(500);
   });
 

@@ -1,23 +1,41 @@
 import { z } from "zod";
 import {
+  ACQUISITION_CLASSES,
+  ELIGIBILITY_PATTERN,
+  ENTRANCE_CONTRACT,
+  ENTRANCE_ID_PATTERN,
   IDENTIFIER_PATTERN,
+  isValidPageKey,
   MAX_IP_LENGTH,
-  OBSERVATION_REF_PATTERN,
+  OCCURRED_AT_PATTERN,
+  parseOccurredAt,
   REPORTING_DEFAULT_LIMIT,
   REPORTING_MAX_LIMIT,
-  REQUEST_ID_PATTERN,
 } from "../contracts/api.js";
 
-export const ResolveBodySchema = z
+/**
+ * POST /v1/entrances body, contract entrance.v1 (docs/contracts/entrance.v1.md).
+ * Strict: unknown fields are rejected. The occurred_at clock-skew bound needs
+ * the resolver clock and is checked by the route handler.
+ */
+export const EntranceBodySchema = z
   .object({
+    contract: z.literal(ENTRANCE_CONTRACT),
     website_id: z.string().regex(IDENTIFIER_PATTERN),
     ip: z.string().min(1).max(MAX_IP_LENGTH),
-    request_id: z.string().regex(REQUEST_ID_PATTERN).optional(),
-    observation_ref: z.string().regex(OBSERVATION_REF_PATTERN).optional(),
+    entrance_id: z.string().regex(ENTRANCE_ID_PATTERN),
+    occurred_at: z
+      .string()
+      .max(40)
+      .regex(OCCURRED_AT_PATTERN)
+      .refine((v) => parseOccurredAt(v) !== null),
+    page_key: z.string().min(1).max(1_024).refine(isValidPageKey),
+    acquisition: z.enum(ACQUISITION_CLASSES),
+    eligibility: z.string().regex(ELIGIBILITY_PATTERN),
   })
   .strict();
 
-export type ResolveBody = z.infer<typeof ResolveBodySchema>;
+export type EntranceBody = z.infer<typeof EntranceBodySchema>;
 
 // ---- Reporting query parameters (all optional, all bounded) ----------------
 

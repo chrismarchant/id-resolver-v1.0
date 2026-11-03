@@ -47,6 +47,7 @@ function config(over: Partial<PipelineConfig["policy"]> = {}): PipelineConfig {
 }
 
 const job = (ref: string, deadlineInMs = 6_000): ResolutionJob => ({
+  context: { pageKey: "/pricing", acquisition: "search", entranceContract: "entrance.v1", eligibility: "tsa-1" },
   job_id: `job-${ref}`,
   ip: IP,
   deadline_at_ms: Date.now() + deadlineInMs,

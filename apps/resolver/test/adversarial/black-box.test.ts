@@ -13,13 +13,27 @@ import { resolve } from "node:path";
 import { startMockEnrichServer, SPECIAL_IPS, type MockServerHandle } from "../../src/provider/mock-server.js";
 import { createTestDb, resetTestDb, getTestDatabaseUrl } from "../helpers/db.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
-import { dumpDatabaseText, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
+import { dumpDatabaseText, entranceResponseProblems, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
 import type { Db } from "../../src/db/index.js";
 
 const PORT = 18000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const QUALIFIED_IP = "203.0.113.10";
 const TEST_IPS = [QUALIFIED_IP, "203.0.113.11", "203.0.113.13", "2001:db8::10", SPECIAL_IPS.slow, SPECIAL_IPS.serverError, "198.51.100.77"];
+const COMPANY_NEEDLES = ["example.com", "Example Ltd", "Example Transit Networks"];
+let entranceSeq = 0;
+/** A valid entrance.v1 body; `over` replaces or adds fields. */
+const entrance = (ip: string, over: Record<string, unknown> = {}) => ({
+  contract: "entrance.v1",
+  website_id: "site-test",
+  ip,
+  entrance_id: `bb-entrance-${String((entranceSeq += 1)).padStart(8, "0")}`,
+  occurred_at: new Date().toISOString(),
+  page_key: "/pricing",
+  acquisition: "search",
+  eligibility: "tsa-1",
+  ...over,
+});
 
 /**
  * Child processes of the service process. Under tsx the loader may keep a
@@ -43,13 +57,15 @@ describe("black-box service process", () => {
   let exitCode: number | null = null;
   let exitSignal: string | null = null;
 
+  const responses: string[] = [];
   const post = async (body: unknown, headers: Record<string, string> = {}) => {
-    const res = await fetch(`${BASE}/v1/resolve`, {
+    const res = await fetch(`${BASE}/v1/entrances`, {
       method: "POST",
       headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}`, "content-type": "application/json", ...headers },
       body: typeof body === "string" ? body : JSON.stringify(body),
     });
     const text = await res.text();
+    responses.push(text);
     return { status: res.status, text, json: (() => { try { return JSON.parse(text) as Record<string, unknown>; } catch { return {}; } })(), headers: res.headers };
   };
 
@@ -111,10 +127,16 @@ describe("black-box service process", () => {
 
   it("rejects bad credentials, wrong website and oversized bodies before processing", async () => {
     const hitsBefore = mock.hits(QUALIFIED_IP);
-    expect((await post({ website_id: "site-test", ip: QUALIFIED_IP }, { authorization: "Bearer nope" })).status).toBe(401);
-    expect((await post({ website_id: "another", ip: QUALIFIED_IP })).status).toBe(403);
-    expect((await post({ website_id: "site-test", ip: QUALIFIED_IP, pad: "x".repeat(4000) })).status).toBe(413);
+    expect((await post(entrance(QUALIFIED_IP), { authorization: "Bearer nope" })).status).toBe(401);
+    expect((await post(entrance(QUALIFIED_IP, { website_id: "another" }))).status).toBe(403);
+    expect((await post(entrance(QUALIFIED_IP, { pad: "x".repeat(4000) }))).status).toBe(413);
     expect((await post("{broken")).status).toBe(400);
+    // A captured request replayed outside the 300 s window is refused before any processing.
+    expect((await post(entrance(QUALIFIED_IP, { occurred_at: new Date(Date.now() - 600_000).toISOString() }))).status).toBe(400);
+    // The removed V0.1 route does not exist, even with a valid credential.
+    const legacy = await fetch(`${BASE}/v1/resolve`, { method: "POST", headers: { authorization: `Bearer ${TEST_AUTH_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ website_id: "site-test", ip: QUALIFIED_IP }) });
+    expect(legacy.status).toBe(400);
+    expect(await legacy.json()).toEqual({ version: "1", error: "invalid_request" });
     expect(mock.hits(QUALIFIED_IP)).toBe(hitsBefore);
   });
 
@@ -123,44 +145,44 @@ describe("black-box service process", () => {
       new Promise<string>((resolve, reject) => {
         const sock = connect(PORT, "127.0.0.1");
         let data = "";
-        const body = JSON.stringify({ website_id: "site-test", ip: QUALIFIED_IP });
+        const body = JSON.stringify(entrance(QUALIFIED_IP));
         sock.on("connect", () => sock.write(`POST ${target} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`));
         sock.on("data", (d) => (data += d.toString()));
         sock.on("end", () => resolve(data));
         sock.on("error", reject);
       });
     const before = mock.hits(QUALIFIED_IP);
-    for (const target of [`http://127.0.0.1:${PORT}/v1/resolve`, "/%761/resolve", "/v1/%72esolve"]) {
+    for (const target of [`http://127.0.0.1:${PORT}/v1/entrances`, "/%761/entrances", "/v1/%65ntrances"]) {
       const res = await raw(target);
       expect(res, target).toMatch(/^HTTP\/1\.1 (401|400) /);
       expect(res).toContain("no-store");
       expect(res).not.toContain('"status":"qualified"');
+      expect(res).not.toContain("example.com");
     }
     expect(mock.hits(QUALIFIED_IP)).toBe(before);
   });
 
   it("resolves in-process, then from cache", async () => {
-    const a = await post({ website_id: "site-test", ip: QUALIFIED_IP, request_id: "bb-1" });
+    const a = await post(entrance(QUALIFIED_IP));
     expect(a.status).toBe(200);
-    expect(a.json["status"]).toBe("qualified");
-    expect(a.json["source"]).toBe("provider");
+    expect(a.json).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
     expect(a.headers.get("cache-control")).toBe("no-store");
     expect(a.headers.get("access-control-allow-origin")).toBeNull();
-    const b = await post({ website_id: "site-test", ip: QUALIFIED_IP });
-    expect(b.json["source"]).toBe("cache");
+    const b = await post(entrance(QUALIFIED_IP));
+    expect(b.json).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
     expect(mock.hits(QUALIFIED_IP)).toBe(1);
   });
 
   it("times out a slow provider inside the deadline and defaults", async () => {
     const t0 = Date.now();
-    const r = await post({ website_id: "site-test", ip: SPECIAL_IPS.slow });
+    const r = await post(entrance(SPECIAL_IPS.slow));
     expect(Date.now() - t0).toBeLessThan(2_000);
     expect(r.json["status"]).toBe("uncertain");
   });
 
   it("handles a burst in one process: bounded concurrency, 503 overloaded beyond it, never a child process", async () => {
     const ips = Array.from({ length: 12 }, (_, i) => `198.51.100.${10 + i}`);
-    const pending = Promise.all(ips.map((ip) => post({ website_id: "site-test", ip })));
+    const pending = Promise.all(ips.map((ip) => post(entrance(ip))));
     // Sampled while the burst is in flight: the service never forks.
     const during = childProcesses(proc.pid!);
     const results = await pending;
@@ -181,7 +203,7 @@ describe("black-box service process", () => {
   });
 
   it("shuts down gracefully on SIGTERM, draining the in-flight job", async () => {
-    const inflight = post({ website_id: "site-test", ip: "198.51.100.77" });
+    const inflight = post(entrance("198.51.100.77"));
     await new Promise((r) => setTimeout(r, 30));
     proc.kill("SIGTERM");
     const t0 = Date.now();
@@ -215,6 +237,12 @@ describe("black-box service process", () => {
     expect(output).toContain('"event":"job_finished"');
     expect(findLeaks(output, needles)).toEqual([]);
     expect(findLeaks(await dumpDatabaseText(db.pool), needles)).toEqual([]);
+    // Every website-facing response is the bare acknowledgement or error body: no IP, no company data (D2).
+    expect(responses.length).toBeGreaterThan(10);
+    for (const raw of responses) expect(entranceResponseProblems(raw, [...needles, ...COMPANY_NEEDLES])).toEqual([]);
+    // The observations carry the entrance context, never the address.
+    const ctx = await db.pool.query<{ n: number }>("SELECT count(*)::int AS n FROM company_observations WHERE page_key = '/pricing' AND acquisition = 'search' AND entrance_contract = 'entrance.v1' AND eligibility = 'tsa-1'");
+    expect(ctx.rows[0]!.n).toBeGreaterThan(0);
     expect(output).not.toMatch(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
   });
 });

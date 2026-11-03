@@ -41,14 +41,9 @@ const IP = "203.0.113.1";
 const deadline = (ms: number) => Date.now() + ms;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+const CONTEXT = { pageKey: "/pricing", acquisition: "search", entranceContract: "entrance.v1", eligibility: "tsa-1" } as const;
 const QUALIFIED: ResolutionOutcome = {
   status: "qualified",
-  company: {
-    domain: "example.com",
-    organisation_name: "Example Ltd",
-    qualification: { category: "COM", source: "provider_usage_type" },
-    resolved_at: "2026-10-26T12:00:00.000Z",
-  },
   source: "provider",
   reason: "provider_resolved",
   activity: { company_id: 7, previously_seen: false, recorded: true, observation_ref: REF },
@@ -88,7 +83,7 @@ describe("runner: results and crash containment", () => {
       seen.push(deps);
       return QUALIFIED;
     });
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
     expect(o).toEqual(QUALIFIED);
     expect(runner.activeCount()).toBe(0);
     // The job receives the shared repositories, the logger and the deferred-write tracker.
@@ -102,8 +97,8 @@ describe("runner: results and crash containment", () => {
     const c = controllable();
     const { runner } = setup(c.execute);
     const at = deadline(5_000);
-    const p = runner.run({ ip: IP, deadlineAtMs: at, observationRef: REF });
-    expect(c.jobs[0]).toMatchObject({ ip: IP, deadline_at_ms: at, observation_ref: REF });
+    const p = runner.run({ ip: IP, deadlineAtMs: at, observationRef: REF, context: CONTEXT });
+    expect(c.jobs[0]).toMatchObject({ ip: IP, deadline_at_ms: at, observation_ref: REF, context: CONTEXT });
     expect(c.jobs[0]!.job_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(c.jobs[0]!.job_id).not.toContain(IP);
     expect(c.jobs[0]!.signal?.aborted).toBe(false);
@@ -120,8 +115,8 @@ describe("runner: results and crash containment", () => {
     }) as JobExecutor],
   ])("%s -> unavailable/internal_error, slot freed, error text never logged", async (_label, execute) => {
     const { runner, logger } = setup(execute);
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF });
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "internal_error" });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "internal_error" });
     expect(runner.activeCount()).toBe(0);
     expect(logger.entries.some((e) => e["event"] === "job_error" && e["category"] === "job")).toBe(true);
     expect(JSON.stringify(logger.entries)).not.toContain("boom");
@@ -129,15 +124,14 @@ describe("runner: results and crash containment", () => {
   });
 
   it.each([
-    ["invalid status", { status: "owned", company: null, source: "provider" }],
-    ["company on a non-qualified status", { ...QUALIFIED, status: "unknown", activity: undefined }],
-    ["free-text reason", { status: "no_match", company: null, source: "provider", reason: "203.0.113.10 leaked" }],
-    ["activity on a non-qualified outcome", { status: "no_match", company: null, source: "cache", activity: QUALIFIED.activity }],
+    ["invalid status", { status: "owned", source: "provider" }],
+    ["free-text reason", { status: "no_match", source: "provider", reason: "203.0.113.10 leaked" }],
+    ["activity on a non-qualified outcome", { status: "no_match", source: "cache", activity: QUALIFIED.activity }],
     ["not an object", "qualified"],
   ])("%s -> unavailable/internal_error", async (_label, value) => {
     const { runner, logger } = setup(async () => value as unknown as ResolutionOutcome);
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF });
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "internal_error" });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "internal_error" });
     expect(runner.activeCount()).toBe(0);
     expect(logger.entries.some((e) => e["event"] === "job_error" && e["category"] === "invalid_outcome")).toBe(true);
     expect(JSON.stringify(logger.entries)).not.toContain("leaked");
@@ -149,9 +143,9 @@ describe("runner: deadline", () => {
     const c = controllable();
     const { runner, logger } = setup(c.execute);
     const started = Date.now();
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(400), observationRef: REF });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(400), observationRef: REF, context: CONTEXT });
     const elapsed = Date.now() - started;
-    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(o).toEqual({ status: "unavailable", source: "none", reason: "deadline_exceeded" });
     expect(elapsed).toBeGreaterThanOrEqual(380);
     expect(elapsed).toBeLessThan(400 + 150);
     expect(c.jobs[0]!.signal?.aborted).toBe(true);
@@ -169,7 +163,7 @@ describe("runner: deadline", () => {
       await sleep(300);
       return QUALIFIED;
     });
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF, context: CONTEXT });
     expect(o.reason).toBe("deadline_exceeded");
   });
 
@@ -177,7 +171,7 @@ describe("runner: deadline", () => {
     const stuck: number[] = [];
     const { runner, logger } = setup(() => new Promise<ResolutionOutcome>(() => undefined), { stuckAfterMs: 150, onStuck: () => stuck.push(Date.now()) });
     const started = Date.now();
-    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF });
+    const o = await runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF, context: CONTEXT });
     expect(o.reason).toBe("deadline_exceeded");
     await sleep(400);
     expect(stuck).toHaveLength(1);
@@ -192,7 +186,7 @@ describe("runner: deadline", () => {
       await sleep(150);
       return QUALIFIED;
     }, { stuckAfterMs: 200, onStuck: () => stuck.push(1) });
-    await runner.run({ ip: IP, deadlineAtMs: deadline(50), observationRef: REF });
+    await runner.run({ ip: IP, deadlineAtMs: deadline(50), observationRef: REF, context: CONTEXT });
     await sleep(400);
     expect(stuck).toEqual([]);
     expect(runner.activeCount()).toBe(0);
@@ -204,14 +198,14 @@ describe("runner: capacity and shutdown", () => {
     const c = controllable();
     const { runner } = setup(c.execute);
     expect(runner.capacity()).toBe(3);
-    const runs = [1, 2, 3].map(() => runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF }));
+    const runs = [1, 2, 3].map(() => runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT }));
     expect(runner.activeCount()).toBe(3);
-    expect(() => runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF })).toThrow(RunnerOverloadedError);
+    expect(() => runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT })).toThrow(RunnerOverloadedError);
     expect(c.jobs).toHaveLength(3);
     c.releaseAll(QUALIFIED);
     expect((await Promise.all(runs)).every((o) => o.status === "qualified")).toBe(true);
     expect(runner.activeCount()).toBe(0);
-    const again = runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF });
+    const again = runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
     c.releaseAll(QUALIFIED);
     expect((await again).status).toBe("qualified");
   });
@@ -219,19 +213,19 @@ describe("runner: capacity and shutdown", () => {
   it("shutdown refuses new work and drains executing jobs within the grace period", async () => {
     const c = controllable();
     const { runner } = setup(c.execute);
-    const runs = [runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF }), runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF })];
+    const runs = [runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT }), runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT })];
     setTimeout(() => c.releaseAll(QUALIFIED), 100);
     const started = Date.now();
     const drain = await runner.shutdown(2_000);
     expect(Date.now() - started).toBeLessThan(1_000);
     expect(drain).toEqual({ drained: true, activeJobs: 0, pendingWrites: 0 });
     expect((await Promise.all(runs)).every((o) => o.status === "qualified")).toBe(true);
-    expect(() => runner.run({ ip: IP, deadlineAtMs: deadline(1_000), observationRef: REF })).toThrow(RunnerStoppedError);
+    expect(() => runner.run({ ip: IP, deadlineAtMs: deadline(1_000), observationRef: REF, context: CONTEXT })).toThrow(RunnerStoppedError);
   });
 
   it("shutdown gives up after the grace period and reports what is left", async () => {
     const { runner } = setup(() => new Promise<ResolutionOutcome>(() => undefined));
-    const run = runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF });
+    const run = runner.run({ ip: IP, deadlineAtMs: deadline(100), observationRef: REF, context: CONTEXT });
     const started = Date.now();
     const drain = await runner.shutdown(200);
     expect(Date.now() - started).toBeLessThan(600);
@@ -245,7 +239,7 @@ describe("runner: capacity and shutdown", () => {
       deps.onDeferred?.(sleep(200).then(() => void (finished = true)));
       return QUALIFIED;
     });
-    await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF });
+    await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
     expect(runner.activeCount()).toBe(0);
     const drain = await runner.shutdown(2_000);
     expect(finished).toBe(true);
@@ -278,16 +272,22 @@ describe("buildPipelineConfig", () => {
 
 describe("sanitiseOutcome", () => {
   it("rebuilds an allowlisted copy and drops unknown keys", () => {
-    const o = sanitiseOutcome({ status: "no_match", company: null, source: "cache", reason: "cache_fresh", extra: "203.0.113.1" });
-    expect(o).toEqual({ status: "no_match", company: null, source: "cache", reason: "cache_fresh" });
+    const o = sanitiseOutcome({ status: "no_match", source: "cache", reason: "cache_fresh", extra: "203.0.113.1" });
+    expect(o).toEqual({ status: "no_match", source: "cache", reason: "cache_fresh" });
+  });
+  it("drops any company identity (D2: identification only)", () => {
+    const o = sanitiseOutcome({ ...QUALIFIED, company: { domain: "example.com", organisation_name: "Example Ltd" }, domain: "example.com" });
+    expect(o).toEqual(QUALIFIED);
+    expect(JSON.stringify(o)).not.toContain("example.com");
   });
   it("rejects malformed shapes", () => {
     expect(sanitiseOutcome(null)).toBeNull();
-    expect(sanitiseOutcome({ status: "qualified", company: null, source: "cache" })).toBeNull();
-    expect(sanitiseOutcome({ status: "no_match", company: null, source: "elsewhere" })).toBeNull();
-    expect(sanitiseOutcome({ status: "no_match", source: "cache" })).toBeNull();
+    expect(sanitiseOutcome({ status: "qualified", source: "elsewhere" })).toBeNull();
+    expect(sanitiseOutcome({ status: "no_match", source: "elsewhere" })).toBeNull();
+    expect(sanitiseOutcome({ status: "no_match" })).toBeNull();
+    expect(sanitiseOutcome({ source: "cache" })).toBeNull();
   });
-  const qualified = { status: "qualified", company: QUALIFIED.company, source: "provider" };
+  const qualified = { status: "qualified", source: "provider" };
   it("keeps a well-formed activity block on qualified outcomes and drops unknown keys inside it", () => {
     const o = sanitiseOutcome({ ...qualified, activity: { company_id: 42, previously_seen: true, recorded: true, observation_ref: REF, ip: "203.0.113.1" } });
     expect(o?.activity).toEqual({ company_id: 42, previously_seen: true, recorded: true, observation_ref: REF });
@@ -306,7 +306,7 @@ describe("sanitiseOutcome", () => {
     ]) {
       expect(sanitiseOutcome({ ...qualified, activity }), JSON.stringify(activity)).toBeNull();
     }
-    expect(sanitiseOutcome({ status: "no_match", company: null, source: "cache", activity: { company_id: 42, previously_seen: true, recorded: true, observation_ref: REF } })).toBeNull();
+    expect(sanitiseOutcome({ status: "no_match", source: "cache", activity: { company_id: 42, previously_seen: true, recorded: true, observation_ref: REF } })).toBeNull();
   });
 });
 
