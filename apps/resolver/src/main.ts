@@ -69,12 +69,16 @@ async function main(): Promise<void> {
   });
   const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting, events: db.events });
 
-  // Expired cache rows and observation retention (the bounded sync buffer, D3),
-  // drained in bounded batches within a per-run budget. Companies, scope stats,
-  // deduplication records and tombstones are never pruned. Started after listen.
+  // Expired cache rows, browser events and observation retention (the bounded
+  // sync buffer, D3), drained in bounded batches within a per-run budget.
+  // Companies, scope stats, deduplication records and tombstones are never
+  // pruned. Started after listen.
   const maintenance = createMaintenance({
     pruneExpiredCache: (limit) => db.cache.pruneExpired(limit),
     retention: createFeedRetention(db.pool, logger),
+    // Browser events (event.v1) share the observation window; pruned even while
+    // EVENTS_ENABLED=false, so rows from an earlier enabled period still age out.
+    pruneEventsBefore: (cutoff, limit) => db.events.pruneBefore(cutoff, limit),
     logger,
     batch: config.CACHE_PRUNE_BATCH,
     retentionDays: config.OBSERVATION_RETENTION_DAYS,
