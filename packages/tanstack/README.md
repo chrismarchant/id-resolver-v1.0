@@ -122,10 +122,15 @@ and served in the reporting feed. Unless you pass your own `pageKeyMapper`, `def
 
 | Segment | Becomes |
 | --- | --- |
-| e-mail address (also percent-encoded `%40`) | `:email` |
+| any segment over 128 characters (not classified, which bounds the work per request) | `:token` |
+| e-mail address (also percent-encoded `%40`, and several addresses in one segment) | `:email` |
 | UUID | `:uuid` |
 | digit run of 4 or more (a plain year such as `2026` is kept) | `:n`, in place (`order-12345` becomes `order-:n`) |
 | hex/base64url token of 16+ characters that is not a readable slug, or a 12+ character run mixing letters and digits | `:token` |
+
+The mapper runs on the response path, so its cost is bounded: every check is linear in the segment length, and
+mapping stops once the output passes the 256-character `page_key` limit. The tests require a 16 KB adversarial path to
+map in under 20 ms (it takes well under 1 ms on a development machine).
 
 Readable slugs (`pricing`, `case-studies`, `2026-11-03-product-update`) are kept. This is a heuristic, not a guarantee: to
 control exactly what is sent, supply your own mapper. It replaces the default entirely:

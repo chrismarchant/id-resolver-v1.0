@@ -237,3 +237,71 @@ describe("defaultPageKeyMapper (conservative page_key default)", () => {
     expect(JSON.stringify(out)).not.toContain("9f86d081884c7d659a2feaa0c55ad015");
   });
 });
+
+describe("page_key mapping cost is bounded (CHR-66 N6)", () => {
+  // The reviewer's adversarial shapes (review probe f7/redos.mts). The earlier
+  // e-mail regex backtracked quadratically: ~313 ms of CPU for a 16 KB path,
+  // spent before the middleware returns the response.
+  const shapes: Record<string, (n: number) => string> = {
+    "x@ + dots + @": (n) => "/x@" + ".".repeat(n) + "@",
+    "x@ + a. pairs + @": (n) => "/x@" + "a.".repeat(n / 2) + "@",
+    "many @": (n) => "/" + "a@".repeat(n / 2),
+    digits: (n) => "/" + "1".repeat(n),
+    "slug parts": (n) => "/" + "ab-".repeat(n / 3),
+    // The same shapes in segments of at most 128 characters, so every segment is classified.
+    "128-char x@ + dots + @ segments": (n) => ("/x@" + ".".repeat(124) + "@").repeat(Math.ceil(n / 128)),
+    "128-char a@a@ segments": (n) => ("/" + "a@".repeat(64)).repeat(Math.ceil(n / 129)),
+    "short digit segments": (n) => "/12345".repeat(Math.ceil(n / 6)),
+  };
+
+  function bestOf3Ms(fn: () => void): number {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t0 = performance.now();
+      fn();
+      best = Math.min(best, performance.now() - t0);
+    }
+    return best;
+  }
+
+  it.each(Object.keys(shapes))("a 16 KB %s path maps in under 20 ms", (name) => {
+    const path = new URL("https://s.example" + shapes[name]!(16_000)).pathname;
+    expect(path.length).toBeGreaterThanOrEqual(15_900);
+    const viaDefault = bestOf3Ms(() => normalisePageKey(path, defaultPageKeyMapper));
+    const viaConfig = bestOf3Ms(() => normalisePageKey(path, resolveConfig(baseOptions()).pageKeyMapper));
+    const viaBuild = bestOf3Ms(() => buildEntrance(reqWithIp(path), baseOptions()));
+    expect(viaDefault).toBeLessThan(20);
+    expect(viaConfig).toBeLessThan(20);
+    expect(viaBuild).toBeLessThan(20);
+    const k = normalisePageKey(path, defaultPageKeyMapper);
+    expect(k.length).toBeLessThanOrEqual(256);
+    expect(/[?#\s\u0000-\u001f\u007f]/.test(k)).toBe(false);
+  });
+
+  it("a segment over 128 characters becomes :token without classification; 128 is still classified", () => {
+    const slug128 = Array.from({ length: 31 }, () => "abc").join("-") + "-abcd"; // a readable slug
+    expect(slug128.length).toBe(128);
+    expect(normalisePageKey(`/blog/${slug128}`, defaultPageKeyMapper)).toBe(`/blog/${slug128}`);
+    expect(normalisePageKey(`/blog/${slug128}x`, defaultPageKeyMapper)).toBe("/blog/:token");
+    expect(normalisePageKey(`/u/${"a".repeat(120)}%40example.com`, defaultPageKeyMapper)).toBe("/u/:token");
+  });
+
+  it("the linear e-mail check keeps the earlier matches and also catches two addresses in one segment", () => {
+    const rows: Array<[string, string]> = [
+      ["/unsubscribe/person@example.com", "/unsubscribe/:email"],
+      ["/unsubscribe/person%40example.com", "/unsubscribe/:email"],
+      ["/u/first.last+tag@example.org/prefs", "/u/:email/prefs"],
+      ["/u/person@mail.example.test", "/u/:email"],
+      ["/u/person@example.com.", "/u/:email"],
+      ["/u/person@example..com", "/u/:email"],
+      ["/share/jane@example.com,john@example.com", "/share/:email"],
+      ["/share/jane%40example.com%2Cjohn%40example.com", "/share/:email"],
+      // Not an address: no local part, no dot, or the dot at an edge of the domain.
+      ["/x/@example.com", "/x/@example.com"],
+      ["/x/a@localhost", "/x/a@localhost"],
+      ["/x/a@.com", "/x/a@.com"],
+      ["/x/a@com.", "/x/a@com."],
+    ];
+    for (const [input, expected] of rows) expect(normalisePageKey(input, defaultPageKeyMapper), input).toBe(expected);
+  });
+});

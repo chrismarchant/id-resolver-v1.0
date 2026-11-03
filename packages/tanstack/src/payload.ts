@@ -2,6 +2,12 @@ import { ACQUISITION_VALUES, ELIGIBILITY_RULE_SET_ID, ENTRANCE_CONTRACT, type Ac
 
 const PAGE_KEY_MAX = 256;
 const PAGE_KEY_VALID = /^\/[^?#\s\u0000-\u001f\u007f]*$/;
+/**
+ * A segment longer than this becomes `:token` without any classification
+ * work: no readable slug is that long, and it bounds the CPU spent per
+ * segment on the response path (CHR-66 N6).
+ */
+const SEGMENT_CLASSIFY_MAX = 128;
 
 /** Maps a normalised path to a route template (e.g. `/blog/my-post` to `/blog/:slug`). Return null to keep the path. */
 export type PageKeyMapper = (path: string) => string | null | undefined;
@@ -26,7 +32,6 @@ export function compileRouteTemplates(templates: readonly string[]): PageKeyMapp
   };
 }
 
-const EMAIL_SEGMENT = /^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/;
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TOKEN_CHARSET = /^[A-Za-z0-9_-]+$/;
 /** A part of a hyphenated slug: a lower-case word, a short number (year, day) or a short mixed token such as `v2` or `2fa`. */
@@ -41,6 +46,26 @@ function decodeForClassification(segment: string): string {
   }
 }
 
+/**
+ * True when some "@" has a non-empty part before it and, up to the next "@"
+ * (or the end), a domain-like part with a dot that is neither its first nor
+ * its last character: `person@example.com`, `first.last+tag@example.org`, and
+ * also two addresses in one segment (`a@example.com,b@example.com`).
+ * Plain string scanning, linear in the segment length. It replaces a regex
+ * (`/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/`) that backtracked quadratically on
+ * inputs such as `x@....@` (CHR-66 N6).
+ */
+function isEmailLike(segment: string): boolean {
+  if (!segment.includes("@")) return false;
+  const parts = segment.split("@");
+  for (let i = 1; i < parts.length; i++) {
+    const local = parts[i - 1]!;
+    const domain = parts[i]!;
+    if (local.length > 0 && domain.length >= 3 && domain.slice(1, -1).includes(".")) return true;
+  }
+  return false;
+}
+
 function isTokenLike(segment: string): boolean {
   // Long random-looking value: hex, base64url or similar, but not a readable slug.
   if (segment.length >= 16 && TOKEN_CHARSET.test(segment)) {
@@ -52,8 +77,9 @@ function isTokenLike(segment: string): boolean {
 }
 
 function mapSegment(segment: string): string {
+  if (segment.length > SEGMENT_CLASSIFY_MAX) return ":token";
   const decoded = decodeForClassification(segment);
-  if (EMAIL_SEGMENT.test(decoded)) return ":email";
+  if (isEmailLike(decoded)) return ":email";
   if (UUID_SEGMENT.test(decoded)) return ":uuid";
   if (isTokenLike(decoded)) return ":token";
   // Digit runs of 4+ are identifiers (order or account numbers); a plain year is kept.
@@ -69,9 +95,22 @@ function mapSegment(segment: string): string {
  * tokens and 12+ character letter-and-digit runs `:token`. Readable slugs
  * (`pricing`, `case-studies`) are kept. It is a heuristic: a site that knows its
  * routes should use `compileRouteTemplates` instead.
+ *
+ * The work is bounded (CHR-66 N6): a segment over 128 characters becomes
+ * `:token` without being classified, and mapping stops at the first segment
+ * that takes the output past 256 characters, the `page_key` limit (the
+ * caller cuts the output back to a segment boundary within 256).
  */
 export const defaultPageKeyMapper: PageKeyMapper = (path) => {
-  const out = "/" + path.split("/").filter((s) => s !== "").map(mapSegment).join("/");
+  let out = "";
+  let start = 0;
+  while (start <= path.length && out.length <= PAGE_KEY_MAX) {
+    let end = path.indexOf("/", start);
+    if (end === -1) end = path.length;
+    if (end > start) out += "/" + mapSegment(path.slice(start, end));
+    start = end + 1;
+  }
+  if (out === "") out = "/";
   return out === path ? null : out;
 };
 
