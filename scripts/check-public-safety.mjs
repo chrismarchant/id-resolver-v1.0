@@ -415,6 +415,63 @@ function isAllowed(allow, commit, path, rule, value) {
 }
 
 /**
+ * Undoes git's C-style quoting of a path. git quotes a path that contains `"`,
+ * `\`, a tab, a newline or another control character (also with
+ * core.quotePath=false): `"we\"ird/.env"`, `"tab\tdir/server.key"`, octal
+ * `\303\251` for bytes. An unquoted input is returned unchanged.
+ */
+export function unquoteGitPath(text) {
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return text;
+  const chars = [...text.slice(1, -1)];
+  const bytes = [];
+  const ESC = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] !== "\\") {
+      bytes.push(...Buffer.from(chars[i], "utf8"));
+      continue;
+    }
+    const next = chars[++i] ?? "";
+    if (next in ESC) bytes.push(ESC[next]);
+    else if (/^[0-3]$/.test(next) && /^[0-7]{2}$/.test((chars[i + 1] ?? "") + (chars[i + 2] ?? ""))) {
+      bytes.push(parseInt(next + chars[i + 1] + chars[i + 2], 8));
+      i += 2;
+    } else bytes.push(...Buffer.from(`\\${next}`, "utf8"));
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/**
+ * Every path each commit adds or changes, read NUL-safely (`--raw -z` never
+ * quotes a path), with the blob id of the commit's (or merge's) result.
+ * Returns Map(commit -> Array<{ path, blob, added }>); `added` means new
+ * relative to every parent. Deleted paths are left out.
+ */
+function collectHistoryPaths() {
+  const out = git(["log", "--all", "--cc", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-color", "--format=commit %H"], { maxBuffer: 1024 * 1024 * 1024 });
+  const byCommit = new Map();
+  let entries = null;
+  let meta = null;
+  for (const token of out.toString("utf8").split("\0")) {
+    if (meta !== null) {
+      // The token after a raw meta field is the path, verbatim (it may even start with a newline).
+      const n = /^:+/.exec(meta)[0].length;
+      const fields = meta.slice(n).split(" ");
+      const blob = fields[2 * n + 1];
+      const status = fields[2 * n + 2] ?? "";
+      if (entries && blob && !/^0+$/.test(blob)) entries.push({ path: token, blob, added: /^A+$/.test(status) });
+      meta = null;
+      continue;
+    }
+    const t = token.replace(/^\n+/, "");
+    if (/^commit [0-9a-f]{40}$/.test(t)) {
+      entries = [];
+      byCommit.set(t.slice(7), entries);
+    } else if (t.startsWith(":")) meta = t;
+  }
+  return byCommit;
+}
+
+/**
  * Parses one `git log -p --raw --cc` stream. A file's header runs from its
  * `diff --git`/`diff --cc` line to its first `@@` line; only there are
  * `+++ `, `Binary files` and similar lines headers. In the hunk body every
@@ -422,15 +479,16 @@ function isAllowed(allow, commit, path, rule, value) {
  * starts with `++ ` (shown as `+++ ...`) is scanned as content. For a merge,
  * `--cc` shows only what the merge itself introduced: a line is scanned when
  * it is added relative to EVERY parent (lines taken from one parent were
- * scanned in the commit that added them there).
+ * scanned in the commit that added them there). Quoted paths in headers are
+ * un-quoted; blob ids come from the NUL-safe path pass.
  */
-function scanPatchLog(log, ctx) {
+function scanPatchLog(log, ctx, historyPaths) {
   let commit = "";
   let state = "none"; // "none" (commit header / raw lines) | "header" | "body"
   let parents = 1;
   let path = null;
   let skipPath = false;
-  const resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
+  let resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
   const setPath = (p) => {
     path = p;
     skipPath = p !== null && SKIP_FILES.has(p);
@@ -453,41 +511,33 @@ function scanPatchLog(log, ctx) {
       ctx.commits++;
       state = "none";
       setPath(null);
-      resultBlob.clear();
+      resultBlob = new Map((historyPaths.get(commit) ?? []).map((e) => [e.path, e.blob]));
       continue;
     }
     if (line.startsWith("diff --git ") || line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
       state = "header";
-      setPath(line.startsWith("diff --git ") ? null : line.slice(line.indexOf(" ", 5) + 1));
+      setPath(line.startsWith("diff --git ") ? null : unquoteGitPath(line.slice(line.indexOf(" ", 5) + 1)));
       continue;
     }
-    if (state === "none") {
-      // Raw lines: ":<modes> <blobs> <status>\t<path>", one colon per parent. Every path the
-      // commit adds or changes is checked against the forbidden-file rules here, so an empty or
-      // binary .env or key file (which has no "+++" line) is found too.
-      const m = /^(:+)([^\t]+)\t(.+)$/.exec(line);
-      if (m) {
-        const n = m[1].length;
-        const blobs = m[2].split(" ").slice(n + 1, 2 * n + 2);
-        const result = blobs[n];
-        if (result && !/^0+$/.test(result)) {
-          resultBlob.set(m[3], result);
-          for (const f of FORBIDDEN_FILES) if (f.re.test(m[3])) ctx.emit(commit, m[3], { id: "forbidden-file", why: f.why }, m[3], false);
-        }
-      }
-      continue;
-    }
+    if (state === "none") continue; // the commit's header lines; paths come from the NUL-safe pass
     if (state === "header") {
       if (line.startsWith("@@")) {
         state = "body";
         parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
       } else if (line.startsWith("+++ ")) {
-        const p = line.slice(4);
+        const p = unquoteGitPath(line.slice(4));
         setPath(p === "/dev/null" ? null : p.replace(/^b\//, ""));
-      } else if (line.startsWith("Binary files ")) {
-        const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
-        const p = m ? m[2] : path; // combined diffs print "Binary files differ"; the path is from "diff --cc"
-        if (p) scanBlob(p);
+      } else if (line === "Binary files differ") {
+        if (path !== null) scanBlob(path); // combined diff: the path is from "diff --cc"
+      } else if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
+        // "Binary files <a> and <b> differ", each side a/P, b/P (maybe quoted) or /dev/null.
+        // With --no-renames both sides name the same path, so the b side is the second half.
+        const inner = line.slice("Binary files ".length, -" differ".length);
+        let b = null;
+        if (inner.startsWith("/dev/null and ")) b = inner.slice("/dev/null and ".length);
+        else if (!inner.endsWith(" and /dev/null")) b = inner.slice((inner.length - " and ".length) / 2 + " and ".length);
+        const p = b === null ? null : unquoteGitPath(b);
+        if (p !== null && p.startsWith("b/")) scanBlob(p.slice(2));
       }
       continue;
     }
@@ -578,12 +628,18 @@ function checkHistory(allow) {
       scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
     },
   };
+  // Every path each commit adds or changes, read NUL-safely: an empty or binary .env or key file
+  // (no "+++" line) and a path git would C-quote (`we"ird/.env`, a tab) are both checked.
+  const historyPaths = collectHistoryPaths();
+  for (const [commit, entries] of historyPaths) {
+    for (const e of entries) for (const f of FORBIDDEN_FILES) if (f.re.test(e.path)) ctx.emit(commit, e.path, { id: "forbidden-file", why: f.why }, e.path, false);
+  }
   // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
   const log = git(
-    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
+    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
     { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
   );
-  scanPatchLog(log, ctx);
+  scanPatchLog(log, ctx, historyPaths);
   scanCommitMetadata(ctx);
   scanTags(ctx);
   // Unused entries are named by their line in the allow-list (whose hashes are public there anyway), not reprinted.
