@@ -49,6 +49,37 @@ export async function freshPublicSchema(pool: pg.Pool): Promise<void> {
 }
 
 /**
+ * A fresh public schema with the projection applied by `owner`, a role that is
+ * neither superuser nor BYPASSRLS (as `postgres` is on hosted Supabase), with
+ * Supabase's default privileges for the objects it creates. Requires
+ * auth.jwt() to exist (ensureProjection creates it). Undo with dropOwner().
+ */
+export async function installAsOwner(pool: pg.Pool, owner: string, sqlPath: string = SQL_PATH): Promise<void> {
+  await freshPublicSchema(pool);
+  await pool.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${owner}') then create role ${owner} nologin nosuperuser nobypassrls; end if; end $$`);
+  await pool.query(`grant usage, create on schema public to ${owner}`);
+  await pool.query(`grant usage on schema auth to ${owner}`);
+  for (const kind of ["tables", "sequences", "functions"]) {
+    await pool.query(`alter default privileges for role ${owner} in schema public grant all on ${kind} to anon, authenticated, service_role`);
+  }
+  const c = await pool.connect();
+  try {
+    await c.query(`set role ${owner}`);
+    await c.query(readFileSync(sqlPath, "utf8"));
+  } finally {
+    await c.query("reset role").catch(() => undefined);
+    c.release();
+  }
+}
+
+/** Restores the default projection (owned by the test role) and removes `owner`. */
+export async function dropOwner(pool: pg.Pool, owner: string): Promise<void> {
+  await resetDatabase(pool);
+  await pool.query(`drop owned by ${owner}`);
+  await pool.query(`drop role ${owner}`);
+}
+
+/**
  * Non-destructive: the Supabase roles and auth.jwt() (if missing), and the
  * SQL template applied (it is idempotent) to whatever public schema exists.
  * Used directly by suites that share the database with other tables.

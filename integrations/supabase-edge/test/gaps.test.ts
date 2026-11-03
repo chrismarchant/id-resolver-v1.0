@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, functionGrants, relationGrants } from "./helpers/acl.ts";
-import { INSTALLATION, SQL_PATH, asRole, freshPublicSchema, gapRows, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
+import { INSTALLATION, asRole, dropOwner, gapRows, installAsOwner, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
 
@@ -442,27 +442,10 @@ describe("row level security", () => {
 describe("R2-8 with an ordinary owner: the script applied by a role that is neither superuser nor BYPASSRLS (on Supabase, postgres is not a superuser)", () => {
   const OWNER = "idr_test_owner";
   beforeAll(async () => {
-    await freshPublicSchema(pool);
-    await pool.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${OWNER}') then create role ${OWNER} nologin nosuperuser nobypassrls; end if; end $$`);
-    await pool.query(`grant usage, create on schema public to ${OWNER}`);
-    await pool.query(`grant usage on schema auth to ${OWNER}`);
-    // Supabase's default privileges, for objects this role creates.
-    for (const kind of ["tables", "sequences", "functions"]) {
-      await pool.query(`alter default privileges for role ${OWNER} in schema public grant all on ${kind} to anon, authenticated, service_role`);
-    }
-    const c = await pool.connect();
-    try {
-      await c.query(`set role ${OWNER}`);
-      await c.query(readFileSync(SQL_PATH, "utf8"));
-    } finally {
-      await c.query("reset role").catch(() => undefined);
-      c.release();
-    }
+    await installAsOwner(pool, OWNER);
   });
   afterAll(async () => {
-    await resetDatabase(pool);
-    await pool.query(`drop owned by ${OWNER}`);
-    await pool.query(`drop role ${OWNER}`);
+    await dropOwner(pool, OWNER);
   });
 
   it("everything is owned by that role, which has no superuser or BYPASSRLS attribute; the grants are exactly as with any owner", async () => {

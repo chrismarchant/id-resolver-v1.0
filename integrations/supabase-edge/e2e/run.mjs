@@ -31,7 +31,7 @@ const DAY_MS = 86_400_000;
 const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "observations", "pages", "reconcile", "status", "tombstones"];
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 /** idr_schema_version() of sql/0001_idr_projection.sql (PROJECTION_SCHEMA_VERSION in src/core/types.ts). */
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 /** No role but the owner holds EXECUTE: the trigger function (CHR-66 G4-L4) and the operator's resync (G5R1-L3). */
 const OWNER_ONLY_FUNCTIONS = ["idr_sync_gaps_guard", "idr_begin_resync"];
 /** Expected grantees of an idr_* function's ACL. */
@@ -275,7 +275,7 @@ async function upgradeChecks() {
   const acl = (await stack.q("select proname, proacl::text[] as acl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'")).rows;
   const bad = acl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify(expectedFnGrantees(x.proname, owner)));
   check(
-    `re-running the current SQL upgrades in place: row and cursor kept, schema_version ${SCHEMA_VERSION}, old signature dropped, ACLs exactly owner + service_role (owner only on the trigger function)`,
+    `re-running the current SQL upgrades in place: row and cursor kept, schema_version ${SCHEMA_VERSION}, old signature dropped, ACLs exactly owner + service_role (owner only on the trigger function and idr_begin_resync)`,
     sv.json?.schema_version === SCHEMA_VERSION && sv.json.cursor === "legacy-c1" && (await obsCount()) === 1 && gone && acl.length === IDR_FUNCTIONS.length + 1 && bad.length === 0,
     bad.map((x) => x.proname).join(",") || `${acl.length} functions`,
   );
@@ -731,7 +731,11 @@ async function s7Rls() {
   const owner = (await stack.q("select current_user as u")).rows[0].u;
   const proacl = (await stack.q("select proname, proacl::text[] as acl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'")).rows;
   const badAcl = proacl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify(expectedFnGrantees(x.proname, owner)));
-  check("every idr_* function's ACL holds exactly its owner and service_role, the trigger function its owner only (as rls.test.ts claims)", proacl.length === IDR_FUNCTIONS.length + 1 && badAcl.length === 0, badAcl.map((x) => `${x.proname}: ${(x.acl ?? []).map((a) => a.split("=")[0]).join(",")}`).join("; ") || `${proacl.length} functions`);
+  // CHR-66 G5R1-M1: the temporary schema is searched last in every function, so a caller's pg_temp type cannot be captured.
+  const cfg = (await stack.q("select proname, proconfig::text as c from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'")).rows;
+  const badCfg = cfg.filter((x) => x.c !== '{"search_path=pg_catalog, pg_temp"}');
+  check("every idr_* function has search_path = pg_catalog, pg_temp (catalog)", cfg.length === IDR_FUNCTIONS.length + 1 && badCfg.length === 0, badCfg.map((x) => `${x.proname}: ${x.c}`).join("; ") || `${cfg.length} functions`);
+  check("every idr_* function's ACL holds exactly its owner and service_role, the trigger function and idr_begin_resync their owner only (as rls.test.ts claims)", proacl.length === IDR_FUNCTIONS.length + 1 && badAcl.length === 0, badAcl.map((x) => `${x.proname}: ${(x.acl ?? []).map((a) => a.split("=")[0]).join(",")}`).join("; ") || `${proacl.length} functions`);
   const tp = (
     await stack.q(
       `select t, r, p, has_table_privilege(r, 'public.' || t, p) as x

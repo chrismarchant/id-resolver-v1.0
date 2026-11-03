@@ -142,7 +142,7 @@ describe("row level security", () => {
     }
   });
 
-  it("R2-8: the six writing functions are SECURITY DEFINER, owned by the tables' owner; the readers and the trigger stay SECURITY INVOKER; all have an empty search_path", async () => {
+  it("R2-8: the six writing functions are SECURITY DEFINER, owned by the tables' owner; the readers and the trigger stay SECURITY INVOKER; all have search_path = pg_catalog, pg_temp (G5R1-M1)", async () => {
     const DEFINER = ["idr_apply_feed_page", "idr_begin_resync", "idr_record_sync_gap", "idr_record_sync_status", "idr_reset_cursor", "idr_resolve_sync_gaps"];
     const r = await pool.query<{ proname: string; prosecdef: boolean; proconfig: string[] | null; same_owner: boolean }>(
       `select p.proname, p.prosecdef, p.proconfig,
@@ -151,7 +151,7 @@ describe("row level security", () => {
     );
     expect(r.rows.filter((x) => x.prosecdef).map((x) => x.proname).sort()).toEqual(DEFINER);
     for (const row of r.rows) {
-      expect(row.proconfig, row.proname).toEqual(['search_path=""']);
+      expect(row.proconfig, row.proname).toEqual(["search_path=pg_catalog, pg_temp"]);
       expect(row.same_owner, row.proname).toBe(true);
     }
     // Every table, the view and the functions have one owner (the role that applied the script).
