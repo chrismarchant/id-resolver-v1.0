@@ -209,7 +209,12 @@ export function createRunner(opts: RunnerOptions): Runner {
     }
     const result: Promise<ResolutionOutcome> = execution.then(
       (value) => {
-        const o = sanitiseOutcome(value);
+        let o: ResolutionOutcome | null = null;
+        try {
+          o = sanitiseOutcome(value);
+        } catch {
+          // a hostile shape (e.g. a throwing getter) is just another invalid outcome
+        }
         if (o !== null) return o;
         logger.error("job_error", { job_id: jobId, category: "invalid_outcome" });
         return failure("internal_error");

@@ -107,7 +107,7 @@ async function main(): Promise<void> {
     const drain = await runner.shutdown(Math.max(0, until - Date.now()));
     await db.close();
     await watchdog.stop();
-    logger.info("server_stopped", { active_jobs: drain.activeJobs, ready: drain.drained });
+    logger.info("server_stopped", { outcome: drain.drained ? "drained" : "grace_exceeded", active_jobs: drain.activeJobs });
     await logger.flush();
     process.exit(0);
   };

@@ -216,7 +216,7 @@ describe("black-box service process", () => {
     expect(output).toContain("server_stopped");
     const stopped = output.split("\n").find((l) => l.includes('"server_stopped"'))!;
     expect(stopped).toContain('"active_jobs":0');
-    expect(stopped).toContain('"ready":true');
+    expect(stopped).toContain('"outcome":"drained"');
     if (r) expect([200, 503]).toContain(r.status);
     await expect(fetch(`${BASE}/healthz`)).rejects.toThrow();
   });

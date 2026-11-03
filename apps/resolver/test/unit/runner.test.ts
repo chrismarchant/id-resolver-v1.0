@@ -129,6 +129,7 @@ describe("runner: results and crash containment", () => {
     ["free-text reason", { status: "no_match", source: "provider", reason: "203.0.113.10 leaked" }],
     ["activity on a non-qualified outcome", { status: "no_match", source: "cache", activity: QUALIFIED.activity }],
     ["not an object", "qualified"],
+    ["a throwing getter", Object.defineProperty({ source: "cache" }, "status", { get: () => { throw new Error("203.0.113.1"); }, enumerable: true })],
   ])("%s -> unavailable/internal_error", async (_label, value) => {
     const { runner, logger } = setup(async () => value as unknown as ResolutionOutcome);
     const o = await runner.run({ ip: IP, deadlineAtMs: deadline(5_000), observationRef: REF, context: CONTEXT });
