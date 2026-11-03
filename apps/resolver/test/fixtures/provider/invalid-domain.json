@@ -1,0 +1,16 @@
+{
+  "description": "Synthetic: provider domain that is not a valid hostname (treated as no domain).",
+  "ip": "203.0.113.14",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "-bad-.example_",
+      "ipOrganization": "Example Ltd",
+      "ipIsp": "Example Transit Networks",
+      "ipRange": "203.0.113.0/24",
+      "ipUsageType": "COM"
+    },
+    "meta": { "credits_used": 100 }
+  }
+}

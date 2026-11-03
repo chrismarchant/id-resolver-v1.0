@@ -1,0 +1,17 @@
+{
+  "description": "Synthetic: provider found no domain (no charge).",
+  "ip": "203.0.113.13",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipIsp": "Example Transit Networks",
+      "ipRange": "203.0.113.0/24",
+      "ipUsageType": "ISP",
+      "city": "Example City",
+      "latitude": 12.3456,
+      "longitude": 65.4321
+    },
+    "meta": { "credits_used": 0 }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "description": "Synthetic: IPv6 documentation address (RFC 3849) with a qualifying usage type.",
+  "ip": "2001:db8::10",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "example.edu",
+      "ipOrganization": "Example University",
+      "ipIsp": "Example Research Network",
+      "ipRange": "2001:db8::/48",
+      "ipUsageType": "EDU",
+      "latitude": -1.25,
+      "longitude": 3.75
+    },
+    "meta": { "credits_used": 100 }
+  }
+}
