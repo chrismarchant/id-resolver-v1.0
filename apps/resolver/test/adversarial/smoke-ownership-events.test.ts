@@ -23,9 +23,20 @@
  *   - `--mode rollback-check` passes against a target without the route,
  *     writes nothing, and fails against a target that has it.
  *
- * This file deliberately imports nothing that Gate 5 added (literal names and
- * reasons only), so it also runs against the Gate 4 smoke, where the
- * ownership and summary tests fail: the before-the-fix evidence.
+ * Production database posture (Gate 5): the service and every smoke process
+ * get the production database settings: verified TLS (DATABASE_SSL=
+ * verify-pinned) through a runtime-generated TLS terminator in front of the
+ * test database, and the separate runtime role. The service logs in as the
+ * runtime role; the smoke's ops connection (kill-switch controls, read-only
+ * events probe) uses DATABASE_URL, the owner, through the same pinned TLS,
+ * exactly as an in-service run with the service's own environment does.
+ *
+ * Apart from those test helpers, this file imports nothing that Gate 5 added
+ * (literal names and reasons only). It no longer runs unchanged against the
+ * Gate 4 smoke: a Gate 4 build does not know DATABASE_SSL=verify-pinned and
+ * refuses to start. The before-the-fix evidence for the ownership and summary
+ * tests was recorded by Cell C against the Gate 4 smoke with the plaintext
+ * test database.
  * Tokens and the HMAC secret are random per run; every smoke output is
  * scanned for them, the database URL, the target URL, the addresses, the
  * event page_key and every stored event_id.
@@ -39,8 +50,14 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../src/db/index.js";
 import { KILL_SWITCH_PROBE_PREFIX } from "../../src/ops/smoke-mode.js";
 import { createTestDb, getTestDatabaseUrl, resetTestDb } from "../helpers/db.js";
+import { startProductionDb } from "../helpers/prod-db.js";
+import { TEST_RUNTIME_PASSWORD, TEST_RUNTIME_ROLE } from "../helpers/runtime-role.js";
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
+// Production posture for the service and the smoke runner: pinned TLS through the test terminator, runtime role provisioned.
+const prodDb = await startProductionDb();
+await prodDb.provision();
+afterAll(() => prodDb.close());
 const INSTALLATION = "inst-test";
 const WEBSITE_TOKEN = randomBytes(24).toString("hex");
 const REPORTING_TOKEN = randomBytes(24).toString("hex");
@@ -105,8 +122,8 @@ function serviceEnv(port: number, opts: { docs: "true" | "false"; events: "true"
     RESOLVER_AUTH_TOKEN: WEBSITE_TOKEN,
     REPORTING_AUTH_TOKEN: REPORTING_TOKEN,
     IP_HMAC_SECRET: HMAC_SECRET,
-    DATABASE_URL: getTestDatabaseUrl(),
-    DATABASE_SSL: "disable",
+    // DATABASE_URL (owner, through the TLS terminator), DATABASE_SSL=verify-pinned, the pin, and the runtime role's login.
+    ...prodDb.env(),
     PROVIDER_MODE: "mock",
     ALLOW_MOCK_PROVIDER: "true",
     ALLOW_DOCUMENTATION_RANGES: opts.docs,
@@ -233,7 +250,7 @@ describe("smoke ownership and events phase against the real service: documentati
   /** Nothing secret, no configuration value, no address, page_key or event_id in anything the smoke writes. */
   async function expectSecretFree(r: SmokeRun, target: string): Promise<void> {
     const out = `${r.stdout}${r.stderr}`;
-    for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), target, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://", "/smoke/"]) {
+    for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), prodDb.url(), prodDb.cert.sha256, TEST_RUNTIME_PASSWORD, target, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://", "/smoke/"]) {
       expect(out.includes(needle), `smoke output leaked a value (${needle.length} chars)`).toBe(false);
     }
     for (const e of await runEvents(r)) expect(out.includes(e.event_id), "smoke output leaked an event_id").toBe(false);
@@ -284,6 +301,20 @@ describe("smoke ownership and events phase against the real service: documentati
     expect(await control()).toEqual([{ enrichment_enabled: true, reason: `${SMOKE_RESTORE_PREFIX} [run ${String(r.summary?.["run"])}]` }]);
     // The events phase changed no configuration: the service still has the route, consent still required.
     expect(service.output()).toContain('"events_enabled":true');
+    // Production database posture: the service runs as the least-privilege runtime role over pinned TLS ...
+    expect(service.output()).toContain('"tls_mode":"verify-pinned"');
+    expect(service.output()).toContain('"db_role":"runtime"');
+    expect(service.output()).toContain('"outcome":"least_privilege"');
+    // No database override is in effect (the only override of this development-like setup is the mock provider's).
+    expect(service.output()).not.toContain("ALLOW_UNVERIFIED_DATABASE_TLS");
+    expect(service.output()).not.toContain("ALLOW_OWNER_DATABASE_ROLE");
+    const sessions = await db.pool.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = $1", [TEST_RUNTIME_ROLE]);
+    expect(sessions.rows[0]!.n).toBeGreaterThan(0);
+    // ... which cannot write the kill switch: the engage and restore above were the smoke's owner connection.
+    const priv = await db.pool.query<{ w: boolean }>("SELECT has_table_privilege($1, 'deployment_controls', 'INSERT,UPDATE,DELETE') AS w", [TEST_RUNTIME_ROLE]);
+    expect(priv.rows[0]!.w).toBe(false);
+    // Every connection through the terminator was TLS (it answers nothing else).
+    expect(prodDb.terminator.stats.handshakes).toBeGreaterThan(0);
     await expectSecretFree(r, base);
   });
 
