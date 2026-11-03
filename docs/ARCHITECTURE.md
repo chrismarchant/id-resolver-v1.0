@@ -49,7 +49,7 @@ Browser ─document request─▶ CDN ─▶ TanStack Start site (Lovable; Nitro
 |---|---|
 | D1 | Replace fork-per-request child processes with a single-process runner, preserving deadline, concurrency, crash-containment and IP-hygiene controls, with independent review *(implemented, reviewed: CHR-70, CHR-66)* |
 | D2 | Identification only: non-blocking `POST /v1/entrances`; status/ack response with no company data *(implemented, reviewed)* |
-| D3 | Observation retention in the resolver is a **configurable, bounded synchronisation buffer**. There is no fixed long default without a documented operational and privacy justification. The client Insights environment owns commercial-history retention. *(Operational justification: [RETENTION.md](RETENTION.md); not legal advice, pending owner/legal confirmation, CHR-59)* |
+| D3 | Observation retention in the resolver is a **configurable, bounded synchronisation buffer**. There is no fixed long default without a documented operational and privacy justification. The client Insights environment owns commercial-history retention. *(Operational justification: [RETENTION.md](RETENTION.md); not legal advice, pending owner/legal confirmation, CHR-59. Fields and open legal questions: [LEGAL_REVIEW_REQUIREMENTS.md](LEGAL_REVIEW_REQUIREMENTS.md); no legal review has been performed)* |
 | D4 | **No browser-to-company matching in V1**, not even flagged-off code. The optional collector records approved, consent-gated semantic events only. |
 | D5 | Server adapter and collector are published to public npm under an owner-controlled scope |
 | D6 | V0.1 migrations are squashed into one V1 baseline, with a schema-equivalence test *(planned: after the feed review)* |
