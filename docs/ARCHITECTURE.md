@@ -1,9 +1,10 @@
 # ID Resolver V1 — architecture
 
-Status: Gate 2/3 (development). Owner-approved reduction of the V0.1 resolver
-(see [PROVENANCE.md](PROVENANCE.md)). Items marked *(implemented, pending
-review)* are built and tested but await the independent security review
-(CHR-66); items marked *(planned)* are not implemented yet.
+Status: Gate 3 (development). Owner-approved reduction of the V0.1 resolver
+(see [PROVENANCE.md](PROVENANCE.md)). Items marked *(implemented, reviewed)*
+are built, tested and passed the independent security review (CHR-66, four
+rounds, 3 Nov 2026: no critical, high or medium finding open); items marked
+*(planned)* are not implemented yet.
 
 ## Deployment model
 
@@ -46,8 +47,8 @@ Browser ─document request─▶ CDN ─▶ TanStack Start site (Lovable; Nitro
 
 | | Decision |
 |---|---|
-| D1 | Replace fork-per-request child processes with a single-process runner, preserving deadline, concurrency, crash-containment and IP-hygiene controls, with independent review *(implemented, pending review: CHR-70)* |
-| D2 | Identification only: non-blocking `POST /v1/entrances`; status/ack response with no company data *(implemented, pending review)* |
+| D1 | Replace fork-per-request child processes with a single-process runner, preserving deadline, concurrency, crash-containment and IP-hygiene controls, with independent review *(implemented, reviewed: CHR-70, CHR-66)* |
+| D2 | Identification only: non-blocking `POST /v1/entrances`; status/ack response with no company data *(implemented, reviewed)* |
 | D3 | Observation retention in the resolver is a **configurable, bounded synchronisation buffer**. There is no fixed long default without a documented operational and privacy justification. The client Insights environment owns commercial-history retention. |
 | D4 | **No browser-to-company matching in V1**, not even flagged-off code. The optional collector records approved, consent-gated semantic events only. |
 | D5 | Server adapter and collector are published to public npm under an owner-controlled scope |
@@ -58,7 +59,7 @@ Browser ─document request─▶ CDN ─▶ TanStack Start site (Lovable; Nitro
 
 ## Interfaces
 
-**Website → resolver** *(implemented, pending review)*: `POST /v1/entrances`
+**Website → resolver** *(implemented, reviewed)*: `POST /v1/entrances`
 `{contract:"entrance.v1", website_id, ip, entrance_id, occurred_at, page_key, acquisition, eligibility}`
 → `{version, status, source, recorded}`.
 
@@ -69,7 +70,7 @@ Browser ─document request─▶ CDN ─▶ TanStack Start site (Lovable; Nitro
 
 **Insights → resolver** (read-only, separate credential):
 * existing: `GET /v1/reporting/companies`, `/companies/:id`, `/summary`
-* *(implemented, pending review: CHR-71)*: `GET /v1/reporting/observations?after=<cursor>`, a scope-wide feed with commit-safe ordering and company-erasure tombstones. Its proof suite (`apps/resolver/test/integration/feed-*.test.ts`) covers out-of-order commits, retries, duplicate delivery, pagination, tombstones, interruption recovery, long-running transactions, randomised concurrency and retention expiry.
+* *(implemented, reviewed: CHR-71, CHR-66)*: `GET /v1/reporting/observations?after=<cursor>`, a scope-wide feed with commit-safe ordering and company-erasure tombstones. Its proof suite (`apps/resolver/test/integration/feed-*.test.ts`) covers out-of-order commits, retries, duplicate delivery, pagination, tombstones, interruption recovery, long-running transactions, randomised concurrency and retention expiry.
 
 **Browser collector → website** *(Gate 4)*: first-party route on the website;
 consent-gated closed event vocabulary; no IP forwarded and no company

@@ -1,8 +1,8 @@
 # Contract `reporting-feed.v1` — resolver → client Insights (pull)
 
 Status: **frozen interface for Gate 3; implemented with a proof suite
-(CHR-71, `apps/resolver/test/integration/feed-*.test.ts`), pending independent
-review (CHR-66)**. The sections after "Reconciliation" are implementation
+(CHR-71, `apps/resolver/test/integration/feed-*.test.ts`); independently
+reviewed (CHR-66, 3 Nov 2026)**. The sections after "Reconciliation" are implementation
 clarifications; they do not change the frozen interface above them, except
 where an **owner clarification** says so explicitly (guarantees 3 and 6:
 "Owner clarification (3 Nov 2026, CHR-66 N1) of guarantee 3" below).
