@@ -2,7 +2,7 @@
  * `npm run ops:prune` deletes expired cache rows in bounded batches until none
  * remain, then (when OBSERVATION_RETENTION_DAYS > 0) observations older than
  * the retention window. Companies and per-company scope stats are never
- * deleted here; see docs/DATABASE.md "Retention and deletion".
+ * deleted here; see docs/ARCHITECTURE.md (retention is a bounded sync buffer).
  */
 import { pathToFileURL } from "node:url";
 import { createDb } from "../db/index.js";

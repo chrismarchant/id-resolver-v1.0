@@ -63,7 +63,8 @@ export const ConfigSchema = z.object({
   BODY_LIMIT_BYTES: intInRange(128, 8_192, 1_024),
   SHUTDOWN_GRACE_MS: intInRange(500, 30_000, 8_000),
 
-  RUN_MIGRATIONS_ON_START: boolFromString(true),
+  /** V1: migrations run only via the deploy pre-step (railway.json preDeployCommand) or `npm run migrate`. */
+  RUN_MIGRATIONS_ON_START: boolFromString(false),
 
   // Enrichment controls
   ENRICHMENT_ENABLED: boolFromString(true),

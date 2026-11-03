@@ -65,7 +65,7 @@ export function canonicaliseIp(input: string, options: CanonicaliseOptions = {})
   // Reject whitespace, zone ids, ports, brackets and anything non-literal up front.
   if (!/^[0-9a-fA-F:.]+$/.test(input)) return { ok: false, reason: "invalid" };
   if (!ipaddr.isValid(input)) return { ok: false, reason: "invalid" };
-  // ipaddr.js accepts octal/hex/short IPv4 forms ("010.0.0.1" → 8.0.0.1). Require a
+  // ipaddr.js accepts octal/hex/short IPv4 forms ("010.0.0.1" → 8.0.0.1). Require a  (public-safety: allow-synthetic — parser example)
   // strict dotted quad for plain IPv4 and for IPv4 embedded in IPv6 (::ffff:a.b.c.d).
   if (input.includes(".")) {
     const quad = input.slice(input.lastIndexOf(":") + 1);

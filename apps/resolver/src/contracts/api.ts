@@ -1,5 +1,5 @@
 /**
- * Frozen V0.1 public API contract (see docs/API_CONTRACT.md).
+ * Public API contract inherited from V0.1 (V1 contract changes: docs/ARCHITECTURE.md).
  *
  * Nothing in this module may carry a raw IP, an IP fingerprint, a secret or a
  * raw provider payload. The website only ever sees the types below.

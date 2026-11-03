@@ -1,5 +1,5 @@
 #!/bin/sh
-# Container entrypoint for ID Resolver V0.1.
+# Container entrypoint for ID Resolver V1.
 # Refuses debugging settings that would expose memory or an inspector,
 # then replaces this shell with the CMD.
 set -eu
@@ -21,8 +21,8 @@ if [ "${NODE_DEBUG+set}" = "set" ]; then
   exit 1
 fi
 
-# Migrations are applied by the supervisor at startup (RUN_MIGRATIONS_ON_START,
-# default true, advisory-locked). Run `node dist/db/migrate.js` manually when
-# RUN_MIGRATIONS_ON_START=false.
+# V1: migrations are NOT applied at startup. They run as a separate deploy
+# pre-step (railway.json preDeployCommand: node dist/db/migrate.js), which is
+# advisory-locked and fails the deployment if a migration fails.
 
 exec "$@"
