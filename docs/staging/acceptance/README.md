@@ -27,8 +27,11 @@ They are not part of `npm run verify` or CI.
   reports the error's code, not its text, and a canary answer that is not JSON is reported by a fixed message.
 * **The header canary (G4-I8, T5).** The canary inspects every request header, every repeated copy included, and
   recognises the tester's IP in any spelling (case, compressed or expanded IPv6, with a port or brackets, IPv4
-  embedded in IPv6, also in hex). A match is a FAIL in every mode. With `--local-probe` a clean result is only INFO:
-  local workerd is not the edge, and no D4 claim is made from it.
+  embedded in IPv6, also in hex). It compares with the tester's IP when the script has set one, with each entrance
+  body's own `ip`, and with the visitor IPs of earlier entrances (in memory only), so the real browsers of phase
+  `browser` are covered too. A match is a FAIL in every mode, and so is a request the canary could not compare: it
+  is never a PASS. With `--local-probe` a clean, fully compared result is only INFO: local workerd is not the edge,
+  and no D4 claim is made from it.
 * **Enter secrets without echo**, for example `read -rs ACCEPT_CANARY_TOKEN && export ACCEPT_CANARY_TOKEN`; never on
   the command line and never in a file in the repository.
 * `--dry-run` validates the configuration and prints the plan without sending anything.
@@ -90,7 +93,8 @@ node supabase-hosted-check.mjs --confirm-target <PROJECT_REF> --checks auth,sync
 
 * `self-test.mjs`: 9 of 9 pass (Gate 5 cell D); 14 of 14 since cell E, including end-to-end runs in which a stand-in
   site leaks the tester's IPv4 or IPv6 address in many headers and spellings: G4-I8 FAILs with the header names,
-  and no output holds the IP.
+  and no output holds the IP. 18 of 18 after the review R2 fixes: a run with nothing to compare against cannot
+  PASS, and a header carrying an entrance body's own IP is caught without an expected IP.
 * `cf-site-check.mjs --local-probe --phase all` against the local workerd probe: 53 PASS, 0 FAIL, 1 SKIP (no
   ceiling route in the probe); `--phase down`: 2 PASS. Details and the finding G5-D-F1 in
   [../CLOUDFLARE_TEST_SITE.md](../CLOUDFLARE_TEST_SITE.md) section 7.

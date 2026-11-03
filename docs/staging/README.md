@@ -88,8 +88,10 @@ Every item below is an owner action. None of them may be done by a cell, and eac
   promised 405). Nothing is forwarded. A browser navigation to that path was reported as an entrance. Found by
   running `cf-site-check.mjs` against the local probe. **Status: remediated in the adapter (Gate 5 cell E), pending
   independent review.** The entrance middleware never reports the collector path (`collectorPath`, default
-  `/idr/e`), for every method and every spelling the router routes there, with no site configuration; the README
-  explains what a client sees for `GET`. `excludePaths: ["/idr/e"]` is no longer required. Phase `route` checks it on
+  `/idr/e`), for every method and for every spelling that TanStack Start's own path canonicalisation turns into it
+  (checked against the router code the probe pins, after review R2 found that `/idr/e%20` was missed: G5R2-L1), with
+  no site configuration; a router `basepath` or input rewrite is not covered (README). The README explains what a
+  client sees for `GET`. `excludePaths: ["/idr/e"]` is no longer required. Phase `route` checks it on
   the edge.
 * **G4-I8 strengthened**: "outside the site's zone" may not be sufficient for a non-Cloudflare resolver host
   (section 4 of the Cloudflare plan); the canary test decides. Gate 5 cell E added the code-side evidence (the

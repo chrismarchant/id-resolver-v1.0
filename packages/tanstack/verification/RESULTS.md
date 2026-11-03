@@ -227,6 +227,16 @@ middleware has no `collectorPath` option and does not exclude `/idr/e`, and its 
 | `GET /idr/ex` | `404` | none | none |
 | `GET /landing/<page>` (control) | `200 text/html` | yes | yes, still delivered |
 
+**Review R2 (G5R2-L1), fixed.** `GET /idr/e%20` (also `/idr/e%20%20`, `/IDR/E%20`, `/idr/%65%20`) is served
+`200 text/html` by the collector route's page: TanStack Start decodes `%20` and its second URL parse strips the
+trailing space. The first version of the exclusion missed it, and the sink received an entrance for each. The
+exclusion now repeats the router's canonicalisation (`src/collector-path.ts`, with file:line references into the
+pinned start-server-core 1.169.39 and router-core 1.171.34). The "real stack" test adds those spellings and a grid of
+180 spellings: for each, a `POST` shows whether the router really dispatches it to `createCollectorRoute` (its bare
+`403`), and a browser `GET` must not create an entrance. Result: 54 of 180 dispatched to the route, every one of them
+excluded, 1 entrance in total (the control page). Before the fix the same test received 23 collector-path entrances.
+`/x/%2%65%2%65/idr/e`, which router-core dispatches to the route in process, answers `400` under workerd.
+
 Not verified here, and why it matters for G4-I8: local workerd, miniflare and the Node target show only what the
 adapter sets on its outbound request (exactly `Authorization`, `Content-Type`, `Accept`). In cell E's local run of the
 acceptance script (`cf-site-check.mjs --local-probe --phase all`), the header names that arrived at the canary were
