@@ -21,7 +21,11 @@
  *     is stored as asserted (three rows);
  *   - disabled: POST /v1/events is byte-identical to an unknown route;
  *   - `--mode rollback-check` passes against a target without the route,
- *     writes nothing, and fails against a target that has it.
+ *     writes nothing, and fails against a target that has it, still storing
+ *     nothing there; the events-disabled check stores nothing there either
+ *     (G5R1-L1);
+ *   - a run stopped by the orphan check reports its events and kill-switch
+ *     phases as not_run (G5R1-I2).
  *
  * Production database posture (Gate 5): the service and every smoke process
  * get the production database settings: verified TLS (DATABASE_SSL=
@@ -239,6 +243,7 @@ describe("smoke ownership and events phase against the real service: documentati
     (await db.pool.query<{ enrichment_enabled: boolean; reason: string; updated_at: Date }>("SELECT enrichment_enabled, reason, updated_at FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows;
   const control = async () => (await controlRows()).map(({ enrichment_enabled, reason }) => ({ enrichment_enabled, reason }));
   const release = () => db.controls.setEnrichmentEnabled(INSTALLATION, true, "test: released");
+  const eventRows = async () => (await db.pool.query<{ n: number }>("SELECT count(*)::int AS n FROM browser_events")).rows[0]!.n;
   const runEvents = async (r: SmokeRun) =>
     (
       await db.pool.query<{ event_id: string; type: string; name: string; consent: string; origin: string }>(
@@ -325,7 +330,8 @@ describe("smoke ownership and events phase against the real service: documentati
       const r = await runSmoke(smokeEnv);
       expect(r.code, r.stdout + r.stderr).toBe(2);
       expect(r.checks.map((c) => [c.check, c.outcome])).toEqual([[ORPHAN_CHECK, "fail"]]);
-      expect(r.summary).toMatchObject({ kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1 });
+      // G5R1-I2: the run stopped before the events and kill-switch phases, and the summary says so.
+      expect(r.summary).toMatchObject({ events_phase: "not_run", kill_switch_phase: "not_run", kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1 });
       expect(r.stderr).toContain("KILL SWITCH LEFT ENGAGED BY AN EARLIER SMOKE RUN");
       expect(r.stderr).toContain("node dist/ops/kill-switch.js off --reason");
       expect(r.stderr).not.toContain("left_engaged_as_found");
@@ -358,6 +364,7 @@ describe("smoke ownership and events phase against the real service: documentati
       const next = await runSmoke(smokeEnv);
       expect(next.code, next.stdout + next.stderr).toBe(2);
       expect(next.checks.map((c) => [c.check, c.outcome])).toEqual([[ORPHAN_CHECK, "fail"]]);
+      expect(next.summary).toMatchObject({ events_phase: "not_run", kill_switch_phase: "not_run", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1, skipped: 0 });
       expect(next.stderr).toContain("KILL SWITCH LEFT ENGAGED BY AN EARLIER SMOKE RUN");
       expect(await control()).toEqual(left);
       await expectSecretFree(next, base);
@@ -477,11 +484,27 @@ describe("smoke ownership and events phase against the real service: documentati
     expect(check(r, "events: consent not_required under EVENT_CONSENT_MODE=not_required -> 200 recorded:true")?.detail).toBe("status 403 recorded=undefined");
   });
 
-  it("rollback-check against a target that HAS the events route fails (exit 1): the absent check is not vacuous", async () => {
+  it("G5R1-L1: rollback-check against a target that HAS the events route fails loudly (exit 1) and stores nothing", async () => {
+    const before = await eventRows();
     const r = await runSmoke(smokeEnv, ["--mode", "rollback-check"]);
     expect(r.code, r.stdout + r.stderr).toBe(1);
+    expect(await eventRows(), "rollback-check stored an event").toBe(before);
     expect(failedChecks(r)).toEqual(["rollback: POST /v1/events with the website credential answers exactly like an unknown route (absent)"]);
-    expect(check(r, "rollback: POST /v1/events with the website credential answers exactly like an unknown route (absent)")?.detail).toMatch(/^status 200 vs 404, differs: /);
+    // The live route rejects the probe body before storing (400), which still differs from the unknown route (404).
+    expect(check(r, "rollback: POST /v1/events with the website credential answers exactly like an unknown route (absent)")?.detail).toMatch(/^status 400 vs 404, differs: /);
+    await expectSecretFree(r, base);
+  });
+
+  it("G5R1-L1: the events-disabled check run against a target that HAS the events route fails loudly (exit 1) and stores nothing", async () => {
+    const before = await eventRows();
+    const r = await runSmoke({ ...smokeEnv, EVENTS_ENABLED: "false" });
+    expect(r.code, r.stdout + r.stderr).toBe(1);
+    expect(await eventRows(), "the events-disabled check stored an event").toBe(before);
+    expect(r.summary).toMatchObject({ events_mode: "events_disabled", events_phase: "check_disabled", kill_switch_restore: "restored" });
+    expect(failedChecks(r)).toEqual([EVENTS_DISABLED_CHECKS[0]]);
+    expect(check(r, EVENTS_DISABLED_CHECKS[0]!)?.detail).toMatch(/^status 400 vs 404, differs: /);
+    expect(check(r, EVENTS_DISABLED_CHECKS[1]!)?.outcome).toBe("pass");
+    await expectSecretFree(r, base);
   });
 });
 

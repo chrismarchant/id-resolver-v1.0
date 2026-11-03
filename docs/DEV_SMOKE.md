@@ -111,7 +111,10 @@ Where the counts can differ:
   * **The reporting feed** afterwards has no item derived from the events,
     and keeps the exact `reporting-feed.v1` shape.
 * **Events disabled.** `POST /v1/events` must be byte-identical to an unknown
-  route: 404 with the website credential, 401 without.
+  route: 404 with the website credential, 401 without. The body it sends is
+  one a live events route refuses before storing (contract `event.v0` and an
+  invalid `event_id`), so this check never writes an event, even against a
+  deployment that does serve the route. There it fails: `status 400 vs 404`.
 
 ## Side effects of a run (all synthetic)
 
@@ -127,14 +130,16 @@ All of these leave through the normal retention and maintenance runs
 ## Rollback to a build before migration 0008
 
 A build from before Gate 4 cell B1 (migration 0008, `POST /v1/events`) can run
-on a database that already has 0008. Examples are the Gate 3 baseline and the
-Gate 4 cell A CHR-72 build. Verified locally with the CHR-72 build.
+on a database that already has 0008 (and 0009). Examples are the Gate 3
+baseline and the Gate 4 cell A CHR-72 build. Verified locally with the CHR-72
+build, on a database with 0008 alone and with 0008 and 0009.
 
 * **Pre-deploy migrate** of the old build exits 0 and applies nothing. It does
-  not refuse the unknown `0008_browser_events`.
+  not refuse the migrations it does not know.
 * **The service starts** and logs
-  `migration_check {"outcome":"database_ahead","count":1}`, then
-  `server_started`. Its `config_loaded` line has no `events_enabled` field: the
+  `migration_check {"outcome":"database_ahead","count":N}`, then
+  `server_started`. `N` is the number of migrations the old build does not
+  know: 2 once 0009 is applied, 1 with 0008 alone. Its `config_loaded` line has no `events_enabled` field: the
   old build ignores `EVENTS_ENABLED`.
 * **`POST /v1/events` does not exist.** With the website credential it gets
   the same answer as any unknown route, which in builds before Gate 4 is
@@ -145,7 +150,8 @@ Gate 4 cell A CHR-72 build. Verified locally with the CHR-72 build.
 
 1. **Deploy logs.** The old build's pre-deploy `migrate.js` exited 0.
 2. **Service logs.** `migration_check` with `outcome` `database_ahead` and
-   `count` 1, followed by `server_started`, and no `process_fatal`.
+   `count` 2 (1 if the database has 0008 but not 0009), followed by
+   `server_started`, and no `process_fatal`.
 3. **Public edge, unauthenticated:**
    * `GET https://<public domain>/healthz` and `/readyz` answer 200.
    * `POST https://<public domain>/v1/entrances` with an invalid body answers
@@ -161,7 +167,9 @@ Gate 4 cell A CHR-72 build. Verified locally with the CHR-72 build.
      liveness, credential separation, the feed, and "`POST /v1/events`
      answers exactly like an unknown route".
    * The suite sends nothing that resolves, writes nothing and reads no
-     database.
+     database. Its event probe is refused before storing by any deployment
+     that does serve the route, so even pointed at the wrong deployment it
+     writes nothing; it fails there with `status 400 vs 404`.
    * Expect exit 0 with 17 passed, and the detail
      `status 400, identical to an unknown route` for a build before Gate 4.
    * When it passes, the current build goes live: that deploy is also the

@@ -29,9 +29,11 @@
  *     (readable, exact reporting-feed.v1 shape, no address) and "POST
  *     /v1/events answers exactly like an unknown route", plus the public edge.
  *     It sends nothing that resolves, writes nothing and reads no database,
- *     and every check holds for every build since Gate 3, so the current
- *     smoke can check a deployment rolled back to a build without migration
- *     0008 (docs/DEV_SMOKE.md).
+ *     even when pointed at a deployment that does serve POST /v1/events (its
+ *     probe body is refused there before anything is stored, and the check
+ *     fails), and every check holds for every build since Gate 3, so the
+ *     current smoke can check a deployment rolled back to a build without
+ *     migration 0008 (docs/DEV_SMOKE.md).
  *
  * Modes of the full suite, read from this process's environment with the
  * service's own parsers (src/ops/smoke-mode.ts); the target must run with the
@@ -324,7 +326,15 @@ async function fullSuite(ctx: Ctx, ops: OpsConfig | undefined, pool: Pool | unde
     if (reading !== "unreadable" && isSmokeEngagement(reading)) {
       // Stop before any other request: the switch is not this run's to probe, release or count as found.
       report.check(KS_ORPHAN, false, "engaged with the smoke's own reason");
-      writeSummary(ctx, { ...summaryBase, kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", first_source: "not_run" });
+      // The summary names the phases that did not run as not_run, not their plan (G5R1-I2).
+      writeSummary(ctx, {
+        ...summaryBase,
+        events_phase: "not_run",
+        kill_switch_phase: "not_run",
+        kill_switch_prior: "engaged",
+        kill_switch_restore: "orphan_left_engaged",
+        first_source: "not_run",
+      });
       stderr(ORPHAN_MESSAGE);
       return smokeExitCode(report.counts().failed, "orphan_left_engaged");
     }

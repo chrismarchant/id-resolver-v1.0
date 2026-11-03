@@ -8,6 +8,8 @@
  * test/adversarial/smoke-ownership-events.test.ts.
  */
 import { describe, expect, it } from "vitest";
+import { EventBodySchema } from "../../src/api/schema.js";
+import { EVENT_ID_PATTERN } from "../../src/contracts/event.js";
 import { checkEventsAbsent, EV } from "../../src/ops/smoke-events.js";
 import { windowVerdict, type ResolutionSnapshot } from "../../src/ops/smoke-events-db.js";
 import { feedPageShapeProblems, readFeed } from "../../src/ops/smoke-feed.js";
@@ -126,6 +128,35 @@ describe("answer comparison (absent = byte-identical to an unknown route)", () =
     expect(r[0]).toMatchObject({ outcome: "pass", detail: "status 400, identical to an unknown route" });
     r = await run(answer(200, "{}"), answer(200, "{}"), undefined);
     expect(r[0]).toMatchObject({ outcome: "fail" });
+  });
+});
+
+describe("the absent check never stores an event (G5R1-L1)", () => {
+  it("sends a body that a live events route rejects before storing, and that the database could not store either", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    await checkEventsAbsent({
+      report: new SmokeReport(() => undefined),
+      post: async (_path, _headers, body) => {
+        bodies.push(body as Record<string, unknown>);
+        return answer(404, JSON.stringify({ version: "1", error: "not_found" }));
+      },
+      websiteAuth: { authorization: "Bearer x" },
+      json: {},
+      websiteId: "site-test",
+      run: "abc",
+      expectStatus: 404,
+    });
+    // Two comparisons (with and without the credential), each to /v1/events and to the unknown route, with one body.
+    expect(bodies).toHaveLength(4);
+    for (const body of bodies) {
+      expect(body).toEqual(bodies[0]);
+      // The route's first step, the strict schema, refuses it (400) ...
+      expect(EventBodySchema.safeParse(body).success).toBe(false);
+      // ... and its event_id breaks the browser_events CHECK (0008), so no route bug could store it.
+      expect(EVENT_ID_PATTERN.test(String(body["event_id"]))).toBe(false);
+      // It still names this website and nothing else: no address, no page_key of a real page.
+      expect(JSON.stringify(body)).not.toMatch(/203\.0\.113\.|2001:db8|10\.0\.0\./);
+    }
   });
 });
 
