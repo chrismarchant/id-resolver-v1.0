@@ -1,0 +1,22 @@
+{
+  "description": "Synthetic: domain with a qualifying usage type. Documentation address (RFC 5737); fake organisation.",
+  "ip": "203.0.113.10",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "www.Example.COM.",
+      "ipOrganization": "  Example   Ltd ",
+      "ipIsp": "Example Transit Networks",
+      "ipRange": "203.0.113.0/24",
+      "ipUsageType": "com",
+      "country": "Exampleland",
+      "region": "Example Region",
+      "city": "Example City",
+      "latitude": 12.3456,
+      "longitude": 65.4321,
+      "timezone": "Etc/UTC"
+    },
+    "meta": { "credits_used": 100 }
+  }
+}

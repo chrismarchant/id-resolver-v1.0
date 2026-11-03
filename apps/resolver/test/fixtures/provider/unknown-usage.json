@@ -1,0 +1,15 @@
+{
+  "description": "Synthetic: domain present but no usage type (unknown).",
+  "ip": "203.0.113.12",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "example.org",
+      "ipOrganization": "Example Org",
+      "ipIsp": "Example Hosting Co",
+      "ipRange": "203.0.113.12/32"
+    },
+    "meta": { "credits": 100 }
+  }
+}

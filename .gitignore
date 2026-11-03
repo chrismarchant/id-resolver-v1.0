@@ -1,0 +1,33 @@
+# dependencies and build output
+node_modules/
+dist/
+coverage/
+.output/
+.nitro/
+.tanstack/
+.wrangler/
+.vinxi/
+*.tsbuildinfo
+
+# secrets and local environment — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+.npmrc
+
+# data dumps, logs, core files
+*.log
+*.dump
+*.sql.gz
+*.sqlite
+*.db
+# core dumps (files named "core" or "core.<pid>"); directories named core are source code
+core
+!core/
+core.[0-9]*
+.DS_Store

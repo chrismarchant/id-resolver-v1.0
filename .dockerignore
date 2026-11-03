@@ -1,0 +1,21 @@
+# Build context is the repository root; only the resolver service is built.
+**/node_modules
+**/dist
+**/coverage
+.git
+.github
+.env
+.env.*
+!**/.env.example
+docs
+scripts
+**/*.md
+apps/resolver/test
+# Other workspaces: keep only their package.json so `npm ci -w` can validate the lockfile.
+packages/**
+!packages/*/package.json
+integrations/**
+!integrations/*/package.json
+core
+core.[0-9]*
+*.log

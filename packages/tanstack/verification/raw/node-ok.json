@@ -1,0 +1,118 @@
+{
+  "sinkMode": "ok",
+  "target": "node",
+  "node": "v22.23.4",
+  "lifecycle": [
+    {
+      "mode": "none",
+      "status": 200,
+      "ttfb_ms": 7,
+      "total_ms": 7,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "env": "process.env.IDR_ENV_PROBE=present",
+        "ua": "Node.js/22",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "unawaited",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 6,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 311,
+      "diag": {
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "awaited",
+      "status": 200,
+      "ttfb_ms": 314,
+      "total_ms": 314,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": -8,
+      "diag": {
+        "result": "sink:200",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "cfworkers",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 5,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "waitUntil": "cloudflare:workers threw Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol 'cloudflare:'",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "request",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 5,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 298,
+      "diag": {
+        "request": "waitUntil=function runtime.cf.ctx.waitUntil=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "event",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 5,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "event": "ev=false keys= wu=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    }
+  ],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 12,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "K7I0sYg1UnTq_x3YSNiyZw",
+      "occurred_at": "2026-11-03T12:41:11Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":6}"
+    ]
+  }
+}

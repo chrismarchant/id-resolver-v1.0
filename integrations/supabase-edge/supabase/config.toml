@@ -1,0 +1,6 @@
+# Function-level settings for the reference adapter. Merge into the client
+# project's supabase/config.toml. The function authenticates callers itself
+# with the x-idr-sync-secret header (constant-time compare), so the platform
+# JWT check is disabled; this lets pg_cron call it without storing a JWT.
+[functions.idr-sync]
+verify_jwt = false

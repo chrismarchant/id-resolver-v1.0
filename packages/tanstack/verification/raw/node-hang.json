@@ -1,0 +1,27 @@
+{
+  "sinkMode": "hang",
+  "target": "node",
+  "node": "v22.23.4",
+  "lifecycle": [],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 42,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "6NZxYPUclbZ_yNrv6_ZMKw",
+      "occurred_at": "2026-11-03T12:41:15Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"dropped\",\"reason\":\"timeout\",\"mode\":\"wait_until\",\"attempts\":2,\"durationMs\":10257}"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "description": "Synthetic: domain owned by a network operator (excluded usage type).",
+  "ip": "203.0.113.11",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "example-isp.net",
+      "ipOrganization": "Example Broadband",
+      "ipIsp": "Example Broadband",
+      "ipRange": "203.0.113.0/25",
+      "ipUsageType": "ISP",
+      "country": "Exampleland",
+      "latitude": 1.5,
+      "longitude": 2.5
+    },
+    "meta": { "creditsUsed": 100 }
+  }
+}

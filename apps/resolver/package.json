@@ -1,0 +1,43 @@
+{
+  "name": "@idr/resolver",
+  "version": "1.0.0-dev.0",
+  "private": true,
+  "description": "ID Resolver V1: dedicated single-client IP-to-company resolution service (Railway)",
+  "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "ops:usage": "tsx src/ops/usage.ts",
+    "ops:kill-switch": "tsx src/ops/kill-switch.ts",
+    "ops:prune": "tsx src/ops/prune.ts",
+    "ops:erase-company": "tsx src/ops/erase-company.ts",
+    "mock-provider": "tsx src/provider/mock-server.ts",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:adversarial": "vitest run test/adversarial",
+    "verify": "npm run typecheck && npm run test"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@fastify/rate-limit": "11.2.1",
+    "fastify": "5.12.7",
+    "ipaddr.js": "2.5.0",
+    "pg": "8.23.1",
+    "pino": "9.14.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}
