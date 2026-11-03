@@ -104,9 +104,9 @@ function isPublicV4(o: readonly number[], docs: boolean): boolean {
 function isPublicV6(g: readonly number[], docs: boolean): boolean {
   const g0 = g[0] ?? 0;
   const g1 = g[1] ?? 0;
-  // Only global unicast 2000::/3 can be a public client. This rejects ::, ::1,
+  // Only global unicast (first three bits 001) can be a public client. This rejects ::, ::1,
   // IPv4-mapped/compatible (::/8), NAT64 (64:ff9b::), ULA fc00::/7, link-local
-  // fe80::/10, multicast ff00::/8 and everything else outside 2000::/3.
+  // fe80::/10, multicast ff00::/8 and everything else outside global unicast.
   if ((g0 & 0xe000) !== 0x2000) return false;
   if (g0 === 0x2001 && g1 < 0x0200) return false; // 2001::/23 IETF protocol assignments (Teredo, benchmarking, ORCHID...)
   if (g0 === 0x2002) return false; // 6to4 (embeds IPv4 chosen by the sender)

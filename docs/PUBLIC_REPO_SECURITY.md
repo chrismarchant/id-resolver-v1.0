@@ -42,16 +42,23 @@ time under Settings → Code security; re-check before relying on them.
 | Control | Where | Verified by |
 |---|---|---|
 | **gitleaks 8.30.1** over the full git history, default ruleset + a narrow value-level allowlist of two synthetic test values | `.github/workflows/ci.yml` job `hygiene`; config `.gitleaks.toml` | Binary pinned by sha256 from the release checksums. A negative control (random hex and base64 tokens planted in a scratch directory) is detected with the same config. |
-| **Public-safety gate**: concrete `*.up.railway.app` / `*.railway.internal` hostnames, UUID literals, public IPv4 literals outside private/reserved/RFC 5737 ranges, non-example e-mails, private-key blocks, committed `.env`/key files | `scripts/check-public-safety.mjs`, job `hygiene` | `scripts/check-public-safety.test.mjs`: 8 tests prove each rule fires on a planted violation and allowed forms pass |
+| **Public-safety gate**, working tree: concrete `*.up.railway.app` / `*.railway.internal` hostnames, UUID literals, public IPv4 literals outside private/reserved/RFC 5737 ranges, public IPv6 literals (global unicast outside RFC 3849 and the protocol block; times and `Foo::bar` are not addresses), non-example e-mails, private-key blocks, committed `.env`/key files. UTF-8 (BOM), UTF-16 and UTF-32 are decoded; a text file over 2 MB **fails** unless its exact path is on the reviewed list; only the root `package-lock.json` and the probe lockfile are skipped (never by basename); true binaries are not scanned and are **listed** in the output | `scripts/check-public-safety.mjs`, job `hygiene` | `scripts/check-public-safety.test.mjs` plants a violation for every rule and encoding (UTF-16 LE/BE, BOM-less, NUL, large file, nested lockfile, IPv6) and proves allowed forms pass |
+| **Public-safety gate**, history: the same rules over every line **added** by any commit reachable from any ref (`git log -p --all`; added UTF-16 blobs are decoded whole; committed `.env`/key files are caught even if later deleted). Fails on a shallow clone. Reviewed historical synthetic hits are exact `commit:path:rule:value` fingerprints in `.public-safety-history-allow`, each with a justification | `node scripts/check-public-safety.mjs --history`, job `hygiene` (checkout `fetch-depth: 0`) | Self-test: a value added and later removed is found; exact-fingerprint allow-listing; UTF-16 and deleted `.env` in history; shallow clone refused |
 | Dependency audit `npm audit --audit-level=high`; `npm ci --ignore-scripts` (no install hooks) | job `verify` | CI log |
 | Actions pinned to full commit SHAs; `permissions: contents: read`; `persist-credentials: false` | `ci.yml` | Review |
 | `.gitignore` excludes `.env*` (except `.env.example`), key files, dumps and logs | `.gitignore` | Review |
-| Fresh history: V0.1 files copied selectively; V0.1 docs, deployment scripts and live fixtures **not** imported | `docs/PROVENANCE.md` | Gate + gitleaks over the full history |
+| Fresh history: V0.1 files copied selectively; V0.1 docs, deployment scripts and live fixtures **not** imported | `docs/PROVENANCE.md` | Gate (`--history`) + gitleaks over the full history |
 
 The `public-safety: allow-synthetic` marker can opt a single line out of the
-UUID and IPv4 rules for deliberately synthetic parser inputs. Every opt-out is
+UUID, IPv4 and IPv6 rules for deliberately synthetic parser inputs. Every opt-out is
 printed in the CI log for review. The marker cannot opt out of the hostname,
 e-mail or key rules.
+
+Limits, stated plainly: the gate is pattern-based (no hostname or domain allowlist beyond
+the Railway patterns, no entropy checks; gitleaks covers secrets). Binary files, and
+encodings other than UTF-8/16/32, are not scanned. History fingerprints name commit SHAs, so a
+history rewrite makes entries stale (reported as warnings) and the reviewed hits must be
+re-listed. The history allow-list file itself is excluded from scanning.
 
 ## 4. Recommended owner actions (optional, not assumed)
 

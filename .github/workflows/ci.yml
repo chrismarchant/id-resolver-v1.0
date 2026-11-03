@@ -36,6 +36,8 @@ jobs:
           node-version: 22
       - name: Public-safety gate (infra identifiers, public IPs, e-mails, key files)
         run: node scripts/check-public-safety.mjs
+      - name: Public-safety gate over the full history (every added line, all refs)
+        run: node scripts/check-public-safety.mjs --history
       - name: Public-safety gate self-test
         run: node --test scripts/check-public-safety.test.mjs
       - name: Secret scan (gitleaks, full history)

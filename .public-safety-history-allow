@@ -1,0 +1,25 @@
+# Reviewed historical hits for `node scripts/check-public-safety.mjs --history`.
+#
+# History is immutable, so a hit that was committed before the gate had a rule
+# (or before a line carried the opt-out marker) cannot be fixed in place. Each
+# entry is an exact fingerprint `commit:path:rule:value` and allows ONE value in
+# ONE file of ONE commit; nothing else. Every entry needs a justification
+# comment above it, written by someone who looked at the content. Entries that
+# no longer match anything are reported as warnings (e.g. after a history rewrite).
+#
+# Reviewed 3 Nov 2026 (CHR-66 follow-up F8). Every value below is a synthetic
+# parser input, a documentation comment or a rule description; none is a real
+# address, hostname or identifier, and none was ever contacted.
+
+# V0.1 import: comment explaining that ipaddr.js maps the octal form "010.0.0.1"
+# to 8.0.0.1; the dotted quad is the output of the quirk being guarded against.
+50012a97edaf8dd14dc0eddb200573d741f21575:apps/resolver/src/ip/canonical.ts:public-ipv4:8.0.0.1
+# V0.1 import: malformed-address test input "1.2.3.4:80" (address with a port), expected to be rejected.
+50012a97edaf8dd14dc0eddb200573d741f21575:apps/resolver/test/unit/canonical.test.ts:public-ipv4:1.2.3.4
+
+# TanStack adapter introduction: comment describing the global unicast block by its prefix notation (a range, not an address).
+1c012636020fb36b3327609ba9081f1444a8d2dd:packages/tanstack/src/ip.ts:public-ipv6:2000::
+# TanStack adapter introduction: parser test inputs. 2a0d:1234:5678::1 is an invented global unicast address used to prove acceptance with
+# documentation ranges off; 64:ff9b::808:808 is a NAT64 form that must be rejected. Neither was ever contacted.
+1c012636020fb36b3327609ba9081f1444a8d2dd:packages/tanstack/test/ip-trust.test.ts:public-ipv6:2a0d:1234:5678::1
+1c012636020fb36b3327609ba9081f1444a8d2dd:packages/tanstack/test/ip-trust.test.ts:public-ipv6:64:ff9b::808:808
