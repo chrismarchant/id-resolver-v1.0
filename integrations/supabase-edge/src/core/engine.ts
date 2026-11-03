@@ -33,10 +33,20 @@ export function reconcileWindow(nowMs: number, days: number): { from: string; to
  * drained, the page cap, or the time budget. The cursor only ever advances
  * through Store.applyPage (atomic compare-and-set), so a crash, a duplicate
  * invocation or a concurrent one cannot skip or double-advance it.
+ *
+ * 410 cursor_expired is a POTENTIAL SYNCHRONISATION CONTINUITY GAP, never a
+ * recovery: observations may have been pruned by the resolver before they
+ * were pulled. The engine records it durably (Store.recordGap: needs_resync
+ * plus an append-only gap record, in one transaction, never duplicated while
+ * open), stops, and does nothing more until an operator calls
+ * idr_begin_resync(). The first run after that which drains the resolver's
+ * buffer marks the gap resolved (Store.resolveGaps): the projection was
+ * rebuilt from what is still retained; the pruned observations stay missing
+ * and the gap record stays.
  */
 export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResult> {
   const deadline = deps.now() + cfg.budgetMs;
-  const result: SyncResult = { status: "ok", pages: 0, observations: 0, tombstones: 0, reconcile: null };
+  const result: SyncResult = { status: "ok", pages: 0, observations: 0, tombstones: 0, reconcile: null, gap: null, gapsResolved: 0 };
 
   async function finish(status: SyncStatus, needsResync: boolean | null = null): Promise<SyncResult> {
     result.status = status;
@@ -44,6 +54,26 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
       await deps.store.recordStatus({ status, needsResync });
     } catch {
       // Status recording is best effort; never mask the run result.
+    }
+    return result;
+  }
+
+  /**
+   * needs_resync: record the gap durably (idempotent while open). If that
+   * fails, still mark needs_resync and report gap.recorded=false; the next run
+   * finds needs_resync set and retries the record.
+   */
+  async function finishGap(): Promise<SyncResult> {
+    result.status = "needs_resync";
+    try {
+      result.gap = await deps.store.recordGap("cursor_expired");
+    } catch {
+      result.gap = { recorded: false, newGap: false };
+      try {
+        await deps.store.recordStatus({ status: "needs_resync", needsResync: true });
+      } catch {
+        // best effort; the run result still says needs_resync
+      }
     }
     return result;
   }
@@ -97,7 +127,9 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         return { kind: "stop", status: "contract_error" };
       }
       // 400 to a request that carried a cursor: the resolver no longer accepts it
-      // (its cursor key rotated). Recoverable by restarting from the buffer start.
+      // (its cursor key rotated). Recoverable by restarting from the buffer start:
+      // a stale cursor already behind the retention watermark gets 410 instead,
+      // which is a potential continuity gap (finishGap), not this reset.
       if (status === 400 && carriedCursor) return { kind: "stop", status: "cursor_rejected" };
       if (status !== null && status !== 429 && status < 500) return { kind: "stop", status: "contract_error" };
 
@@ -122,7 +154,8 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     return finish("store_error");
   }
   // A pending resync is an operator decision; never fetch, advance or skip.
-  if (state.needsResync) return finish("needs_resync", true);
+  // Re-recording is idempotent and covers a gap whose record failed earlier.
+  if (state.needsResync) return finishGap();
 
   let cursor = state.cursor;
   let drained = false;
@@ -153,7 +186,8 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         continue;
       }
       if (fetched.status === "cursor_rejected") return finish("contract_error");
-      return finish(fetched.status, fetched.status === "needs_resync" ? true : null);
+      if (fetched.status === "needs_resync") return finishGap();
+      return finish(fetched.status);
     }
     const page: FeedPage | null = parseFeedPage(fetched.body, cfg.installationId);
     if (page === null) return finish("contract_error");
@@ -178,6 +212,17 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   }
 
   if (!drained) return finish(cursorReset ? "cursor_rejected" : "partial");
+
+  // Drained: if a gap is open, the projection may now have been rebuilt from
+  // the start of the retained buffer after idr_begin_resync(); the store
+  // resolves only gaps that precede the latest resync request.
+  if (state.gapOpen) {
+    try {
+      result.gapsResolved = await deps.store.resolveGaps();
+    } catch {
+      return finish("store_error");
+    }
+  }
 
   if (cfg.reconcileDays > 0) {
     result.reconcile = await reconcile();

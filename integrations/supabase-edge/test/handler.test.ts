@@ -1,7 +1,7 @@
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { handleSyncRequest, loadConfig, secretsMatch, type HandlerDeps } from "../src/core/index.ts";
-import { INSTALLATION, counts, newPool, resetDatabase, storedCursor, truncateAll } from "./helpers/db.ts";
+import { INSTALLATION, asRole, counts, gapRows, newPool, resetDatabase, storedCursor, truncateAll } from "./helpers/db.ts";
 import { FakePostgrest, SERVICE_KEY } from "./helpers/fake-postgrest.ts";
 import { MockResolver, TOKEN, obs } from "./helpers/mock-resolver.ts";
 
@@ -82,7 +82,7 @@ describe("authorised invocation", () => {
     const res = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps());
     expect(res.status).toBe(200);
     const text = await res.text();
-    expect(JSON.parse(text)).toEqual({ status: "ok", pages: 2, observations: 3, tombstones: 0, reconcile: null });
+    expect(JSON.parse(text)).toEqual({ status: "ok", pages: 2, observations: 3, tombstones: 0, reconcile: null, gap_recorded: false, gap_new: false, gaps_resolved: 0 });
     for (const leak of [TOKEN, SERVICE_KEY, SECRET, "example.com", "Company", "c3", INSTALLATION]) expect(text).not.toContain(leak);
     expect((await counts(pool)).observations).toBe(3);
     expect(await storedCursor(pool)).toBe("c3");
@@ -95,21 +95,43 @@ describe("authorised invocation", () => {
     expect(await res.json()).toMatchObject({ status: "auth_failed" });
   });
 
-  it("returns 409 needs_resync after cursor expiry", async () => {
+  it("returns 409 needs_resync after cursor expiry, records the continuity gap and says so (summary and log), never data", async () => {
     mock.items = [1, 2, 3, 4].map((i) => obs(i, 5, "2026-11-02T10:00:00.000Z"));
     await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps({ IDR_MAX_PAGES: "1" }));
     mock.retentionFloor = 3;
-    const res = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps());
+    const logs: string[] = [];
+    const res = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), { ...deps(), log: (m) => logs.push(m) });
     expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({ status: "needs_resync" });
+    const text = await res.text();
+    expect(JSON.parse(text)).toEqual({ status: "needs_resync", pages: 0, observations: 0, tombstones: 0, reconcile: null, gap_recorded: true, gap_new: true, gaps_resolved: 0 });
     expect(await storedCursor(pool)).toBe("c2");
+    expect(await gapRows(pool)).toHaveLength(1);
+    expect(logs).toContain("sync needs_resync pages=0 observations=0 tombstones=0 gap_recorded=true gap_new=true");
+    expect(logs.some((l) => l.startsWith("continuity gap open (cursor_expired): recorded in idr_sync_gaps"))).toBe(true);
+    for (const leak of [TOKEN, SERVICE_KEY, SECRET, "example.com", "c2", INSTALLATION]) {
+      expect(text).not.toContain(leak);
+      expect(logs.join("\n")).not.toContain(leak);
+    }
+
+    // Repeated invocations: still 409 and gap_recorded, never a second row.
+    const again = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps());
+    expect(again.status).toBe(409);
+    expect(await again.json()).toMatchObject({ status: "needs_resync", gap_recorded: true, gap_new: false });
+    expect(await gapRows(pool)).toHaveLength(1);
+
+    // After the operator's resync the first drained run reports the resolution; the row stays.
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    const resynced = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps());
+    expect(resynced.status).toBe(200);
+    expect(await resynced.json()).toMatchObject({ status: "ok", gap_recorded: false, gaps_resolved: 1 });
+    expect((await gapRows(pool))[0]).toMatchObject({ resolution: "full_resync" });
   });
 
   it("reports store failures (PostgREST rejecting the key) as store_error", async () => {
     mock.items = [obs(1, 5, "2026-11-02T10:00:00.000Z")];
     const res = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps({ SUPABASE_SERVICE_ROLE_KEY: "wrong-wrong-wrong-wrong" }));
     expect(res.status).toBe(500);
-    expect(await res.json()).toEqual({ status: "store_error", pages: 0, observations: 0, tombstones: 0, reconcile: null });
+    expect(await res.json()).toEqual({ status: "store_error", pages: 0, observations: 0, tombstones: 0, reconcile: null, gap_recorded: false, gap_new: false, gaps_resolved: 0 });
   });
 
   it("returns a generic misconfigured status (no variable values) when env is invalid", async () => {

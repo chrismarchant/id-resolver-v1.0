@@ -28,6 +28,7 @@ import {
 } from "../contracts/reporting-feed.js";
 import type { Logger } from "../log/index.js";
 import { DbError, guarded, type Pool } from "./pool.js";
+import { queryFeedWatermark } from "./retention.js";
 
 export const MAX_PAGE_LIMIT = 100;
 
@@ -369,6 +370,10 @@ export function createReportingRepository(pool: Pool, logger?: Logger): Reportin
         const items = rows.slice(0, limit).map(toFeedRecord);
         return { items, hasMore: rows.length > limit, expired: false, horizon };
       });
+    },
+
+    async feedWatermark(scope): Promise<FeedPosition | null> {
+      return guarded(logger, () => queryFeedWatermark(pool, scope));
     },
   };
 }

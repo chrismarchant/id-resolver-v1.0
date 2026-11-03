@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { INSTALLATION, asRole, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
-const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state"];
+const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 const FUNCS = [
   "idr_get_sync_state(text)",
   "idr_apply_feed_page(text,text,text,jsonb)",
@@ -11,7 +11,11 @@ const FUNCS = [
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
   "idr_reconcile_counts(text,date,date)",
+  "idr_record_sync_gap(text,text)",
+  "idr_resolve_sync_gaps(text)",
 ];
+/** Trigger functions cannot be called directly; only their ACL is checked. */
+const TRIGGER_FUNCS = ["idr_sync_gaps_guard()"];
 
 beforeAll(async () => {
   pool = newPool();
@@ -29,6 +33,7 @@ beforeEach(async () => {
   );
   await pool.query("insert into public.idr_tombstones (installation_id, tombstone_id, company_id, erased_at) values ($1, 1, 9, '2026-11-02T11:00:00Z')", [INSTALLATION]);
   await pool.query("insert into public.idr_sync_state (installation_id) values ($1)", [INSTALLATION]);
+  await pool.query("insert into public.idr_sync_gaps (installation_id, kind) values ($1, 'cursor_expired')", [INSTALLATION]);
 });
 
 describe("row level security", () => {
@@ -75,6 +80,9 @@ describe("row level security", () => {
       "delete from public.idr_tombstones",
       "update public.idr_sync_state set cursor = 'c99'",
       "truncate public.idr_observations",
+      "insert into public.idr_sync_gaps (installation_id, kind) values ('x', 'cursor_expired')",
+      "update public.idr_sync_gaps set resolved_at = now(), resolution = 'full_resync'",
+      "delete from public.idr_sync_gaps",
     ];
     for (const w of writes) await expect(asRole(pool, "authenticated", (c) => c.query(w), READER), w).rejects.toThrow(/permission denied/);
   });
@@ -102,6 +110,8 @@ describe("row level security", () => {
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
       "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
       "idr_reconcile_counts(text,date,date)": ["select public.idr_reconcile_counts($1, '2026-11-01', '2026-11-02')", [INSTALLATION]],
+      "idr_record_sync_gap(text,text)": ["select public.idr_record_sync_gap($1, 'cursor_expired')", [INSTALLATION]],
+      "idr_resolve_sync_gaps(text)": ["select public.idr_resolve_sync_gaps($1)", [INSTALLATION]],
     };
     for (const f of FUNCS) {
       const [sql, args] = calls[f]!;
@@ -114,7 +124,7 @@ describe("row level security", () => {
     const acl = await pool.query<{ proname: string; proacl: string[] }>(
       "select proname, proacl::text[] as proacl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
     );
-    expect(acl.rows.length).toBe(FUNCS.length);
+    expect(acl.rows.length).toBe(FUNCS.length + TRIGGER_FUNCS.length);
     for (const row of acl.rows) {
       const grantees = row.proacl.map((a) => a.split("=")[0]);
       expect(grantees.sort(), row.proname).toEqual(["resolver", "service_role"].sort());

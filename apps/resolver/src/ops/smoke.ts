@@ -6,18 +6,33 @@
  * printed.
  *
  * Safety: refuses to run unless PROVIDER_MODE=mock. With a live provider, the
- * qualified-entrance checks would trigger paid lookups.
+ * qualified-entrance checks would trigger paid lookups. That guard reads THIS
+ * process's environment, so it can only vouch for a target that runs with
+ * this environment; the target is therefore restricted (src/ops/smoke-target.ts,
+ * CHR-66 N7):
+ *   - private (every authenticated check): by default
+ *     http://$RAILWAY_PRIVATE_DOMAIN:$PORT, this same service and environment;
+ *     or SMOKE_BASE_URL, accepted only for a loopback host (127.0.0.1, [::1],
+ *     localhost) or a *.railway.internal host (Railway's encrypted private
+ *     network; for another service there, the operator asserts it runs with
+ *     PROVIDER_MODE=mock). Any other host is refused (exit 2): the tokens
+ *     would leave the private network, over http in clear text, and the guard
+ *     would say nothing about that target's provider mode.
+ *   - public: https://$RAILWAY_PUBLIC_DOMAIN, if set, for edge checks only
+ *     (TLS, CORS, unauthenticated rejection; only a random wrong token is sent).
  *
- * Targets:
- *   - private: SMOKE_BASE_URL, or http://$RAILWAY_PRIVATE_DOMAIN:$PORT (the
- *     currently running deployment), for every authenticated check
- *   - public:  https://$RAILWAY_PUBLIC_DOMAIN, if set, for edge checks only
- *     (TLS, CORS, unauthenticated rejection)
+ * Side effect: every run WRITES two synthetic observations (domain
+ * example.com, page_key /smoke/<run>, acquisition direct) into the target's
+ * activity store. They are ordinary reporting-feed items, so the Insights
+ * projection fed by that deployment (the dev projection) receives them; filter
+ * on the /smoke/ page_key prefix. They leave the resolver only through
+ * retention like any other observation.
  *
  * Usage (inside the service): node dist/ops/smoke.js. Exit 0 = all passed,
  * 1 = a check failed, 2 = refused or misconfigured.
  */
 import { randomBytes } from "node:crypto";
+import { resolveSmokeTarget } from "./smoke-target.js";
 
 interface Result {
   check: string;
@@ -58,13 +73,19 @@ async function main(): Promise<number> {
     process.stderr.write("smoke: refusing to run unless PROVIDER_MODE=mock (qualified checks would call a paid provider)\n");
     return 2;
   }
+  const target = resolveSmokeTarget(process.env);
+  if (!target.ok) {
+    // The reason names variables and rules only, never their values.
+    process.stderr.write(`smoke: refusing target: ${target.reason}\n`);
+    return 2;
+  }
   const websiteToken = env("RESOLVER_AUTH_TOKEN");
   const reportingToken = env("REPORTING_AUTH_TOKEN");
   const websiteId = env("WEBSITE_ID");
-  const privateBase = env("SMOKE_BASE_URL") ?? (env("RAILWAY_PRIVATE_DOMAIN") ? `http://${env("RAILWAY_PRIVATE_DOMAIN")}:${env("PORT") ?? "8080"}` : undefined);
+  const privateBase = target.base;
   const publicDomain = env("RAILWAY_PUBLIC_DOMAIN");
-  if (!websiteToken || !reportingToken || !websiteId || !privateBase) {
-    process.stderr.write("smoke: missing RESOLVER_AUTH_TOKEN, REPORTING_AUTH_TOKEN, WEBSITE_ID or a target base URL\n");
+  if (!websiteToken || !reportingToken || !websiteId) {
+    process.stderr.write("smoke: missing RESOLVER_AUTH_TOKEN, REPORTING_AUTH_TOKEN or WEBSITE_ID\n");
     return 2;
   }
   const wrong = randomHex(32);
@@ -185,7 +206,7 @@ async function main(): Promise<number> {
   }
 
   const failed = results.filter((x) => !x.pass).length;
-  process.stdout.write(`${JSON.stringify({ event: "smoke_summary", run, checks: results.length, passed: results.length - failed, failed, first_source: firstSource })}\n`);
+  process.stdout.write(`${JSON.stringify({ event: "smoke_summary", run, target: target.kind, checks: results.length, passed: results.length - failed, failed, first_source: firstSource })}\n`);
   return failed === 0 ? 0 : 1;
 }
 

@@ -50,7 +50,11 @@ export class MockResolver {
   overrides: Override[] = [];
   /** Cursors below this stream index answer 410 cursor_expired. */
   retentionFloor = 0;
-  /** Simulates a cursor-key rotation: cursors minted under another prefix are rejected with 400. */
+  /**
+   * Simulates a cursor-key rotation: cursors minted under another prefix fail
+   * verification. Like the resolver, a well-formed stale cursor whose position
+   * is below the retention floor answers 410 cursor_expired; any other 400.
+   */
   cursorPrefix = "";
   requests: LoggedRequest[] = [];
   installationId = "inst_test";
@@ -98,7 +102,12 @@ export class MockResolver {
       let start = this.retentionFloor; // no cursor = start of the retained buffer
       if (after !== null) {
         const m = new RegExp(`^${this.cursorPrefix}c([0-9]{1,9})$`).exec(after);
-        if (!m || Number(m[1]) > this.items.length) return this.send(res, 400, { version: "1", error: "invalid_request" });
+        if (!m) {
+          const stale = /^[a-z0-9]*c([0-9]{1,9})$/.exec(after);
+          if (stale && Number(stale[1]) < this.retentionFloor) return this.send(res, 410, { version: "1", error: "cursor_expired" });
+          return this.send(res, 400, { version: "1", error: "invalid_request" });
+        }
+        if (Number(m[1]) > this.items.length) return this.send(res, 400, { version: "1", error: "invalid_request" });
         start = Number(m[1]);
         if (start < this.retentionFloor) return this.send(res, 410, { version: "1", error: "cursor_expired" });
       }

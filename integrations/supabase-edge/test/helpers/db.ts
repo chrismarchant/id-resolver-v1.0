@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import type { ApplyPageArgs, ApplyPageResult, LocalCounts, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
+import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
 
 export const TEST_DB_URL =
   process.env["TEST_DATABASE_URL"] ?? "postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test_edge";
@@ -15,6 +15,17 @@ export function newPool(): pg.Pool {
 
 /** Recreates the public schema, the Supabase roles (if missing) and applies the SQL template. */
 export async function resetDatabase(pool: pg.Pool): Promise<void> {
+  await pool.query("drop schema public cascade");
+  await pool.query("create schema public");
+  await ensureProjection(pool);
+}
+
+/**
+ * Non-destructive: the Supabase roles and auth.jwt() (if missing), and the
+ * SQL template applied (it is idempotent) to whatever public schema exists.
+ * Used directly by suites that share the database with other tables.
+ */
+export async function ensureProjection(pool: pg.Pool): Promise<void> {
   const c = await pool.connect();
   try {
     for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
@@ -34,8 +45,6 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
     );
     await c.query("grant usage on schema auth to anon, authenticated, service_role");
     await c.query("grant execute on function auth.jwt() to anon, authenticated, service_role");
-    await c.query("drop schema public cascade");
-    await c.query("create schema public");
     await c.query("grant usage on schema public to anon, authenticated, service_role");
     await c.query(readFileSync(SQL_PATH, "utf8"));
   } finally {
@@ -43,8 +52,42 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
   }
 }
 
+/**
+ * Empties every projection table. idr_sync_gaps is append-only (its guard
+ * trigger rejects TRUNCATE), so the reset runs with
+ * session_replication_role = replica for this transaction only: a test-only
+ * bypass that needs superuser (the test role and CI's POSTGRES_USER are).
+ */
 export async function truncateAll(pool: pg.Pool): Promise<void> {
-  await pool.query("truncate public.idr_observations, public.idr_tombstones, public.idr_companies, public.idr_sync_state");
+  const c = await pool.connect();
+  try {
+    await c.query("begin");
+    await c.query("set local session_replication_role = replica");
+    await c.query("truncate public.idr_observations, public.idr_tombstones, public.idr_companies, public.idr_sync_state, public.idr_sync_gaps restart identity");
+    await c.query("commit");
+  } catch (e) {
+    await c.query("rollback").catch(() => undefined);
+    throw e;
+  } finally {
+    c.release();
+  }
+}
+
+export interface GapRow {
+  id: number;
+  installation_id: string;
+  kind: string;
+  detected_at: Date;
+  expired_cursor: string | null;
+  last_applied_at: Date | null;
+  last_observed_at: Date | null;
+  resolved_at: Date | null;
+  resolution: string | null;
+}
+
+export async function gapRows(pool: pg.Pool): Promise<GapRow[]> {
+  const r = await pool.query<GapRow>("select id::int as id, installation_id, kind, detected_at, expired_cursor, last_applied_at, last_observed_at, resolved_at, resolution from public.idr_sync_gaps order by id");
+  return r.rows;
 }
 
 /** Runs fn in a transaction as the given role. */
@@ -82,7 +125,21 @@ export class PgStore implements Store {
       c.query<{ s: { cursor: string | null; needs_resync: boolean } }>("select public.idr_get_sync_state($1) as s", [this.installationId]),
     );
     const s = r.rows[0]!.s;
-    return { cursor: s.cursor, needsResync: s.needs_resync };
+    return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: (s as { gap_open?: boolean }).gap_open === true };
+  }
+
+  async recordGap(kind: GapKind): Promise<RecordGapResult> {
+    const r = await asRole(this.pool, "service_role", (c) =>
+      c.query<{ r: { recorded: boolean; new: boolean } }>("select public.idr_record_sync_gap($1,$2) as r", [this.installationId, kind]),
+    );
+    return { recorded: r.rows[0]!.r.recorded, newGap: r.rows[0]!.r.new };
+  }
+
+  async resolveGaps(): Promise<number> {
+    const r = await asRole(this.pool, "service_role", (c) =>
+      c.query<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1) as r", [this.installationId]),
+    );
+    return r.rows[0]!.r.resolved;
   }
 
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {

@@ -31,6 +31,7 @@ import {
 } from "../contracts/api.js";
 import type { CompaniesCursor, CompanyActivitySummary, CompanyOrder, ObservationItem, ObservationsCursor, ReportingRepository } from "../contracts/db.js";
 import {
+  compareFeedPositions,
   FEED_CONTRACT,
   FEED_CURSOR_EXPIRED_STATUS,
   FEED_DEFAULT_LIMIT,
@@ -148,7 +149,8 @@ export function dateRange(from: string, to: string): { from: Date; to: Date } | 
 // The scope is bound into the tag, so a cursor from another deployment scope is
 // rejected. 34 bytes encode to exactly 46 base64url characters. Positions are
 // not secret (a consumer could infer them); the tag only makes a tampered or
-// fabricated position detectable (400) instead of silently skipping data.
+// fabricated position detectable (400, or 410 when the claimed position lies
+// before the retention watermark) instead of silently skipping data.
 
 const FEED_CURSOR_FORMAT = 1;
 const FEED_CURSOR_PAYLOAD_BYTES = 18;
@@ -164,8 +166,13 @@ const I64_MAX = 0x7fff_ffff_ffff_ffffn;
  * IP_HMAC_SECRET; the reporting token is unsuitable because the consumer holds
  * it). Domain-separated from every other use of that secret by its label, so
  * the derived key reveals nothing about the fingerprint key. Rotating the
- * secret invalidates outstanding cursors (400); consumers then resynchronise
- * from the start of the buffer, which is safe because they apply idempotently.
+ * secret invalidates outstanding cursors: a stale cursor whose position lies
+ * strictly before the scope's retention watermark gets 410 cursor_expired (a
+ * potential synchronisation continuity gap; see registerFeedRoute), any other
+ * gets 400, after which the consumer restarts from the start of the buffer,
+ * which is safe because nothing after its position was pruned and it applies
+ * idempotently. A separate cursor-signing secret with a key ring is deferred
+ * beyond V1.
  */
 export function deriveFeedCursorKey(secret: string): Buffer {
   if (typeof secret !== "string" || secret.length < 32) throw new Error("feed cursor key: secret too short");
@@ -194,21 +201,46 @@ export function encodeFeedCursor(position: FeedPosition, key: Buffer, scope: Rep
   return Buffer.concat([payload, feedCursorTag(key, scope, payload)]).toString("base64url");
 }
 
-/** The position a cursor encodes, or undefined when it is malformed, tampered with or issued for another scope or key. */
-export function decodeFeedCursor(raw: string, key: Buffer, scope: ReportingScope): FeedPosition | undefined {
+/** Payload and tag of a canonical 46-character cursor, or undefined when it is not one. Verifies nothing. */
+function splitFeedCursor(raw: string): { payload: Buffer; tag: Buffer } | undefined {
   if (typeof raw !== "string" || !FEED_CURSOR_PATTERN.test(raw)) return undefined;
   const buf = Buffer.from(raw, "base64url");
   // Reject non-canonical encodings (stray low bits in the last character).
   if (buf.length !== FEED_CURSOR_PAYLOAD_BYTES + FEED_CURSOR_TAG_BYTES || buf.toString("base64url") !== raw) return undefined;
-  const payload = buf.subarray(0, FEED_CURSOR_PAYLOAD_BYTES);
-  const tag = buf.subarray(FEED_CURSOR_PAYLOAD_BYTES);
-  if (!timingSafeEqual(tag, feedCursorTag(key, scope, payload))) return undefined;
+  return { payload: buf.subarray(0, FEED_CURSOR_PAYLOAD_BYTES), tag: buf.subarray(FEED_CURSOR_PAYLOAD_BYTES) };
+}
+
+/** The position an 18-byte payload encodes, or undefined when its format, kind or id is invalid. */
+function feedCursorPayloadPosition(payload: Buffer): FeedPosition | undefined {
   if (payload.readUInt8(0) !== FEED_CURSOR_FORMAT) return undefined;
   const kind = payload.readUInt8(9);
   if (kind !== FEED_KIND_OBSERVATION && kind !== FEED_KIND_TOMBSTONE) return undefined;
   const id = payload.readBigUInt64BE(10);
   if (id > I64_MAX) return undefined;
   return { txid: payload.readBigUInt64BE(1), kind, id };
+}
+
+/** The position a cursor encodes, or undefined when it is malformed, tampered with or issued for another scope or key. */
+export function decodeFeedCursor(raw: string, key: Buffer, scope: ReportingScope): FeedPosition | undefined {
+  const c = splitFeedCursor(raw);
+  if (!c) return undefined;
+  if (!timingSafeEqual(c.tag, feedCursorTag(key, scope, c.payload))) return undefined;
+  return feedCursorPayloadPosition(c.payload);
+}
+
+/**
+ * The position a well-formed cursor CLAIMS, WITHOUT verifying its tag:
+ * undefined when the cursor is malformed (wrong length or alphabet,
+ * non-canonical encoding, unknown format, invalid kind or id). The claim may
+ * be stale (issued under a rotated key), from another scope, or forged, so it
+ * is used for exactly one decision: whether a cursor that failed
+ * verification lies strictly before the retention watermark (410 instead of
+ * 400). It must never select or serve items. Positions are not secret, so
+ * reading the claim leaks nothing.
+ */
+export function unverifiedFeedCursorPosition(raw: string): FeedPosition | undefined {
+  const c = splitFeedCursor(raw);
+  return c ? feedCursorPayloadPosition(c.payload) : undefined;
 }
 
 export const FeedQuerySchema = z
@@ -357,31 +389,70 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
  * the server). All ordering and commit-safety guarantees live in one database
  * statement (src/db/reporting-repo.ts, FEED_SQL); this handler only validates,
  * signs and projects.
+ *
+ * A cursor whose tag does not verify is never served (owner clarification of
+ * guarantee 3, CHR-66 N1). It is usually stale: the cursor key derives from
+ * IP_HMAC_SECRET, so rotating that secret invalidates every outstanding
+ * cursor; a failed tag does not establish that it was ever authentic either.
+ * A consumer answers 400 with an automatic restart from the start of the
+ * buffer, which is only safe when nothing after its position was pruned. So
+ * when the cursor is well-formed and the position it claims lies strictly
+ * before the scope's retention watermark, the answer is 410 cursor_expired (a
+ * potential continuity gap the consumer must record and alert on), exactly
+ * what the same cursor would have received before the rotation; otherwise
+ * 400. Both answers carry no items.
+ *
+ * Untrusted bytes stay out of the database: a malformed cursor causes no
+ * database call; for a well-formed one the claimed position is decoded from
+ * the fixed 34-byte buffer and compared IN MEMORY with the watermark, which is
+ * read by a statement parameterised only by the server-configured scope
+ * (FEED_WATERMARK_SQL). reporting.feed is never called on this path. If the
+ * watermark cannot be read the answer is 500, never a 400 that could trigger
+ * a silent reset.
  */
 function registerFeedRoute(app: FastifyInstance, deps: ReportingDeps, feed: ReportingFeedOptions): void {
   const { scope, reporting, logger, sendError } = deps;
   const key = Buffer.from(feed.cursorKey);
   const s = { installationId: scope.installation_id, websiteId: scope.website_id };
+  const route = FEED_ROUTE;
+
+  const sendExpired = (reply: FastifyReply, unverified: boolean) => {
+    logger.warn("request_rejected", { route, error_code: "cursor_expired", http_status: FEED_CURSOR_EXPIRED_STATUS, ...(unverified ? { reason: "unverified_cursor" } : {}) });
+    const expired: FeedCursorExpiredResponse = { version: FEED_VERSION, error: "cursor_expired" };
+    return reply.code(FEED_CURSOR_EXPIRED_STATUS).send(expired);
+  };
+
+  const rejectUnverifiedCursor = async (reply: FastifyReply, raw: string) => {
+    const claimed = unverifiedFeedCursorPosition(raw);
+    if (claimed) {
+      let watermark: FeedPosition | null;
+      try {
+        watermark = await reporting.feedWatermark(s);
+      } catch {
+        logger.error("request_rejected", { route, error_code: "internal", http_status: 500 });
+        return sendError(reply, "internal");
+      }
+      if (watermark && compareFeedPositions(claimed, watermark) < 0) return sendExpired(reply, true);
+    }
+    logger.warn("request_rejected", { route, error_code: "invalid_request", http_status: 400 });
+    return sendError(reply, "invalid_request");
+  };
 
   app.get(FEED_ROUTE, async (req, reply) => {
-    const route = FEED_ROUTE;
     const q = FeedQuerySchema.safeParse(req.query ?? {});
     if (!q.success) {
       logger.warn("request_rejected", { route, error_code: "invalid_request", http_status: 400 });
       return sendError(reply, "invalid_request");
     }
-    const after = q.data.after === undefined ? null : decodeFeedCursor(q.data.after, key, scope);
-    if (after === undefined) {
-      logger.warn("request_rejected", { route, error_code: "invalid_request", http_status: 400 });
-      return sendError(reply, "invalid_request");
+    let after: FeedPosition | null = null;
+    if (q.data.after !== undefined) {
+      const verified = decodeFeedCursor(q.data.after, key, scope);
+      if (verified === undefined) return rejectUnverifiedCursor(reply, q.data.after);
+      after = verified;
     }
     try {
       const page = await reporting.feed(s, { after, limit: q.data.limit });
-      if (page.expired) {
-        logger.warn("request_rejected", { route, error_code: "cursor_expired", http_status: FEED_CURSOR_EXPIRED_STATUS });
-        const expired: FeedCursorExpiredResponse = { version: FEED_VERSION, error: "cursor_expired" };
-        return reply.code(FEED_CURSOR_EXPIRED_STATUS).send(expired);
-      }
+      if (page.expired) return sendExpired(reply, false);
       const last = page.items[page.items.length - 1];
       const position = last ? last.position : (after ?? FEED_START);
       const body: ReportingFeedResponse = {

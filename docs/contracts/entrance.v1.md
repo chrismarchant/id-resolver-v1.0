@@ -1,7 +1,9 @@
 # Contract `entrance.v1` — website server → resolver
 
 Status: **frozen for Gate 2/3 implementation** (owner decision D2). Changes
-require a new contract version.
+require a new contract version. The "Clarifications" section at the end
+corrects the documented meaning of the frozen interface to match implemented
+behaviour; it does not change the wire.
 
 `POST /v1/entrances` · `Authorization: Bearer <RESOLVER_AUTH_TOKEN>` ·
 `Content-Type: application/json` · body ≤ `BODY_LIMIT_BYTES`.
@@ -33,7 +35,7 @@ removed because it returns company data to the website.
 |---|---|
 | `status` | one of `qualified, no_match, excluded, unknown, pending, ineligible, disabled, uncertain, unavailable` (unchanged from V0.1) |
 | `source` | `cache \| provider \| none` |
-| `recorded` | `true` only when a company observation was **confirmed** durably recorded for this `entrance_id` before the answer (qualified outcomes only, including cache hits). `false` means **"not confirmed within the deadline"**, not "not stored": an observation write still running at the deadline is not cancelled and may commit after the answer, in which case the observation exists and the reporting feed serves it. Repeating the `entrance_id` never records a second observation. |
+| `recorded` | `true` only when a company observation was durably recorded for this `entrance_id` (qualified outcomes only, including cache hits). See **Clarification (CHR-66 F4)** below: `false` does not mean "not stored". |
 
 **The response never contains company identity, a company id, an IP, a
 fingerprint or provider data** (D2). Every status lets the website continue
@@ -53,3 +55,20 @@ echoed input.
 (= `entrance_id`), `source` (cache/provider), `page_key`, `acquisition`,
 `entrance_contract`, `eligibility`, `txid` (feed position). Nothing else is
 stored: no IP, header, user agent, referrer or query string.
+
+## Clarifications
+
+### Clarification (CHR-66 F4): the meaning of `recorded: false`
+
+**No wire change.** `recorded` stays a boolean in the same response, with the
+same keys, statuses and status codes. Only its documented meaning is
+corrected, to match how the resolver has always behaved; the original row
+above implied that `false` means nothing was stored.
+
+* `recorded: true`: the observation for this `entrance_id` was **confirmed**
+  durably recorded before the answer.
+* `recorded: false`: **not confirmed within the deadline**, not "not stored".
+  An observation write still running when the request deadline is reached is
+  not cancelled; it may commit after the answer, in which case the
+  observation exists and the reporting feed serves it.
+* Repeating the `entrance_id` never records a second observation.

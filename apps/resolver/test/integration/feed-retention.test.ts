@@ -81,7 +81,8 @@ describe("reporting feed: retention watermark", () => {
     const caughtUp = await getFeed(app, ahead.cursor);
     expect(caughtUp.body).toMatchObject({ items: [], has_more: false, next_cursor: ahead.cursor });
 
-    // The documented recovery: alert, then resynchronise from the start of the retained buffer.
+    // The documented response: record the potential gap, alert, then resynchronise from the
+    // start of the retained buffer (which rebuilds the projection; it does not recover pruned items).
     const start = await getFeed(app);
     expect(obsIds(start.body.items)).toEqual(fresh.map((f) => f.id));
     // Retention is not erasure: no tombstones, companies and stats untouched.

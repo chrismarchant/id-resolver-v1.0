@@ -60,8 +60,9 @@ name variables, never values. See `.env.example` for every variable.
   commercial history. Choose a value that **exceeds the longest Insights
   sync outage you are prepared to tolerate**: observations older than the
   window are pruned whether or not Insights has pulled them, and a consumer
-  whose cursor falls behind the buffer must resynchronise (it has missed
-  data). Shorter is better for privacy; longer is safer for sync. The owner
+  whose cursor falls behind the buffer gets `410 cursor_expired`, a
+  potential continuity gap: it must record it, alert and resynchronise,
+  and the pruned observations are not recoverable from the resolver. Shorter is better for privacy; longer is safer for sync. The owner
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
   and per-company scope statistics are never pruned.

@@ -124,7 +124,12 @@ export interface ReportingFeedResponse {
   has_more: boolean;
 }
 
-/** 410: the cursor lies before the retention watermark. The consumer must alert and resynchronise. */
+/**
+ * 410: the cursor (verified, or a well-formed one whose tag does not verify)
+ * claims a position before the retention watermark. A POTENTIAL
+ * synchronisation continuity gap, never a recovery: the consumer must record
+ * it durably, alert and resynchronise. Carries no items.
+ */
 export interface FeedCursorExpiredResponse {
   version: typeof FEED_VERSION;
   error: "cursor_expired";

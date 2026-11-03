@@ -32,6 +32,8 @@ export interface FeedPage {
 export interface SyncState {
   cursor: string | null;
   needsResync: boolean;
+  /** An unresolved continuity gap is recorded (see Store.recordGap). */
+  gapOpen: boolean;
 }
 
 export interface ApplyPageArgs {
@@ -66,6 +68,16 @@ export interface RecordStatusArgs {
   needsResync: boolean | null;
 }
 
+/** The only gap kind: the resolver answered 410 cursor_expired. */
+export type GapKind = "cursor_expired";
+
+export interface RecordGapResult {
+  /** A durable gap record exists for this incident (inserted now or already open). */
+  recorded: boolean;
+  /** This call inserted it (false: an open gap of this kind already existed). */
+  newGap: boolean;
+}
+
 export interface LocalCounts {
   observations: number;
   observedCompanies: number;
@@ -88,6 +100,19 @@ export interface Store {
    * false when another invocation changed it. Keeps the projection.
    */
   resetCursor(expectedCursor: string): Promise<boolean>;
+  /**
+   * A potential synchronisation continuity gap (410 cursor_expired). In ONE
+   * transaction: mark needs_resync (status needs_resync) and append a durable
+   * gap record, unless an unresolved gap of this kind is already open (never a
+   * duplicate). The record is never deleted; a later resync does not erase it.
+   */
+  recordGap(kind: GapKind): Promise<RecordGapResult>;
+  /**
+   * After a run that drained the resolver's buffer: mark open gaps detected
+   * before the latest resync request as resolved (rebuilt from the retained
+   * buffer, NOT recovered). Returns how many were resolved.
+   */
+  resolveGaps(): Promise<number>;
 }
 
 export interface SyncConfig {
@@ -133,4 +158,8 @@ export interface SyncResult {
   observations: number;
   tombstones: number;
   reconcile: ReconcileOutcome | null;
+  /** status needs_resync: whether the continuity gap is durably recorded (null: no gap this run). */
+  gap: RecordGapResult | null;
+  /** Open gaps this run marked resolved after draining the buffer post-resync. */
+  gapsResolved: number;
 }

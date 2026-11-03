@@ -1,4 +1,4 @@
-import type { ApplyPageArgs, ApplyPageResult, LocalCounts, RecordStatusArgs, Store, SyncState } from "./types.ts";
+import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "./types.ts";
 
 export class StoreError extends Error {
   constructor(readonly code: string) {
@@ -63,7 +63,7 @@ export class PostgrestStore implements Store {
     const r = obj(await this.rpc("idr_get_sync_state", { p_installation_id: this.o.installationId }));
     const cursor = r["cursor"];
     if (cursor !== null && typeof cursor !== "string") throw new StoreError("bad_rpc_response");
-    return { cursor: cursor ?? null, needsResync: r["needs_resync"] === true };
+    return { cursor: cursor ?? null, needsResync: r["needs_resync"] === true, gapOpen: r["gap_open"] === true };
   }
 
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
@@ -90,6 +90,17 @@ export class PostgrestStore implements Store {
       p_status: a.status,
       p_needs_resync: a.needsResync,
     });
+  }
+
+  async recordGap(kind: GapKind): Promise<RecordGapResult> {
+    const r = obj(await this.rpc("idr_record_sync_gap", { p_installation_id: this.o.installationId, p_kind: kind }));
+    if (typeof r["recorded"] !== "boolean" || typeof r["new"] !== "boolean") throw new StoreError("bad_rpc_response");
+    return { recorded: r["recorded"], newGap: r["new"] };
+  }
+
+  async resolveGaps(): Promise<number> {
+    const r = obj(await this.rpc("idr_resolve_sync_gaps", { p_installation_id: this.o.installationId }));
+    return int(r["resolved"]);
   }
 
   async localCounts(fromDay: string, toDay: string): Promise<LocalCounts> {
