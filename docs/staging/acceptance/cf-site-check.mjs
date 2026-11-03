@@ -275,12 +275,23 @@ function g4i8(name, records) {
   // The canary inspects every header (every copy) and matches the IP in any spelling; it returns header NAMES only.
   const leaking = [...new Set(records.flatMap((r) => r.headersWithClientIp))].sort();
   const forged = [...new Set(records.flatMap((r) => r.headersWithForgedIp))].sort();
-  if (LOCAL && leaking.length === 0) {
+  // A request the canary could not compare (no expected tester IP, no entrance body IP yet) is no evidence: it can
+  // never make this check PASS (G5R2-L5).
+  const uncompared = records.filter((r) => r.compared !== true).length;
+  const ok = records.length > 0 && leaking.length === 0 && uncompared === 0;
+  const detail = leaking.length
+    ? `headers carrying it: ${leaking.join(", ")}`
+    : records.length === 0
+      ? "no request reached the canary: nothing was compared"
+      : uncompared > 0
+        ? `${uncompared} of ${records.length} requests could not be compared (no expected tester IP at the canary and no visitor IP from an entrance body): not evidence`
+        : `${records.length} requests inspected, each compared`;
+  if (LOCAL && ok) {
     // Local workerd shows only what the adapter and the local runtime send, never what the Cloudflare edge adds:
     // no D4 transport-isolation claim is made from it (owner decision on G4-I8). A leak is still a FAIL below.
-    R.info(`${name}: G4-I8 header canary (local workerd: not the production edge, no claim)`, `no header carried the tester IP (${records.length} requests)`);
+    R.info(`${name}: G4-I8 header canary (local workerd: not the production edge, no claim)`, `no header carried the tester IP (${records.length} requests, each compared)`);
   } else {
-    R.check(`${name}: G4-I8, no request header at the resolver's hosting position carries the visitor's IP${LOCAL ? " (local workerd)" : ""}`, records.length > 0 && leaking.length === 0, leaking.length ? `headers carrying it: ${leaking.join(", ")}` : `${records.length} requests inspected`);
+    R.check(`${name}: G4-I8, no request header at the resolver's hosting position carries the visitor's IP${LOCAL ? " (local workerd)" : ""}`, ok, detail);
   }
   R.check(`${name}: no request header carries the forged IP`, forged.length === 0, forged.join(", ") || "none");
   const cf = records.filter((r) => r.headerPresence["cf-connecting-ip"]).length;
@@ -458,6 +469,9 @@ async function route() {
     ["GET", cfg.collectorPath],
     ["HEAD", cfg.collectorPath],
     ["GET", cfg.collectorPath.toUpperCase()],
+    // G5R2-L1: the router decodes %20 and strips trailing spaces, so these reach the collector route as well.
+    ["GET", `${cfg.collectorPath}%20`],
+    ["GET", `${cfg.collectorPath.toUpperCase()}%20%20`],
   ];
   const navStatuses = [];
   for (const [method, path] of navigations) navStatuses.push(`${method} ${(await rawRequest(siteUrl(path), { method, headers: browserHeaders() })).status}`);
@@ -520,7 +534,7 @@ async function route() {
   if (ip) R.check("forwarded bodies carry no copy of the tester's IP anywhere", events.every((r) => r.bodyContainsClientIp === false));
   R.check("page_key is the mapped path", events.every((r) => r.pageKey === `/landing/route-${tag}`));
   const navEntrances = res.records.filter((r) => r.route === "entrances").length;
-  R.check("G5-D-F1: a browser navigation to the collector path (GET, HEAD, upper case) produced no entrance", navEntrances === 0, `${navStatuses.join(", ")}; ${navEntrances} entrance(s) at the canary`);
+  R.check("G5-D-F1: a browser navigation to the collector path (GET, HEAD, upper case, trailing %20) produced no entrance", navEntrances === 0, `${navStatuses.join(", ")}; ${navEntrances} entrance(s) at the canary`);
   g4i8("route", events);
 }
 
@@ -645,7 +659,10 @@ async function browser() {
     byKey[k] = (byKey[k] ?? 0) + 1;
   }
   for (const [k, n] of Object.entries(byKey)) R.info("received", `${k}: ${n}`);
-  if (recs.length > 0) g4i8("browser", recs);
+  // No expected IP is set in this phase (each real browser has its own): the canary compares every entrance with its
+  // own body `ip`, and events with the visitor IPs of earlier entrances. Counts only.
+  R.info("browser: comparison basis at the canary", `expected tester IP set: ${res.expectationSet === true}; visitor IPs known from entrance bodies: ${Number(res.visitorIpsKnown ?? 0)}`);
+  g4i8("browser", recs);
 }
 
 function finish() {

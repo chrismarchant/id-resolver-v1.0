@@ -9,8 +9,10 @@
 //   * which route, mode and attempt (an entrance_id / event_id seen before counts as a retry);
 //   * the body's key list, contract, page_key and event name;
 //   * whether the body's `ip` equals the tester's IP or the forged IP (booleans only: the IP is never stored);
-//   * which request HEADERS were present, and the NAMES of headers whose value contains the tester's IP
-//     (G4-I8: a platform-added CF-Connecting-IP / X-Real-IP / X-Forwarded-For carrying the visitor's IP).
+//   * which request HEADERS were present, and the NAMES of headers whose value contains a visitor's IP
+//     (G4-I8: a platform-added CF-Connecting-IP / X-Real-IP / X-Forwarded-For carrying the visitor's IP). The
+//     comparison uses the tester's IP when the script sets one, each entrance body's own `ip`, and the visitor IPs
+//     of earlier entrances (for event subrequests); a request with nothing to compare against is marked as such.
 //     Every header is inspected, every copy of a repeated header included (raw headers), and the IP is recognised in
 //     any spelling: upper or lower case, compressed or expanded IPv6, with a port or brackets, and IPv4 embedded in
 //     IPv6 (::ffff:a.b.c.d, its hex form ::ffff:xxxx:xxxx, ::a.b.c.d, 64:ff9b::a.b.c.d).
@@ -164,15 +166,40 @@ export function containsIp(text, address) {
   return forms.length > 0 && ipLiterals(v).some((ip) => forms.includes(ip));
 }
 
+/** A matcher for several addresses at once: true when a text contains any of them, in any spelling. */
+function anyIpMatcher(addresses) {
+  const list = [...new Set((addresses ?? []).filter((a) => typeof a === "string" && a !== ""))];
+  if (list.length === 0) return null;
+  const forms = new Set(list.flatMap((a) => ipForms(a)));
+  const lowers = list.map((a) => a.toLowerCase());
+  return (text) => {
+    const v = String(text ?? "");
+    const lv = v.toLowerCase();
+    return lowers.some((l) => lv.includes(l)) || (forms.size > 0 && ipLiterals(v).some((ip) => forms.has(ip)));
+  };
+}
+
+/** True when the text contains any of the addresses in any spelling. */
+export function containsAnyIp(text, addresses) {
+  const m = anyIpMatcher(addresses);
+  return m !== null && m(text);
+}
+
 /**
- * Header NAMES whose value contains the address in any spelling (conservative: a false positive fails safe).
+ * Header NAMES whose value contains any of the addresses in any spelling (conservative: a false positive fails safe).
  * Accepts raw headers (preferred: Node drops repeated copies of some headers from req.headers) or a header object.
+ * With no address there is nothing to compare against: [] (callers must not read that as "no leak").
  */
-export function headersContaining(headers, address) {
-  if (!address) return [];
+export function headersContainingAny(headers, addresses) {
+  const m = anyIpMatcher(addresses);
+  if (m === null) return [];
   const names = new Set();
-  for (const [name, value] of headerPairs(headers)) if (containsIp(value, address)) names.add(safeName(name));
+  for (const [name, value] of headerPairs(headers)) if (m(value)) names.add(safeName(name));
   return [...names].sort();
+}
+
+export function headersContaining(headers, address) {
+  return headersContainingAny(headers, [address]);
 }
 
 /** The names of every header present (sanitised), for the "all headers checked" summary. */
@@ -180,11 +207,22 @@ function headerNames(rawHeaders) {
   return [...new Set(headerPairs(rawHeaders).map(([n]) => safeName(n)))].sort();
 }
 
+/** Visitor IPs learned from entrance bodies, kept in memory for comparison only (never returned or logged). */
+const MAX_VISITOR_IPS = 1000;
+
 export function createCanary(cfg) {
-  const state = { mode: cfg.defaultMode, expectedIp: null, records: [], ceiling: [], seen: new Map(), authFailed: 0, other: 0, startedAt: Date.now() };
+  const state = { mode: cfg.defaultMode, expectedIp: null, visitorIps: new Map(), records: [], ceiling: [], seen: new Map(), authFailed: 0, other: 0, startedAt: Date.now() };
+  const rememberVisitorIp = (ip) => {
+    const c = canonicalIp(ip);
+    if (c === null) return;
+    state.visitorIps.delete(c);
+    state.visitorIps.set(c, ip);
+    while (state.visitorIps.size > MAX_VISITOR_IPS) state.visitorIps.delete(state.visitorIps.keys().next().value);
+  };
   const reset = () => {
     state.mode = cfg.defaultMode;
     state.expectedIp = null;
+    state.visitorIps = new Map();
     state.records = [];
     state.ceiling = [];
     state.seen = new Map();
@@ -226,6 +264,7 @@ export function createCanary(cfg) {
       contract: "idr-staging-canary.v1",
       mode: state.mode,
       expectationSet: state.expectedIp !== null,
+      visitorIpsKnown: state.visitorIps.size,
       uptimeS: Math.round((Date.now() - state.startedAt) / 1000),
       counts: {
         entrances: state.records.filter((r) => r.route === "entrances").length,
@@ -300,6 +339,12 @@ export function createCanary(cfg) {
     const attempt = (state.seen.get(key) ?? 0) + 1;
     state.seen.set(key, attempt);
     const ipField = typeof body.ip === "string" ? body.ip : null;
+    // G4-I8 comparison basis, in memory only: the expected tester IP (when the script set one), this entrance's own
+    // `ip` (so every entrance is compared, whoever the client), and visitor IPs from earlier entrance bodies (so an
+    // event subrequest from the same visitor is compared too).
+    if (route === "entrances" && ipField !== null) rememberVisitorIp(ipField);
+    const basis = [state.expectedIp, ...state.visitorIps.values()];
+    const compared = basis.some((a) => typeof a === "string" && a !== "");
     const sameIp = (a, b) => a !== null && b !== null && canonicalIp(a) !== null && canonicalIp(a) === canonicalIp(b);
     const presence = {};
     for (const h of HEADER_WATCH) presence[h] = req.headers[h] !== undefined;
@@ -322,11 +367,14 @@ export function createCanary(cfg) {
         matchesExpected: sameIp(ipField, state.expectedIp),
         matchesForged: sameIp(ipField, cfg.forgedIp),
       },
-      // The tester's IP anywhere in the body other than the entrance's `ip` field (an event body has no `ip`).
-      bodyContainsClientIp: containsIp(JSON.stringify({ ...body, ip: undefined }), state.expectedIp),
+      // Whether this request was compared with at least one known visitor IP. A record that was not compared is no
+      // evidence of anything: cf-site-check never counts it as a PASS.
+      compared,
+      // A visitor IP anywhere in the body other than the entrance's `ip` field (an event body has no `ip`).
+      bodyContainsClientIp: containsAnyIp(JSON.stringify({ ...body, ip: undefined }), basis),
       headerPresence: presence,
       headerNames: headerNames(req.rawHeaders),
-      headersWithClientIp: headersContaining(req.rawHeaders, state.expectedIp),
+      headersWithClientIp: headersContainingAny(req.rawHeaders, basis),
       headersWithForgedIp: headersContaining(req.rawHeaders, cfg.forgedIp),
     };
     if (state.records.length < MAX_RECORDS) state.records.push(record);
