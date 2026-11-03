@@ -2,7 +2,9 @@
 
 Status: **frozen interface for Gate 4 implementation; the event vocabulary is
 approved by the owner on 3 Nov 2026 (CHR-59)**. This contract is additive. It
-does not change `entrance.v1` or `reporting-feed.v1`.
+does not change `entrance.v1` or `reporting-feed.v1`. The "Clarifications"
+section at the end corrects how the frozen interface may be relied on; it
+does not change the wire.
 
 ## Owner constraints (D4, 3 Nov 2026)
 
@@ -108,3 +110,36 @@ copy, and a test asserts it matches this file.
 
 The site allowlist is a subset of the vocabulary. Adding a name or type
 requires a new vocabulary version.
+
+## Clarifications
+
+### Clarification (CHR-66 G4-I1): browser events are forgeable telemetry
+
+**No wire change.** The fields, rules, vocabulary, status codes and storage
+above are unchanged. This states what a browser event can and cannot be
+trusted for.
+
+* **Anyone can send one.** `Origin` and `Sec-Fetch-Site` checks stop a
+  browser from posting cross-site; they do not stop a script or a server,
+  which can set `Origin` to the site's own origin. Such a client can post
+  plausible events through the first-party route: any allowlisted name, any
+  path, `consent: "granted"`, a fresh `event_id` each time.
+* **This is inherent to D4, not a defect.** The route has no visitor identity,
+  session, cookie or IP to authenticate or key a sender by, and must not get
+  one. The resolver's `/v1/events` needs the website token, which stays on
+  the website's server, so a sender without it goes through the site's
+  route; but that route is public.
+* **What bounds it:** the closed vocabulary and the site allowlist; the consent
+  policy (a sender can claim consent, and `Sec-GPC: 1` is always refused); the
+  `occurred_at` window and the replay cache; the 1 KiB body; the route's
+  per-instance rate budget and the resolver's separate `events` rate bucket and
+  in-flight limit. The rate budget is not per client, so one sender can also
+  use it up and crowd out real events (availability, not integrity). Forged
+  events are stored like real ones and, like them, are never joined to a
+  company. The entrance path (`entrance.v1`) is unaffected: it is a different
+  route with its own bucket.
+* **Therefore browser events must never be used for security or billing
+  decisions**: not for access control, fraud or abuse detection, rate limiting
+  of anyone, invoicing, contractual or performance metrics, or any decision
+  about a person or a company. Treat them as indicative, aggregate telemetry
+  that may contain noise.

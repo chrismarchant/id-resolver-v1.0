@@ -254,6 +254,12 @@ never joined to companies (owner decision D4).
 The resolver serves `/v1/events` only when `EVENTS_ENABLED=true`; otherwise it answers 404, and the hook shows
 `dropped/http_4xx`.
 
+**Browser events are forgeable telemetry** (`event.v1.md`, clarification CHR-66 G4-I1; no wire change). The
+`Origin` and `Sec-Fetch-Site` checks below stop browsers on other sites, not scripts: anyone can post plausible
+allowlisted events through this route, within its rate budget, the vocabulary, your allowlist and the consent policy.
+That is inherent to D4 (there is no visitor identity to authenticate). Never use browser events for security or
+billing decisions.
+
 ### TanStack Start server route
 
 ```ts
