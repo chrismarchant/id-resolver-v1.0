@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isEligible, type EligibilityRules } from "../src/index.js";
-import { BROWSER_HEADERS, req } from "./helpers.js";
+import { buildEntrance, createCollectorRoute, createIdrServerMiddleware, DEFAULT_COLLECTOR_PATH, isEligible, resolveConfig, type EligibilityRules } from "../src/index.js";
+import { BROWSER_HEADERS, req, TEST_TOKEN } from "./helpers.js";
 
 type Row = { name: string; path?: string; headers?: Record<string, string>; method?: string; rules?: EligibilityRules; base?: boolean; expect: true | string };
 
@@ -157,5 +157,159 @@ describe("tsa-1 eligibility", () => {
 
   it("the shared header fixture is itself eligible (guards the other test files)", () => {
     expect(isEligible(new Request("https://www.example.com/", { headers: BROWSER_HEADERS })).eligible).toBe(true);
+  });
+});
+
+describe("tsa-1 eligibility: the collector path is never eligible (G5-D-F1)", () => {
+  // A realistic browser navigation: every other rule would admit it.
+  const nav = (path: string, method = "GET") => req(path, {}, { method });
+
+  it("the default collector path /idr/e, without any configuration", () => {
+    expect(isEligible(nav("/idr/e"))).toEqual({ eligible: false, reason: "collector_path" });
+    expect(isEligible(nav("/idr/e"), {})).toEqual({ eligible: false, reason: "collector_path" });
+    expect(isEligible(nav("/idr/e"), undefined, undefined)).toEqual({ eligible: false, reason: "collector_path" });
+    expect(DEFAULT_COLLECTOR_PATH).toBe("/idr/e");
+  });
+
+  // Checked before the method rule, on its own: the exclusion does not rely on "method" (non-GET) to hold.
+  it.each(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])("%s to the collector path: collector_path, not method", (method) => {
+    expect(isEligible(nav("/idr/e", method))).toEqual({ eligible: false, reason: "collector_path" });
+  });
+
+  // Every spelling a router could dispatch to the collector route (TanStack Router: trailing slashes trimmed, static
+  // segments matched case-insensitively, percent-encoding decoded), plus deliberate over-exclusion of the same path.
+  it.each([
+    ["trailing slash", "/idr/e/"],
+    ["several trailing slashes", "/idr/e///"],
+    ["upper case", "/IDR/E"],
+    ["mixed case with trailing slash", "/Idr/E/"],
+    ["percent-encoded last segment", "/idr/%65"],
+    ["percent-encoded, lower-case hex", "/%69dr/e"],
+    ["every character percent-encoded", "/%69%64%72/%65"],
+    ["percent-encoded upper case", "/%49DR/%45"],
+    ["encoded separator %2F (over-excluded)", "/idr%2Fe"],
+    ["encoded separator %2f (over-excluded)", "/idr%2fe"],
+    ["encoded trailing slash", "/idr/e%2F"],
+    ["encoded backslash separator (over-excluded)", "/idr%5Ce"],
+    ["duplicate leading slash (kept by the URL parser)", "//idr/e"],
+    ["triple leading slash", "///idr/e"],
+    ["duplicate inner slash (over-excluded)", "/idr//e"],
+    ["dot segment (resolved by the URL parser)", "/idr/./e"],
+    ["parent segment (resolved by the URL parser)", "/x/../idr/e"],
+    ["encoded dot segment (resolved by the URL parser)", "/idr/%2e/e"],
+    ["backslash (a separator for http URLs)", "/idr\\e"],
+    ["query string", "/idr/e?utm_medium=email"],
+    ["fragment", "/idr/e#top"],
+  ])("variant: %s (%s)", (_n, path) => {
+    expect(isEligible(nav(path))).toEqual({ eligible: false, reason: "collector_path" });
+    expect(isEligible(nav(path, "HEAD"))).toEqual({ eligible: false, reason: "collector_path" });
+  });
+
+  // Never an unrelated page: no prefix match, no suffix match.
+  it.each([
+    "/idr/ex",
+    "/idr/e-mail",
+    "/idr/e.html",
+    "/idr",
+    "/idr/",
+    "/idr/e/x",
+    "/idr/f",
+    "/idre",
+    "/xidr/e",
+    "/e",
+    "/idr/e%20",
+    "/idr/e;x",
+    "/idr/%66",
+    "/blog/idr/e",
+  ])("non-match stays eligible: %s", (path) => {
+    expect(isEligible(nav(path))).toEqual({ eligible: true, ruleSet: "tsa-1" });
+  });
+
+  it("other exclusions keep their own reason (api_path is not turned into collector_path)", () => {
+    expect(isEligible(nav("/api/idr/e"))).toEqual({ eligible: false, reason: "api_path" });
+    expect(isEligible(nav("/pricing", "POST"))).toEqual({ eligible: false, reason: "method" });
+    expect(isEligible(nav("/pricing", "HEAD"))).toEqual({ eligible: false, reason: "method" });
+  });
+
+  it("includePaths cannot re-admit the collector path, and excludePaths is not needed for it", () => {
+    expect(isEligible(nav("/idr/e"), { includePaths: ["/idr/e", "/idr/*"] })).toEqual({ eligible: false, reason: "collector_path" });
+    expect(isEligible(nav("/idr/e"), { excludePaths: ["/idr/e"] })).toEqual({ eligible: false, reason: "collector_path" });
+  });
+
+  it("a custom collectorPath replaces the default, with the same variants", () => {
+    const custom = "/t/collect";
+    for (const path of ["/t/collect", "/T/Collect/", "/t/%63ollect", "//t/collect"]) {
+      expect(isEligible(nav(path), {}, custom)).toEqual({ eligible: false, reason: "collector_path" });
+    }
+    for (const path of ["/t/collected", "/t", "/t/collect/x"]) expect(isEligible(nav(path), {}, custom)).toEqual({ eligible: true, ruleSet: "tsa-1" });
+    // The default path is an ordinary page once the collector lives elsewhere.
+    expect(isEligible(nav("/idr/e"), {}, custom)).toEqual({ eligible: true, ruleSet: "tsa-1" });
+    // A configured trailing slash or upper case is normalised.
+    expect(isEligible(nav("/t/collect"), {}, "/T/Collect/")).toEqual({ eligible: false, reason: "collector_path" });
+  });
+
+  it("buildEntrance and resolveConfig apply the collectorPath option (default and custom)", () => {
+    const withIp = (path: string) => req(path, { "x-client-ip": "198.51.100.23" });
+    const options = { resolverUrl: "https://resolver.example.com", token: TEST_TOKEN, websiteId: "example-site", trustPolicy: { mode: "header", name: "x-client-ip" } as const, allowDocumentationRanges: true };
+    expect(buildEntrance(withIp("/idr/e"), options)).toEqual({ ok: false, stage: "eligibility", reason: "collector_path" });
+    expect(buildEntrance(withIp("/pricing"), options).ok).toBe(true);
+    expect(buildEntrance(withIp("/t/collect/"), { ...options, collectorPath: "/t/collect" })).toEqual({ ok: false, stage: "eligibility", reason: "collector_path" });
+    expect(buildEntrance(withIp("/idr/e"), { ...options, collectorPath: "/t/collect" }).ok).toBe(true);
+    expect(resolveConfig(options).collectorPath).toBe("/idr/e");
+    expect(resolveConfig({ ...options, collectorPath: "/T/Collect/" }).collectorPath).toBe("/t/collect");
+  });
+
+  const INVALID: Array<[string, unknown]> = [
+    ["empty", ""],
+    ["relative", "idr/e"],
+    ["root only", "/"],
+    ["root with trailing slash", "//"],
+    ["protocol-relative", "//idr/e"],
+    ["backslash host", "/\\idr/e"],
+    ["absolute URL", "https://www.example.com/idr/e"],
+    ["wildcard", "/idr/*"],
+    ["trailing wildcard", "/idr/e*"],
+    ["query string", "/idr/e?x=1"],
+    ["fragment", "/idr/e#x"],
+    ["percent-encoding", "/idr/%65"],
+    ["empty inner segment", "/idr//e"],
+    ["dot segment", "/idr/./e"],
+    ["parent segment", "/idr/../e"],
+    ["whitespace", "/idr e"],
+    ["control character", "/idr/e\n"],
+    ["too long (257 characters)", "/" + "a".repeat(256)],
+    ["number", 42],
+    ["object", { path: "/idr/e" }],
+  ];
+  it.each(INVALID)("an invalid collectorPath (%s) is rejected at configuration, without echoing it", (_n, value) => {
+    const options = { resolverUrl: "https://resolver.example.com", token: TEST_TOKEN, websiteId: "example-site", trustPolicy: { mode: "none" } as const, collectorPath: value as string };
+    let message = "";
+    try {
+      resolveConfig(options);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    // One fixed message for every invalid value: it never echoes what was configured.
+    expect(message).toBe("idr-tanstack: collectorPath must be a plain same-origin path such as /idr/e (no query string, fragment, wildcard, percent-encoding, empty or dot segment; at most 256 characters)");
+    expect(() => createIdrServerMiddleware(options)).toThrow(/collectorPath/);
+    expect(() => createCollectorRoute({ ...options, allow: ["cta_click"] })).toThrow(/collectorPath/);
+    expect(() => isEligible(nav("/pricing"), {}, value as string)).toThrow(/collectorPath/);
+  });
+
+  it("the longest accepted collectorPath is 256 characters", () => {
+    const longest = "/" + "a".repeat(255);
+    expect(isEligible(nav(longest), {}, longest)).toEqual({ eligible: false, reason: "collector_path" });
+  });
+
+  it("matching is linear: 16 KB adversarial paths are classified in under 20 ms", () => {
+    const paths = ["/" + "/".repeat(16_000) + "idr/e", "/idr" + "%2F".repeat(5_000) + "e", "/" + "%".repeat(16_000), "/" + "%41%".repeat(4_000) + "/idr/e"];
+    const t0 = performance.now();
+    const reasons = paths.map((p) => {
+      const r = isEligible(nav(p));
+      return r.eligible ? "eligible" : r.reason;
+    });
+    expect(performance.now() - t0).toBeLessThan(20);
+    expect(reasons.slice(0, 2)).toEqual(["collector_path", "collector_path"]);
+    expect(reasons[2]).toBe("eligible");
   });
 });

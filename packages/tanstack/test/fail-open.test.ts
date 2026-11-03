@@ -133,6 +133,26 @@ describe("fail-open", () => {
     await Promise.all(pending);
   });
 
+  it("a browser navigation to the collector path (G5-D-F1): the page is byte-identical and nothing reaches the resolver", async () => {
+    const fx = await startResolver({ kind: "ok" });
+    closers.push(() => fx.close());
+    const baseline = await snapshot(makePage());
+    const results: DeliveryResult[] = [];
+    const mw = createIdrServerMiddleware(baseOptions({ resolverUrl: fx.url, allowInsecureHttp: true, onDeliveryResult: (r) => void results.push(r) }));
+    for (const method of ["GET", "HEAD"]) {
+      for (const request of [reqWithIp("/idr/e"), new Request(reqWithIp("/idr/e"), { method })]) {
+        const w = withWaitUntil(request);
+        const t0 = performance.now();
+        const out = await mw({ request: w.request, next: async () => makePage() });
+        expect(performance.now() - t0).toBeLessThan(BUDGET_MS);
+        expect(await snapshot(out)).toEqual(baseline);
+        await Promise.all(w.pending);
+      }
+    }
+    expect(fx.captured).toHaveLength(0);
+    expect(results.map((r) => `${r.outcome}/${r.reason}`)).toEqual(Array(4).fill("skipped/eligibility:collector_path"));
+  });
+
   it("nothing is written to the console by any outcome", async () => {
     const spies = (["log", "info", "warn", "error", "debug"] as const).map((m) => vi.spyOn(console, m).mockImplementation(() => {}));
     const fx = await startResolver({ kind: "status", code: 500 });
