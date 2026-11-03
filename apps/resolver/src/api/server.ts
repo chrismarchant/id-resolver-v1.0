@@ -68,7 +68,8 @@ function sendError(reply: FastifyReply, error: ErrorCode): FastifyReply {
  * Defensive: the response is rebuilt from four allowlisted fields, so nothing
  * else in an outcome (activity block, company id, reason) can reach the
  * website. `recorded` is true only for a qualified outcome whose observation
- * for this entrance_id is durably recorded.
+ * for this entrance_id was confirmed durably recorded in time; false means
+ * "not confirmed" (a write past the deadline may still commit, CHR-66 F4).
  */
 function toResponse(outcome: ResolutionOutcome): EntranceResponse {
   const status = (RESOLUTION_STATUSES as readonly string[]).includes(outcome.status) ? outcome.status : "unavailable";

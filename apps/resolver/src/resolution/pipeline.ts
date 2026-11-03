@@ -5,10 +5,19 @@
  *
  * Runs in the service process under the runner (src/runtime/runner.ts). The
  * runner aborts `job.signal` at the request deadline: the pipeline then stops
- * at its next checkpoint, an in-flight provider call is aborted, and the
- * activity write is never started, so nothing is recorded after the caller
- * has been answered. A result the provider already returned is still
- * committed to the cache (fenced), so a paid answer is not lost.
+ * at its next checkpoint, an in-flight provider call is aborted, and an
+ * activity write that has not started is never started. A result the
+ * provider already returned is still committed to the cache (fenced), so a
+ * paid answer is not lost.
+ *
+ * An activity write that HAS started is never cancelled (CHR-66 F4, MAIN's
+ * decision: dropping a real observation is worse than a late one). When it
+ * outlives its budget the caller is answered `recorded: false`, which means
+ * "not confirmed within the deadline", NOT "not stored": the write keeps
+ * running (bounded by the pool's statement and query timeouts, tracked
+ * through onDeferred) and may commit after the answer, in which case the
+ * observation exists and the reporting feed serves it. A retry with the same
+ * entrance_id never records a second one.
  *
  * Dependencies are injected so the orchestration is testable with fakes.
  * The outcome never carries free text: only allowlisted statuses/reasons.
@@ -291,8 +300,9 @@ export async function runJob(
       return { ...o, activity: base };
     }
     try {
-      // The write is bounded by the request deadline: a slow database yields a
-      // qualified answer with recorded=false (not confirmed) instead of a lost answer.
+      // The ANSWER is bounded by the request deadline: a slow database yields a
+      // qualified answer with recorded=false (not confirmed) instead of a lost
+      // answer. The write itself is not cancelled and may still commit.
       const write = activity.recordObservation({
         scope: { installationId: config.installation_id, websiteId: config.website_id },
         companyId,
@@ -304,7 +314,8 @@ export async function runJob(
       const r = await new Promise<RecordObservationResult>((resolve, reject) => {
         const t = setTimeout(() => {
           // The write keeps running (bounded by the pool's statement and query
-          // timeouts); hand it to the runner so shutdown drains it.
+          // timeouts) and may commit after the caller has been answered
+          // recorded=false; hand it to the runner so shutdown drains it.
           deps.onDeferred?.(write.then(noop, noop));
           reject(new ActivityTimeoutError());
         }, Math.max(1, remaining - ACTIVITY_DEADLINE_MARGIN_MS));

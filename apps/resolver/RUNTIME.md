@@ -124,6 +124,10 @@ These are accepted by D1 and listed for the independent review (CHR-66):
   from `process.env` does not change it.
 * **Work after the answer.** A job that overruns its deadline keeps running
   (bounded) after the caller got `unavailable`: a provider result received
-  in that window is committed to the cache, and a delayed observation write
-  may still land, so `recorded: false` means "not confirmed", never "not
-  recorded".
+  in that window is committed to the cache. An observation write that has
+  started is never cancelled (CHR-66 F4): when it outlives its budget the
+  caller gets `qualified` with `recorded: false`, and the write may still
+  commit afterwards, after which the reporting feed serves it. So
+  `recorded: false` means "not confirmed within the deadline", never "not
+  recorded" (`docs/contracts/entrance.v1.md`); retrying the same
+  `entrance_id` never adds a second observation.

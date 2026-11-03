@@ -33,7 +33,7 @@ removed because it returns company data to the website.
 |---|---|
 | `status` | one of `qualified, no_match, excluded, unknown, pending, ineligible, disabled, uncertain, unavailable` (unchanged from V0.1) |
 | `source` | `cache \| provider \| none` |
-| `recorded` | `true` only when a company observation was durably recorded for this `entrance_id` (qualified outcomes only, including cache hits) |
+| `recorded` | `true` only when a company observation was **confirmed** durably recorded for this `entrance_id` before the answer (qualified outcomes only, including cache hits). `false` means **"not confirmed within the deadline"**, not "not stored": an observation write still running at the deadline is not cancelled and may commit after the answer, in which case the observation exists and the reporting feed serves it. Repeating the `entrance_id` never records a second observation. |
 
 **The response never contains company identity, a company id, an IP, a
 fingerprint or provider data** (D2). Every status lets the website continue

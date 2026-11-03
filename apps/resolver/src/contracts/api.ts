@@ -84,7 +84,12 @@ export interface EntranceResponse {
   version: typeof API_VERSION;
   status: ResolutionStatus;
   source: ResolutionSource;
-  /** true only when a company observation is durably recorded for this entrance_id (qualified outcomes only). */
+  /**
+   * true only when a company observation is confirmed durably recorded for
+   * this entrance_id within the deadline (qualified outcomes only). false
+   * means "not confirmed", not "not stored": a write still running at the
+   * deadline is not cancelled and may commit afterwards (CHR-66 F4).
+   */
   recorded: boolean;
 }
 

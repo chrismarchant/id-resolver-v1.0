@@ -570,16 +570,23 @@ describe("runJob: company activity", () => {
     expect(activityLogs(t)).toEqual([expect.objectContaining({ event: "activity_write_failed", reason: "deadline_exceeded", source: "cache" })]);
   });
 
-  it("a slow activity write is abandoned at the deadline and reported as not recorded", async () => {
+  it("a slow activity write is not awaited past the deadline: answered recorded=false (not confirmed), never cancelled, and it still lands afterwards (CHR-66 F4)", async () => {
     const t = setup();
     const key = keyFor(t.config);
     t.repos.cache.seed(key, { status: "qualified", company: { domain: "example.com", organisationName: "Example Ltd", qualificationCategory: "COM" }, checkedAt: new Date(), ttlMs: 60_000 });
-    t.repos.activity.delayMs = 2_000;
+    t.repos.activity.delayMs = 600;
+    const deferred: Promise<void>[] = [];
     const started = Date.now();
-    const o = await runJob(t.deps, t.config, job(IP, 400));
+    const o = await runJob({ ...t.deps, onDeferred: (p) => deferred.push(p) }, t.config, job(IP, 400));
     expect(Date.now() - started).toBeLessThan(400);
     expect(o).toMatchObject({ status: "qualified", source: "cache", activity: { previously_seen: null, recorded: false } });
     expect(activityLogs(t)).toEqual([expect.objectContaining({ event: "activity_write_failed", reason: "deadline_exceeded" })]);
+    // At answer time nothing is stored; the write is handed to the runner, not cancelled ...
+    expect(t.repos.activity.observations).toHaveLength(0);
+    expect(deferred).toHaveLength(1);
+    // ... and commits after the answer: recorded=false meant "not confirmed", not "not stored".
+    await Promise.all(deferred);
+    expect(t.repos.activity.observations).toHaveLength(1);
   });
 
   it("delayed best-effort accounting cannot consume the activity or response budget (Warp P2-3): cache hit", async () => {
