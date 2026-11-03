@@ -1,0 +1,118 @@
+{
+  "sinkMode": "ok",
+  "target": "cloudflare",
+  "node": "v22.23.4",
+  "lifecycle": [
+    {
+      "mode": "none",
+      "status": 200,
+      "ttfb_ms": 13,
+      "total_ms": 15,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "env": "process.env.IDR_ENV_PROBE=present",
+        "ua": "Cloudflare-Workers",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "unawaited",
+      "status": 200,
+      "ttfb_ms": 11,
+      "total_ms": 12,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "awaited",
+      "status": 200,
+      "ttfb_ms": 325,
+      "total_ms": 326,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": -14,
+      "diag": {
+        "result": "sink:200",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "cfworkers",
+      "status": 200,
+      "ttfb_ms": 9,
+      "total_ms": 10,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 298,
+      "diag": {
+        "waitUntil": "cloudflare:workers ok",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "request",
+      "status": 200,
+      "ttfb_ms": 8,
+      "total_ms": 9,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 302,
+      "diag": {
+        "request": "waitUntil=function runtime.cf.ctx.waitUntil=function",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "event",
+      "status": 200,
+      "ttfb_ms": 10,
+      "total_ms": 11,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "event": "ev=false keys= wu=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    }
+  ],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 15,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "7a5k5wWtaGClzrizZynF9Q",
+      "occurred_at": "2026-11-03T12:40:56Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":3}"
+    ]
+  }
+}

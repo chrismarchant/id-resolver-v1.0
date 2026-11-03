@@ -1,0 +1,27 @@
+{
+  "sinkMode": "500",
+  "target": "cloudflare",
+  "node": "v22.23.4",
+  "lifecycle": [],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 21,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "Kt5iGOzEPkeJ26C_XCvRfQ",
+      "occurred_at": "2026-11-03T12:40:10Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"dropped\",\"reason\":\"http_5xx\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":500,\"durationMs\":6}"
+    ]
+  }
+}
