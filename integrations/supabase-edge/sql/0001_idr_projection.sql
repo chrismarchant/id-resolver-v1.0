@@ -13,6 +13,14 @@
 -- Roles: relies on the standard Supabase roles anon, authenticated and
 -- service_role. Writes happen only through the idr_* functions below, which
 -- only service_role may execute (the Edge Function uses the service key).
+--
+-- The whole script is ONE transaction: every statement in it is
+-- transaction-safe (no CREATE INDEX CONCURRENTLY, VACUUM or similar), so a
+-- failure part-way leaves the previous version untouched. idr_schema_version()
+-- is defined last, so it can only report this version once everything before
+-- it has been applied.
+
+begin;
 
 create table if not exists public.idr_companies (
   installation_id   text   not null,
@@ -253,26 +261,16 @@ end $$;
 -- privilege elevation is needed and a mistake here cannot widen access.
 -- ---------------------------------------------------------------------------
 
--- The projection schema this script installs. The Edge function refuses to
--- run (status schema_mismatch, HTTP 500) unless it matches the version its
--- code expects, so code/SQL skew can never silently drop gap evidence.
--- 4 = this release (gap log with compare-and-set, reset_from_cursor re-check
--- after a 400 and after a voluntary resync,
--- generations); earlier releases had no version function.
-create or replace function public.idr_schema_version()
-returns integer
-language sql
-immutable
-set search_path = ''
-as $$ select 4 $$;
-
+-- plpgsql (not sql) so that its reference to idr_schema_version(), which is
+-- defined at the very end of this script, is resolved at call time.
 create or replace function public.idr_get_sync_state(p_installation_id text)
 returns jsonb
-language sql
+language plpgsql
 stable
 set search_path = ''
 as $$
-  select coalesce(
+begin
+  return coalesce(
     (select jsonb_build_object('cursor', s.cursor, 'needs_resync', s.needs_resync, 'reset_from_cursor', s.reset_from_cursor)
        from public.idr_sync_state s where s.installation_id = p_installation_id),
     jsonb_build_object('cursor', null, 'needs_resync', false, 'reset_from_cursor', null))
@@ -280,6 +278,7 @@ as $$
          select 1 from public.idr_sync_gaps g
           where g.installation_id = p_installation_id and g.resolved_at is null),
        'schema_version', public.idr_schema_version());
+end;
 $$;
 
 -- Applies one feed page atomically, only if the stored cursor equals
@@ -588,7 +587,6 @@ as $$
     and (o.observed_at at time zone 'utc')::date between p_from and p_to;
 $$;
 
-revoke all on function public.idr_schema_version() from public, anon, authenticated;
 revoke all on function public.idr_get_sync_state(text) from public, anon, authenticated;
 revoke all on function public.idr_apply_feed_page(text, text, text, jsonb, text) from public, anon, authenticated;
 revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated;
@@ -598,7 +596,6 @@ revoke all on function public.idr_reconcile_counts(text, date, date) from public
 revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated;
 revoke all on function public.idr_resolve_sync_gaps(text, text) from public, anon, authenticated;
 revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
-grant execute on function public.idr_schema_version() to service_role;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
@@ -609,3 +606,23 @@ grant execute on function public.idr_record_sync_gap(text, text, text) to servic
 grant execute on function public.idr_resolve_sync_gaps(text, text) to service_role;
 -- A trigger function cannot be called directly; the grant only mirrors the others.
 grant execute on function public.idr_sync_gaps_guard() to service_role;
+
+-- ---------------------------------------------------------------------------
+-- LAST: the projection schema this script installs. The Edge function refuses
+-- to run (status schema_mismatch, HTTP 500) unless it matches the version its
+-- code expects, so code/SQL skew can never silently drop gap evidence.
+-- 4 = this release (gap log with compare-and-set, reset_from_cursor re-check
+-- after a 400 and after a voluntary resync, generations); earlier releases had
+-- no version function. Defined after everything else, inside the same
+-- transaction, so it never reports 4 for a partially applied script.
+-- ---------------------------------------------------------------------------
+create or replace function public.idr_schema_version()
+returns integer
+language sql
+immutable
+set search_path = ''
+as $$ select 4 $$;
+revoke all on function public.idr_schema_version() from public, anon, authenticated;
+grant execute on function public.idr_schema_version() to service_role;
+
+commit;

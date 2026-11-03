@@ -28,7 +28,13 @@ existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_s
 `idr_record_sync_gap` with new signatures, so re-run the SQL and redeploy the function together). It creates the
 projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
-execution to `service_role` only.
+execution to `service_role` only. The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
+transaction-safe): if any statement fails, nothing is applied and the previous version stays
+intact, even with `psql -f`, which by default continues after an error. `idr_schema_version()` is
+defined last, so it reports the new version only for a completely applied script. Apply it as one
+script (SQL editor or `psql -f`); with a migration runner that wraps each file in its own
+transaction, check how it treats the script's own `BEGIN`/`COMMIT` (not verified for
+`supabase db push`).
 
 **Before upgrading an existing project**, check its sync state:
 
