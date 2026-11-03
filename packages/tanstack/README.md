@@ -73,7 +73,8 @@ exactly what `next()` returned, so it composes with any other middleware.
 | `maxInFlight` | 50 (1 to 500) | reports in flight per process/isolate; extra ones are dropped (`overload`) |
 | `onUnsupportedBackground`, `blockingBudgetMs` | `"drop"`, 250 (50 to 1000) | edge isolate with no `waitUntil` only: drop, or block for at most the budget |
 | `eligibility` | `{}` | `includePaths`, `excludePaths` (exact path, `/prefix/*`, or RegExp), `extraBotPatterns` |
-| `pageKeyMapper` | `defaultPageKeyMapper` | replaces the conservative default (see below). Use `compileRouteTemplates(["/blog/:slug", "/products/:id"])` when you know your routes |
+| `pageKeyMapper` | none | your own mapper, e.g. `compileRouteTemplates(["/blog/:slug", "/products/:id"])`. The conservative default mapper still runs after it (see below) |
+| `pageKeyDefaultMapper` | `true` | `false` switches the default mapper off so that `pageKeyMapper` alone decides; requires `pageKeyMapper` (see below) |
 | `siteHosts` | host of the request URL | host names counted as "internal" referrers |
 | `onDeliveryResult` | none | receives non-identifying status (below) |
 | `allowDocumentationRanges` | `false` | accept RFC 5737/3849 IPs; tests and local development only |
@@ -118,24 +119,54 @@ or query string is sent.
 ### `page_key` privacy: the default mapper
 
 Dynamic path segments can carry reset tokens, e-mail addresses or order numbers, and `page_key` is stored by the resolver
-and served in the reporting feed. Unless you pass your own `pageKeyMapper`, `defaultPageKeyMapper` rewrites such segments:
+and served in the reporting feed. `defaultPageKeyMapper` rewrites such segments, and it always applies unless you
+explicitly switch it off with `pageKeyDefaultMapper: false`:
 
 | Segment | Becomes |
 | --- | --- |
-| e-mail address (also percent-encoded `%40`) | `:email` |
+| any segment over 128 characters (not classified, which bounds the work per request) | `:token` |
+| e-mail address (also percent-encoded `%40`, and several addresses in one segment) | `:email` |
 | UUID | `:uuid` |
 | digit run of 4 or more (a plain year such as `2026` is kept) | `:n`, in place (`order-12345` becomes `order-:n`) |
 | hex/base64url token of 16+ characters that is not a readable slug, or a 12+ character run mixing letters and digits | `:token` |
 
-Readable slugs (`pricing`, `case-studies`, `2026-11-03-product-update`) are kept. This is a heuristic, not a guarantee: to
-control exactly what is sent, supply your own mapper. It replaces the default entirely:
+The mapper runs on the response path, so its cost is bounded: every check is linear in the segment length, and
+mapping stops once the output passes the 256-character `page_key` limit. The tests require a 16 KB adversarial path to
+map in under 20 ms (it takes well under 1 ms on a development machine).
+
+Readable slugs (`pricing`, `case-studies`, `2026-11-03-product-update`) are kept. This is a heuristic, not a guarantee.
+Where you know your routes, add your own mapper. The default still runs after it, so a path your mapper does not match
+is never sent raw:
 
 ```ts
-import { compileRouteTemplates, defaultPageKeyMapper } from "@salescrusader/idr-tanstack";
-// Known routes only; anything else falls through to the conservative default.
-const templates = compileRouteTemplates(["/blog/:slug", "/products/:id"]);
-pageKeyMapper: (path) => templates(path) ?? defaultPageKeyMapper(path),
+import { compileRouteTemplates } from "@salescrusader/idr-tanstack";
+
+createIdrServerMiddleware({
+  // ...
+  pageKeyMapper: compileRouteTemplates(["/blog/:slug", "/products/:id"]),
+});
+// /blog/my-post            -> /blog/:slug       (template; placeholders such as :slug pass the default unchanged)
+// /orders/12345            -> /orders/:n        (no template matched: the default applies to the path)
+// /reset/<hex token>       -> /reset/:token
 ```
+
+How the two combine:
+
+* Your mapper returns a string: the default runs on that string. Template output such as `/blog/:slug` comes through
+  unchanged. Literal segments of a template that look like identifiers (a 4+ digit run, a long token) are rewritten too.
+* Your mapper returns `null`/`undefined` (no match) or throws: the default runs on the path.
+* The result is cut to 256 characters on a segment boundary. A result that is still not a valid `page_key` (no leading
+  `/`, a `?`, `#`, whitespace or control character) is sent as `/`. The unmapped path is never sent in its place.
+
+`pageKeyDefaultMapper: false` is an explicit opt-out for sites whose own mapper guarantees that no identifier (token,
+e-mail, order number, user name) can reach the resolver. Your mapper then alone decides, and a path it returns `null` for
+is sent as is (still capped and validated). It requires `pageKeyMapper`; on its own it is a configuration error.
+
+**Upgrade note.** Earlier versions applied a site's `pageKeyMapper` *instead of* the default, so with
+`pageKeyMapper: compileRouteTemplates([...])` every path that matched no template was sent raw. Such integrations now
+also get the default for those paths, with no code change. The previously documented composition
+`(path) => templates(path) ?? defaultPageKeyMapper(path)` keeps working but is now redundant. Set
+`pageKeyDefaultMapper: false` only if you need the old replace-the-default behaviour.
 
 ## Latency and failure behaviour (verified)
 
@@ -212,7 +243,9 @@ second pass, a wrong token). Pages must render exactly as before with unchanged 
 
 `buildEntrance(request, options)` (eligibility, trust policy and payload, nothing sent), `selectClientIp(request,
 trustPolicy)`, `isEligible(request, rules)`, `classifyAcquisition({ referrer, siteHosts, utmMedium })`,
-`normalisePageKey(pathOrUrl, mapper?)`, `compileRouteTemplates(templates)`, `parsePublicIp(text)`, `checkConnectivity(options)`.
+`normalisePageKey(pathOrUrl, mapper?)` (applies exactly the mapper it is given; pass
+`composePageKeyMapper(yourMapper)` to get the adapter's composition with the default), `compileRouteTemplates(templates)`,
+`defaultPageKeyMapper`, `parsePublicIp(text)`, `checkConnectivity(options)`.
 
 ## Development
 

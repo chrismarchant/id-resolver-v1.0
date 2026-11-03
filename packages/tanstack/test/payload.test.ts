@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildEntrance, classifyAcquisition, compileRouteTemplates, generateEntranceId, normalisePageKey, defaultPageKeyMapper, resolveConfig, ACQUISITION_VALUES } from "../src/index.js";
+import { buildEntrance, classifyAcquisition, compileRouteTemplates, composePageKeyMapper, generateEntranceId, normalisePageKey, defaultPageKeyMapper, resolveConfig, ACQUISITION_VALUES, type PageKeyMapper } from "../src/index.js";
 import { assemblePayload } from "../src/payload.js";
 import { baseOptions, PUBLIC_IP, PUBLIC_IP_V6, reqWithIp, validateEntranceV1 } from "./helpers.js";
 
@@ -46,17 +46,24 @@ describe("normalisePageKey", () => {
     expect(normalisePageKey("/" + "a".repeat(400))).toBe("/");
   });
 
-  it("applies a route-template mapper and falls back safely", () => {
+  it("applies exactly the mapper it is given; an unusable output becomes / and never the unmapped path (CHR-66 N2)", () => {
     const mapper = compileRouteTemplates(["/blog/:slug", "/products/:id/reviews", "/"]);
     expect(normalisePageKey("/blog/my-secret-post", mapper)).toBe("/blog/:slug");
     expect(normalisePageKey("/products/12345/reviews", mapper)).toBe("/products/:id/reviews");
+    // null means "keep the path" for a bare mapper; the adapter composes the default after it (see CHR-66 N3 tests).
     expect(normalisePageKey("/products/12345", mapper)).toBe("/products/12345");
     expect(normalisePageKey("/", mapper)).toBe("/");
-    expect(normalisePageKey("/blog/x", () => { throw new Error("boom"); })).toBe("/blog/x");
-    expect(normalisePageKey("/blog/x", () => "no-leading-slash")).toBe("/blog/x");
-    expect(normalisePageKey("/blog/x", () => "/has?query")).toBe("/blog/x");
-    expect(normalisePageKey("/blog/x", () => "/" + "z".repeat(300))).toBe("/blog/x");
     expect(normalisePageKey("/blog/x", () => null)).toBe("/blog/x");
+    expect(normalisePageKey("/blog/x", () => undefined)).toBe("/blog/x");
+    expect(normalisePageKey("/blog/secret", () => { throw new Error("boom"); })).toBe("/");
+    expect(normalisePageKey("/blog/secret", () => "no-leading-slash")).toBe("/");
+    expect(normalisePageKey("/blog/secret", () => "/has?query")).toBe("/");
+    expect(normalisePageKey("/blog/secret", () => "/has space")).toBe("/");
+    expect(normalisePageKey("/blog/secret", () => 42 as unknown as string)).toBe("/");
+    expect(normalisePageKey("/blog/secret", () => "/" + "z".repeat(300))).toBe("/");
+    // An over-long output is cut back to a segment boundary, never replaced by the raw path.
+    const long = "/kept" + "/seg".repeat(100);
+    expect(normalisePageKey("/blog/secret", () => long)).toBe("/kept" + "/seg".repeat(62));
   });
 });
 
@@ -224,16 +231,215 @@ describe("defaultPageKeyMapper (conservative page_key default)", () => {
     expect(normalisePageKey(input, defaultPageKeyMapper)).toBe(expected);
   });
 
-  it("is on by default and a site-supplied mapper replaces it", () => {
+  it("is on by default, and a site-supplied mapper is composed with it instead of replacing it", () => {
     const base = baseOptions();
+    expect(resolveConfig(base).pageKeyMapper).toBe(defaultPageKeyMapper);
     expect(resolveConfig(base).pageKeyMapper("/reset/9f86d081884c7d659a2feaa0c55ad015")).toBe("/reset/:token");
     const own = (p: string): string => p;
-    expect(resolveConfig({ ...base, pageKeyMapper: own }).pageKeyMapper).toBe(own);
+    const composed = resolveConfig({ ...base, pageKeyMapper: own }).pageKeyMapper;
+    expect(composed).not.toBe(own);
+    expect(composed("/reset/9f86d081884c7d659a2feaa0c55ad015")).toBe("/reset/:token");
   });
 
   it("the built entrance carries no identifier from the path", async () => {
     const out = buildEntrance(reqWithIp("/reset/9f86d081884c7d659a2feaa0c55ad015?email=person%40example.com"), baseOptions());
     expect(out.ok).toBe(true);
     expect(JSON.stringify(out)).not.toContain("9f86d081884c7d659a2feaa0c55ad015");
+  });
+});
+
+describe("page_key mapping cost is bounded (CHR-66 N6)", () => {
+  // The reviewer's adversarial shapes (review probe f7/redos.mts). The earlier
+  // e-mail regex backtracked quadratically: ~313 ms of CPU for a 16 KB path,
+  // spent before the middleware returns the response.
+  const shapes: Record<string, (n: number) => string> = {
+    "x@ + dots + @": (n) => "/x@" + ".".repeat(n) + "@",
+    "x@ + a. pairs + @": (n) => "/x@" + "a.".repeat(n / 2) + "@",
+    "many @": (n) => "/" + "a@".repeat(n / 2),
+    digits: (n) => "/" + "1".repeat(n),
+    "slug parts": (n) => "/" + "ab-".repeat(n / 3),
+    // The same shapes in segments of at most 128 characters, so every segment is classified.
+    "128-char x@ + dots + @ segments": (n) => ("/x@" + ".".repeat(124) + "@").repeat(Math.ceil(n / 128)),
+    "128-char a@a@ segments": (n) => ("/" + "a@".repeat(64)).repeat(Math.ceil(n / 129)),
+    "short digit segments": (n) => "/12345".repeat(Math.ceil(n / 6)),
+  };
+
+  function bestOf3Ms(fn: () => void): number {
+    let best = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t0 = performance.now();
+      fn();
+      best = Math.min(best, performance.now() - t0);
+    }
+    return best;
+  }
+
+  it.each(Object.keys(shapes))("a 16 KB %s path maps in under 20 ms", (name) => {
+    const path = new URL("https://s.example" + shapes[name]!(16_000)).pathname;
+    expect(path.length).toBeGreaterThanOrEqual(15_900);
+    const viaDefault = bestOf3Ms(() => normalisePageKey(path, defaultPageKeyMapper));
+    const viaConfig = bestOf3Ms(() => normalisePageKey(path, resolveConfig(baseOptions()).pageKeyMapper));
+    const viaBuild = bestOf3Ms(() => buildEntrance(reqWithIp(path), baseOptions()));
+    expect(viaDefault).toBeLessThan(20);
+    expect(viaConfig).toBeLessThan(20);
+    expect(viaBuild).toBeLessThan(20);
+    const k = normalisePageKey(path, defaultPageKeyMapper);
+    expect(k.length).toBeLessThanOrEqual(256);
+    expect(/[?#\s\u0000-\u001f\u007f]/.test(k)).toBe(false);
+  });
+
+  it("a segment over 128 characters becomes :token without classification; 128 is still classified", () => {
+    const slug128 = Array.from({ length: 31 }, () => "abc").join("-") + "-abcd"; // a readable slug
+    expect(slug128.length).toBe(128);
+    expect(normalisePageKey(`/blog/${slug128}`, defaultPageKeyMapper)).toBe(`/blog/${slug128}`);
+    expect(normalisePageKey(`/blog/${slug128}x`, defaultPageKeyMapper)).toBe("/blog/:token");
+    expect(normalisePageKey(`/u/${"a".repeat(120)}%40example.com`, defaultPageKeyMapper)).toBe("/u/:token");
+  });
+
+  it("the linear e-mail check keeps the earlier matches and also catches two addresses in one segment", () => {
+    const rows: Array<[string, string]> = [
+      ["/unsubscribe/person@example.com", "/unsubscribe/:email"],
+      ["/unsubscribe/person%40example.com", "/unsubscribe/:email"],
+      ["/u/first.last+tag@example.org/prefs", "/u/:email/prefs"],
+      ["/u/person@mail.example.test", "/u/:email"],
+      ["/u/person@example.com.", "/u/:email"],
+      ["/u/person@example..com", "/u/:email"],
+      ["/share/jane@example.com,john@example.com", "/share/:email"],
+      ["/share/jane%40example.com%2Cjohn%40example.com", "/share/:email"],
+      // Not an address: no local part, no dot, or the dot at an edge of the domain.
+      ["/x/@example.com", "/x/@example.com"],
+      ["/x/a@localhost", "/x/a@localhost"],
+      ["/x/a@.com", "/x/a@.com"],
+      ["/x/a@com.", "/x/a@com."],
+    ];
+    for (const [input, expected] of rows) expect(normalisePageKey(input, defaultPageKeyMapper), input).toBe(expected);
+  });
+});
+
+// The reviewer's cases (review probe f7/probe.mts). Identifiers are synthetic.
+const LONG_TAIL = "/" + Array.from({ length: 12 }, (_, i) => `annual-report-section-${i}`).join("/");
+const LONG_EMAIL_PATH = "/u/jane.doe@example.com" + LONG_TAIL; // 313 characters
+const LONG_TOKEN_PATH = "/reset/Zx9kQ2mP4rT8vW1y" + LONG_TAIL; // 313 characters
+const REVIEW_UUID = ["3c9e2f1a", "8b7d", "4e6f", "9a0b", "1c2d3e4f5a6b"].join("-");
+
+/** The key is a whole-segment prefix of `full`: cut at a "/" boundary, never inside a segment. */
+function expectSegmentPrefix(key: string, full: string): void {
+  expect(full.startsWith(key)).toBe(true);
+  expect(full.length === key.length || full[key.length] === "/").toBe(true);
+}
+
+describe("an over-long mapped path is capped, never sent unmapped (CHR-66 N2)", () => {
+  it("the reviewer's 313-character paths keep their mapping", () => {
+    expect(LONG_EMAIL_PATH.length).toBe(313);
+    expect(LONG_TOKEN_PATH.length).toBe(313);
+    for (const mapper of [defaultPageKeyMapper, resolveConfig(baseOptions()).pageKeyMapper]) {
+      const e = normalisePageKey(LONG_EMAIL_PATH, mapper);
+      const t = normalisePageKey(LONG_TOKEN_PATH, mapper);
+      expect(e.length).toBeLessThanOrEqual(256);
+      expect(t.length).toBeLessThanOrEqual(256);
+      expect(e).not.toContain("jane");
+      expect(e).not.toContain("example.com");
+      expect(t).not.toContain("Zx9kQ2mP4rT8vW1y");
+      expectSegmentPrefix(e, "/u/:email" + LONG_TAIL);
+      expectSegmentPrefix(t, "/reset/:token" + LONG_TAIL);
+      expect(e.startsWith("/u/:email/annual-report-section-0/")).toBe(true);
+      expect(t.startsWith("/reset/:token/annual-report-section-0/")).toBe(true);
+    }
+  });
+
+  it("the built entrance carries the capped mapped key", () => {
+    for (const path of [LONG_EMAIL_PATH, LONG_TOKEN_PATH]) {
+      const r = buildEntrance(reqWithIp(path), baseOptions());
+      if (!r.ok) throw new Error("expected ok");
+      expect(validateEntranceV1(r.payload)).toEqual([]);
+      expect(r.payload.page_key).not.toMatch(/jane|Zx9kQ2mP4rT8vW1y/);
+    }
+  });
+
+  it("a mapped path of exactly 256 characters is kept; one character more is cut at the boundary", () => {
+    const exact = "/" + "a".repeat(100) + "/" + "b".repeat(100) + "/" + "c".repeat(53);
+    expect(exact.length).toBe(256);
+    expect(normalisePageKey(exact, defaultPageKeyMapper)).toBe(exact);
+    expect(normalisePageKey(exact + "c", defaultPageKeyMapper)).toBe("/" + "a".repeat(100) + "/" + "b".repeat(100));
+  });
+});
+
+describe("a site mapper never bypasses the default mapper (CHR-66 N3)", () => {
+  // The form the README shows: route templates only.
+  const templates = compileRouteTemplates(["/blog/:slug", "/products/:id", "/p/:productId/reviews/:review_id", "/org/:orgSlug/members"]);
+  const withTemplates = resolveConfig(baseOptions({ pageKeyMapper: templates })).pageKeyMapper;
+  const key = (path: string, mapper = withTemplates): string => normalisePageKey(new URL("https://site.example" + path).pathname, mapper);
+
+  it.each<[string, string]>([
+    ["/reset-password/9f86d081884c7d659a2feaa0c55ad015", "/reset-password/:token"],
+    ["/unsubscribe/jane.doe%40example.com", "/unsubscribe/:email"],
+    [`/account/${REVIEW_UUID}/settings`, "/account/:uuid/settings"],
+    ["/orders/12345", "/orders/:n"],
+  ])("with templates only, an unmatched %j is still mapped to %j", (path, expected) => {
+    expect(key(path)).toBe(expected);
+  });
+
+  it("with templates only, the reviewer's 313-character paths are mapped and capped", () => {
+    expect(key(LONG_EMAIL_PATH)).not.toContain("jane");
+    expect(key(LONG_TOKEN_PATH)).not.toContain("Zx9kQ2mP4rT8vW1y");
+    expectSegmentPrefix(key(LONG_EMAIL_PATH), "/u/:email" + LONG_TAIL);
+  });
+
+  it.each<[string, string]>([
+    ["/blog/my-secret-post", "/blog/:slug"],
+    ["/blog/9f86d081884c7d659a2feaa0c55ad015", "/blog/:slug"],
+    ["/products/12345", "/products/:id"],
+    ["/p/12345/reviews/67890", "/p/:productId/reviews/:review_id"],
+    ["/org/acme-corp/members", "/org/:orgSlug/members"],
+  ])("a template match %j stays exactly %j", (path, expected) => {
+    expect(key(path)).toBe(expected);
+  });
+
+  it("the default runs on the path when the site mapper returns null, a non-string or throws", () => {
+    const token = "/reset/9f86d081884c7d659a2feaa0c55ad015";
+    for (const own of [() => null, () => undefined, () => 42 as unknown as string, () => { throw new Error("boom"); }]) {
+      expect(key(token, resolveConfig(baseOptions({ pageKeyMapper: own })).pageKeyMapper)).toBe("/reset/:token");
+    }
+    // ...and on its output when it returns a string.
+    const echo = resolveConfig(baseOptions({ pageKeyMapper: (p) => p.replace("/x/", "/y/") })).pageKeyMapper;
+    expect(key("/x/person%40example.com", echo)).toBe("/y/:email");
+  });
+
+  it("buildEntrance and the middleware config use the composed mapper", () => {
+    const r = buildEntrance(reqWithIp("/reset-password/9f86d081884c7d659a2feaa0c55ad015?x=1"), baseOptions({ pageKeyMapper: templates }));
+    if (!r.ok) throw new Error("expected ok");
+    expect(r.payload.page_key).toBe("/reset-password/:token");
+    const m = buildEntrance(reqWithIp("/blog/my-secret-post"), baseOptions({ pageKeyMapper: templates }));
+    if (!m.ok) throw new Error("expected ok");
+    expect(m.payload.page_key).toBe("/blog/:slug");
+  });
+
+  it("pageKeyDefaultMapper: false is the explicit opt-out: the site mapper alone applies", () => {
+    const optOut = resolveConfig(baseOptions({ pageKeyMapper: templates, pageKeyDefaultMapper: false })).pageKeyMapper;
+    expect(optOut).toBe(templates);
+    expect(key("/blog/my-secret-post", optOut)).toBe("/blog/:slug");
+    // Unmatched paths are sent as is: this is what the site opted into.
+    expect(key("/orders/12345", optOut)).toBe("/orders/12345");
+    // Even opted out, an over-long or unusable output never becomes the raw path.
+    const longOwn = resolveConfig(baseOptions({ pageKeyMapper: () => "/kept" + "/seg".repeat(100), pageKeyDefaultMapper: false })).pageKeyMapper;
+    expect(key("/reset/secret", longOwn)).toBe("/kept" + "/seg".repeat(62));
+    const throwing = resolveConfig(baseOptions({ pageKeyMapper: () => { throw new Error("boom"); }, pageKeyDefaultMapper: false })).pageKeyMapper;
+    expect(key("/reset/secret", throwing)).toBe("/");
+    // An explicit true is the default behaviour.
+    const explicitOn = resolveConfig(baseOptions({ pageKeyMapper: templates, pageKeyDefaultMapper: true })).pageKeyMapper;
+    expect(key("/orders/12345", explicitOn)).toBe("/orders/:n");
+  });
+
+  it("rejects an opt-out without a site mapper, and malformed values", () => {
+    expect(() => resolveConfig(baseOptions({ pageKeyDefaultMapper: false }))).toThrow(/pageKeyDefaultMapper: false requires your own pageKeyMapper/);
+    expect(() => resolveConfig(baseOptions({ pageKeyDefaultMapper: "no" as unknown as boolean }))).toThrow(/pageKeyDefaultMapper must be true or false/);
+    expect(() => resolveConfig(baseOptions({ pageKeyMapper: "/blog/:slug" as unknown as PageKeyMapper }))).toThrow(/pageKeyMapper must be a function/);
+    expect(resolveConfig(baseOptions({ pageKeyMapper: null as unknown as PageKeyMapper })).pageKeyMapper).toBe(defaultPageKeyMapper);
+  });
+
+  it("composePageKeyMapper is exported for direct use with normalisePageKey", () => {
+    expect(normalisePageKey("/orders/12345", composePageKeyMapper(templates))).toBe("/orders/:n");
+    expect(normalisePageKey("/orders/12345", composePageKeyMapper(templates, false))).toBe("/orders/12345");
+    expect(composePageKeyMapper(undefined)).toBe(defaultPageKeyMapper);
   });
 });

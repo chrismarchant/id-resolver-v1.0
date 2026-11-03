@@ -15,7 +15,9 @@
  *   - a Railway private hostname other than the generic postgres.railway.internal
  *   - a UUID literal (Railway project/service/environment/deployment ids are UUIDs)
  *   - a public IPv4 literal outside private, reserved and RFC 5737 documentation ranges
- *   - an e-mail address outside RFC 2606 reserved/example domains
+ *   - an e-mail address outside RFC 2606 reserved/example domains (git noreply
+ *     addresses such as noreply@anthropic.com and *@users.noreply.github.com
+ *     are allowed)
  *   - a public IPv6 literal (global unicast, first three bits 001, outside
  *     documentation 2001:db8::/32, 3fff::/20 and the 2001::/23 protocol block; link-local, ULA, loopback, "::" and mapped
  *     private IPv4 are never reported)
@@ -36,25 +38,52 @@
  *   (default)   every file tracked by git (or untracked and not ignored)
  *   --staged    files staged for commit
  *   --history   every line ADDED by any commit reachable from any ref
- *               (`git log -p --all`), with the same rules. History is
- *               immutable, so already-reviewed historical synthetic hits are
- *               listed as exact `commit:path:rule:value` fingerprints in
- *               .public-safety-history-allow (see that file).
+ *               (`git log -p --cc --all`; for a merge, what the merge itself
+ *               introduced), every commit message and annotated tag message,
+ *               and author/committer/tagger identities (every rule except
+ *               `email`: an author e-mail is inherent to git), with the same
+ *               rules. History is immutable, so already-reviewed historical
+ *               synthetic hits are listed as exact
+ *               `commit:path:rule:sha256(value)` fingerprints in
+ *               .public-safety-history-allow (see that file). Messages and
+ *               identities use the pseudo-paths `<commit message>`,
+ *               `<author>`, `<committer>`, `<tag message>` and `<tagger>`.
  *
- * Usage: node scripts/check-public-safety.mjs [--staged | --history]
- * Exit code 0 = clean, 1 = findings, 2 = internal error.
+ * The allow-list file is scanned like any other file, so it can hold no raw
+ * hit value: entries store the SHA-256 of the value. Every entry needs a
+ * justification comment directly above it (or above its block). Entries for
+ * the rules in NEVER_ALLOW are refused as a hard error: a committed key or env
+ * file, a real e-mail address or a concrete Railway host needs history
+ * rewriting and credential rotation, not a waiver. The allow-list is validated
+ * in every mode.
+ *
+ * Output never contains a matched value, nor a hash of one: the repository
+ * and its CI logs are public, and a hash of a low-entropy value (an IPv4
+ * address, an e-mail address) is effectively the value. A finding or opt-out
+ * shows its location, the rule and `[redacted: <length> chars]` only.
+ * Two flags are for LOCAL use only; the gate refuses both (exit 2) when the
+ * CI or GITHUB_ACTIONS environment variable is set, and CI never passes them:
+ *   --fingerprints  with --history, also print each allow-list entry
+ *                   (`commit:path:rule:sha256`), for synthetic values only
+ *   --show-values   print the raw matched values (and full internal errors)
+ *
+ * Usage: node scripts/check-public-safety.mjs [--staged | --history] [--fingerprints] [--show-values]
+ * Exit code 0 = clean, 1 = findings, 2 = internal error (or a local-only flag in CI).
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 
 const MARKER = "public-safety: allow-synthetic";
+const SHOW_VALUES = process.argv.includes("--show-values");
+const SHOW_FINGERPRINTS = process.argv.includes("--fingerprints");
 const MAX_BYTES = 2 * 1024 * 1024;
 const HISTORY_ALLOW_FILE = ".public-safety-history-allow";
 
 // Generated lockfiles that are skipped entirely: EXACT repository-relative
-// paths only (never matched by basename, never at any other depth).
-// The history allow-list is skipped too: its entries necessarily quote the values they allow.
-const SKIP_FILES = new Set(["package-lock.json", "packages/tanstack/verification/cf-lifecycle/package-lock.json", HISTORY_ALLOW_FILE]);
+// paths only (never matched by basename, never at any other depth). The
+// history allow-list is NOT skipped: its entries hold hashes, not values.
+const SKIP_FILES = new Set(["package-lock.json", "packages/tanstack/verification/cf-lifecycle/package-lock.json"]);
 // Text files over MAX_BYTES that a reviewer has accepted (exact paths). Empty
 // on purpose: any other large text file is a finding, not a silent skip.
 const REVIEWED_LARGE_TEXT = new Set([]);
@@ -87,7 +116,7 @@ const RULES = [
     id: "email",
     re: /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b/g,
     allowMarker: false,
-    filter: (m) => !/@(([a-z0-9-]+\.)*(example|invalid|test|localhost)|example\.(com|org|net))$/i.test(m) && !/@users\.noreply\.github\.com$/i.test(m),
+    filter: (m) => !isAllowedEmail(m),
     why: "e-mail address outside example domains",
   },
   {
@@ -114,6 +143,46 @@ const RULES = [
     why: "public IPv6 literal (use RFC 3849 2001:db8::/32)",
   },
 ];
+
+// History hits of these rules can never be allow-listed: they need history
+// rewriting and credential rotation, not a waiver.
+const NEVER_ALLOW = new Set(["forbidden-file", "private-key-block", "email", "railway-public-host", "railway-private-host"]);
+const KNOWN_RULES = new Set([...RULES.map((r) => r.id), "forbidden-file"]);
+const REMEDIATION =
+  "if the value is real, rewrite history to remove it and rotate or revoke it; only a SYNTHETIC value may be allow-listed (entry: run locally with --fingerprints)";
+const FINGERPRINT_HINT =
+  "public-safety: allow-list entries are not printed here (a hash of a low-entropy value reveals it). For SYNTHETIC values only, run " +
+  "`node scripts/check-public-safety.mjs --history --fingerprints` locally (refused in CI) to print them; a real value needs history rewriting and rotation instead.";
+const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it, and rotate or revoke what it exposed (key, credential, host)";
+
+export function sha256Hex(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/** How a matched value is printed: its length only, unless --show-values (local use only). No hash: it would reveal a low-entropy value. */
+export function displayValue(value, showValues = SHOW_VALUES) {
+  return showValues ? value : `[redacted: ${value.length} chars]`;
+}
+
+/** An error whose message is ours and never contains scanned content. */
+class GateError extends Error {}
+
+/**
+ * E-mail addresses that are never personal data: RFC 2606 / RFC 6761 reserved
+ * names (any subdomain of example.com/.org/.net, and the .example, .invalid,
+ * .test and .localhost TLDs), and fixed git "noreply" identities, which appear
+ * in commit trailers such as `Co-Authored-By: Claude <noreply@anthropic.com>`.
+ */
+const ALLOWED_EMAILS = [
+  /@(?:[a-z0-9-]+\.)*(?:example|invalid|test|localhost)$/i,
+  /@(?:[a-z0-9-]+\.)*example\.(?:com|org|net)$/i,
+  /@users\.noreply\.github\.com$/i,
+  /^noreply@(?:anthropic\.com|github\.com)$/i,
+];
+
+function isAllowedEmail(address) {
+  return ALLOWED_EMAILS.some((re) => re.test(address));
+}
 
 /** Strict IPv6 text parser (RFC 4291, incl. "::" and an embedded dotted quad). Returns 8 hextets or null. */
 function parseIpv6(text) {
@@ -177,9 +246,17 @@ function isPublicIpv4(text) {
   return true;
 }
 
+/**
+ * Runs git with its stderr captured, never echoed: a git diagnostic could quote
+ * scanned content. A failure surfaces as an internal error (see the end of this file).
+ */
+function git(args, options = {}) {
+  return execFileSync("git", args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+}
+
 function listFiles(staged) {
   const args = staged ? ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"] : ["ls-files", "-z", "--cached", "--others", "--exclude-standard"];
-  const out = execFileSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const out = git(args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   return out.split("\0").filter(Boolean);
 }
 
@@ -227,11 +304,12 @@ export function decodeText(buf) {
   }
 }
 
-/** Applies every rule to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
-function scanText(text, report) {
+/** Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
+function scanText(text, report, skipRules = null) {
   const lines = text.split(/\r\n|\n|\r|\u2028|\u2029/);
   lines.forEach((line, i) => {
     for (const rule of RULES) {
+      if (skipRules?.has(rule.id)) continue;
       rule.re.lastIndex = 0;
       for (const m of line.matchAll(rule.re)) {
         const hit = m[0];
@@ -268,120 +346,249 @@ function checkTree(staged) {
       continue;
     }
     scanText(dec.text, (rule, hit, line, optedOut) => {
-      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} (${hit})`);
-      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${hit}`);
+      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} ${displayValue(hit)}`);
+      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
     });
   }
   return { count: files.length, findings, optOuts, skippedBinary };
 }
 
+// `<full commit sha>:<path>:<rule>:<sha256 hex of the value>`; the path may contain ":".
+const ALLOW_ENTRY = /^([0-9a-f]{40}|[0-9a-f]{64}):(.+):([a-z0-9-]+):([0-9a-f]{64})$/;
+
+/**
+ * Parses the history allow-list. Returns `{ entries, errors }`: `entries` maps
+ * each accepted fingerprint to `{ line, used }`; `errors` lists every refused
+ * line (malformed, unknown or never-allowed rule, no justification).
+ */
+export function parseHistoryAllow(text) {
+  const entries = new Map();
+  const errors = [];
+  let commentHasText = false; // the comment block directly above has a justification
+  let blockJustified = false; // the current block of consecutive entries is justified
+  let prev = "blank";
+  text.split(/\r\n|\n|\r/).forEach((raw, i) => {
+    const line = raw.trim();
+    const where = `${HISTORY_ALLOW_FILE}:${i + 1}`;
+    if (line === "") {
+      prev = "blank";
+      return;
+    }
+    if (line.startsWith("#")) {
+      const hasText = /[A-Za-z]/.test(line.replace(/^#+/, ""));
+      commentHasText = prev === "comment" ? commentHasText || hasText : hasText;
+      prev = "comment";
+      return;
+    }
+    if (prev === "comment") blockJustified = commentHasText;
+    else if (prev === "blank") blockJustified = false;
+    prev = "entry";
+    const m = ALLOW_ENTRY.exec(line);
+    if (!m) {
+      errors.push(`${where}: malformed entry (expected <full commit sha>:<path>:<rule>:<sha256 hex of the value>; raw values are not accepted)`);
+      return;
+    }
+    const [, commit, path, rule, hash] = m;
+    if (!KNOWN_RULES.has(rule)) errors.push(`${where}: unknown rule "${rule}"`);
+    else if (NEVER_ALLOW.has(rule)) errors.push(`${where}: rule ${rule} ${NO_WAIVER}`);
+    else if (!blockJustified) errors.push(`${where}: no justification: put a non-empty "# ..." comment directly above this entry or its block`);
+    else entries.set(`${commit}:${path}:${rule}:${hash}`, { line: i + 1, used: false });
+  });
+  return { entries, errors };
+}
+
 function loadHistoryAllow() {
-  const allow = new Map(); // fingerprint -> used?
   let text;
   try {
     text = readFileSync(HISTORY_ALLOW_FILE, "utf8");
   } catch {
-    return allow;
+    return { entries: new Map(), errors: [] };
   }
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("#")) continue;
-    allow.set(line, false);
-  }
-  return allow;
+  return parseHistoryAllow(text);
 }
 
 function isAllowed(allow, commit, path, rule, value) {
-  for (const key of allow.keys()) {
-    const parts = key.split(":");
-    if (parts.length < 4) continue;
-    const [c, p, r] = parts;
-    const v = parts.slice(3).join(":");
-    if (c.length >= 12 && commit.startsWith(c) && p === path && r === rule && v === value) {
-      allow.set(key, true);
-      return true;
-    }
-  }
-  return false;
+  const entry = allow.get(`${commit}:${path}:${rule}:${sha256Hex(value)}`);
+  if (!entry) return false;
+  entry.used = true;
+  return true;
 }
 
-function checkHistory() {
-  if (execFileSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
-    throw new Error("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
-  }
-  const log = execFileSync(
-    "git",
-    ["-c", "core.quotePath=false", "log", "--all", "-p", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
-    { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
-  );
-  const allow = loadHistoryAllow();
-  const findings = [];
-  const optOuts = [];
-  const skippedBinary = [];
-  const seen = new Set();
-  let commits = 0;
+/**
+ * Parses one `git log -p --raw --cc` stream. A file's header runs from its
+ * `diff --git`/`diff --cc` line to its first `@@` line; only there are
+ * `+++ `, `Binary files` and similar lines headers. In the hunk body every
+ * line carries one prefix column per parent, so an added line whose content
+ * starts with `++ ` (shown as `+++ ...`) is scanned as content. For a merge,
+ * `--cc` shows only what the merge itself introduced: a line is scanned when
+ * it is added relative to EVERY parent (lines taken from one parent were
+ * scanned in the commit that added them there).
+ */
+function scanPatchLog(log, ctx) {
   let commit = "";
+  let state = "none"; // "none" (commit header / raw lines) | "header" | "body"
+  let parents = 1;
   let path = null;
   let skipPath = false;
-  let combined = false;
-  const rawNew = new Map(); // path -> blob id added in this commit
-  const emit = (rule, hit, where, optedOut) => {
-    const fp = `${commit}:${path}:${rule.id}:${hit}`;
-    if (seen.has(fp)) return;
-    seen.add(fp);
-    if (isAllowed(allow, commit, path, rule.id, hit)) return;
-    if (optedOut) optOuts.push(`${commit.slice(0, 12)}:${path}: ${rule.id} (${hit})`);
-    else findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}`);
+  const resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
+  const setPath = (p) => {
+    path = p;
+    skipPath = p !== null && SKIP_FILES.has(p);
   };
-  const addLine = (line) => scanText(line, (rule, hit, _n, optedOut) => emit(rule, hit, "", optedOut));
+  const scanBlob = (p) => {
+    const blob = resultBlob.get(p);
+    if (!blob || SKIP_FILES.has(p)) return;
+    // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the blob and scan it whole.
+    const content = git(["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
+    const dec = decodeText(content);
+    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
+    else ctx.scan(commit, p, dec.text);
+  };
 
   for (const lineBuf of splitBuffer(log, 0x0a)) {
     const line = lineBuf.toString("utf8");
+    // Neither a commit line nor a diff line can be hunk content: content lines start with a prefix column.
     if (line.startsWith("commit ") && /^commit [0-9a-f]{40}$/.test(line)) {
       commit = line.slice(7);
-      commits++;
-      path = null;
-      rawNew.clear();
+      ctx.commits++;
+      state = "none";
+      setPath(null);
+      resultBlob.clear();
       continue;
     }
-    if (line.startsWith(":") && !line.startsWith("::")) {
-      const m = /^:\d+ \d+ [0-9a-f]+ ([0-9a-f]+) [AM]\t(.+)$/.exec(line);
-      if (m && !/^0+$/.test(m[1])) rawNew.set(m[2], m[1]);
+    if (line.startsWith("diff --git ") || line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
+      state = "header";
+      setPath(line.startsWith("diff --git ") ? null : line.slice(line.indexOf(" ", 5) + 1));
       continue;
     }
-    if (line.startsWith("diff --git ") || line.startsWith("diff --cc ")) {
-      combined = line.startsWith("diff --cc ");
-      path = combined ? line.slice("diff --cc ".length) : null;
-      skipPath = path !== null && SKIP_FILES.has(path);
-      continue;
-    }
-    if (line.startsWith("+++ ")) {
-      const p = line.slice(4);
-      path = p === "/dev/null" ? null : p.replace(/^b\//, "");
-      skipPath = path !== null && SKIP_FILES.has(path);
-      if (path !== null) for (const f of FORBIDDEN_FILES) if (f.re.test(path)) emit({ id: "forbidden-file", why: f.why }, path, "", false);
-      continue;
-    }
-    if (line.startsWith("Binary files ")) {
-      // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the added blob and scan it whole.
-      const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
-      const p = m?.[2];
-      const blob = p ? rawNew.get(p) : undefined;
-      if (p && blob && !SKIP_FILES.has(p)) {
-        path = p;
-        const content = execFileSync("git", ["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
-        const dec = decodeText(content);
-        if (dec === null) skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
-        else addLine(dec.text);
+    if (state === "none") {
+      // Raw lines: ":<modes> <blobs> <status>\t<path>", one colon per parent. Every path the
+      // commit adds or changes is checked against the forbidden-file rules here, so an empty or
+      // binary .env or key file (which has no "+++" line) is found too.
+      const m = /^(:+)([^\t]+)\t(.+)$/.exec(line);
+      if (m) {
+        const n = m[1].length;
+        const blobs = m[2].split(" ").slice(n + 1, 2 * n + 2);
+        const result = blobs[n];
+        if (result && !/^0+$/.test(result)) {
+          resultBlob.set(m[3], result);
+          for (const f of FORBIDDEN_FILES) if (f.re.test(m[3])) ctx.emit(commit, m[3], { id: "forbidden-file", why: f.why }, m[3], false);
+        }
       }
       continue;
     }
-    if (line.startsWith("--- ") || line.startsWith("@@") || line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file") || line.startsWith("old mode") || line.startsWith("new mode")) continue;
+    if (state === "header") {
+      if (line.startsWith("@@")) {
+        state = "body";
+        parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
+      } else if (line.startsWith("+++ ")) {
+        const p = line.slice(4);
+        setPath(p === "/dev/null" ? null : p.replace(/^b\//, ""));
+      } else if (line.startsWith("Binary files ")) {
+        const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
+        const p = m ? m[2] : path; // combined diffs print "Binary files differ"; the path is from "diff --cc"
+        if (p) scanBlob(p);
+      }
+      continue;
+    }
+    // Hunk body.
+    if (line.startsWith("@@")) {
+      parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
+      continue;
+    }
     if (path === null || skipPath) continue;
-    if (combined ? line.startsWith("++") : line.startsWith("+")) addLine(line.slice(combined ? 2 : 1));
+    const prefix = line.slice(0, parents);
+    if (prefix.length === parents && /^\+*$/.test(prefix)) ctx.scan(commit, path, line.slice(parents));
   }
-  const unused = [...allow].filter(([, used]) => !used).map(([k]) => k);
-  return { count: commits, findings, optOuts, skippedBinary, unused };
+}
+
+/** Pseudo-paths for content that is not a file. Real paths never start with "<". */
+const MESSAGE_PATH = "<commit message>";
+const AUTHOR_PATH = "<author>";
+const COMMITTER_PATH = "<committer>";
+const TAG_MESSAGE_PATH = "<tag message>";
+const TAGGER_PATH = "<tagger>";
+// Identities are scanned with every rule except "email": an author e-mail is inherent to git
+// (documented limitation, docs/PUBLIC_REPO_SECURITY.md).
+const IDENTITY_SKIP = new Set(["email"]);
+
+/** Commit messages (every rule) and author/committer identities (every rule but e-mail). */
+function scanCommitMetadata(ctx) {
+  const out = git(["log", "--all", "-z", "--no-color", "--format=%H%n%an <%ae>%n%cn <%ce>%n%B"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+  for (const record of out.split("\0")) {
+    const m = /^([0-9a-f]{40})\n([^\n]*)\n([^\n]*)\n([\s\S]*)$/.exec(record.replace(/^\n/, ""));
+    if (!m) continue;
+    const [, commit, author, committer, message] = m;
+    ctx.scan(commit, MESSAGE_PATH, message);
+    ctx.scan(commit, AUTHOR_PATH, author, IDENTITY_SKIP);
+    ctx.scan(commit, COMMITTER_PATH, committer, IDENTITY_SKIP);
+  }
+}
+
+/** Annotated tag messages (every rule) and tagger identities (every rule but e-mail), following tags of tags. */
+function scanTags(ctx) {
+  const refs = git(["for-each-ref", "refs/tags", "--format=%(objectname) %(objecttype)"], { encoding: "utf8" });
+  const done = new Set();
+  for (const ref of refs.split("\n").filter(Boolean)) {
+    let [sha, type] = ref.split(" ");
+    while (type === "tag" && !done.has(sha)) {
+      done.add(sha);
+      ctx.tags++;
+      const body = git(["cat-file", "tag", sha], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+      const split = body.indexOf("\n\n");
+      const headers = split === -1 ? body : body.slice(0, split);
+      const message = split === -1 ? "" : body.slice(split + 2);
+      const h = (name) => new RegExp(`^${name} (.*)$`, "m").exec(headers)?.[1];
+      ctx.scan(sha, TAG_MESSAGE_PATH, message);
+      const tagger = h("tagger");
+      if (tagger !== undefined) ctx.scan(sha, TAGGER_PATH, tagger.replace(/ \d+ [+-]\d{4}$/, ""), IDENTITY_SKIP);
+      [sha, type] = [h("object"), h("type")];
+    }
+  }
+}
+
+function checkHistory(allow) {
+  if (git(["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
+    throw new GateError("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
+  }
+  const findings = [];
+  const optOuts = [];
+  const seen = new Set();
+  const ctx = {
+    commits: 0,
+    tags: 0,
+    waivable: 0,
+    skippedBinary: [],
+    emit(commit, path, rule, hit, optedOut) {
+      const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
+      if (seen.has(fp)) return;
+      seen.add(fp);
+      if (isAllowed(allow, commit, path, rule.id, hit)) return;
+      const where = `${commit.slice(0, 12)}:${path}`;
+      // A forbidden file's "value" is its path, which the location already shows.
+      const what = rule.id === "forbidden-file" ? `${rule.id}: ${rule.why}` : `${rule.id}: ${rule.why}: ${displayValue(hit)}`;
+      if (optedOut) optOuts.push(`${where}: ${rule.id} ${displayValue(hit)}`);
+      else if (NEVER_ALLOW.has(rule.id)) findings.push(`${where}: ${what}\n      ${NO_WAIVER}`);
+      else {
+        ctx.waivable++;
+        findings.push(`${where}: ${what}\n      ${REMEDIATION}${SHOW_FINGERPRINTS ? `\n      allow-list fingerprint: ${fp}` : ""}`);
+      }
+    },
+    scan(commit, path, text, skipRules = null) {
+      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
+    },
+  };
+  // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
+  const log = git(
+    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
+    { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
+  );
+  scanPatchLog(log, ctx);
+  scanCommitMetadata(ctx);
+  scanTags(ctx);
+  // Unused entries are named by their line in the allow-list (whose hashes are public there anyway), not reprinted.
+  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k.slice(0, k.lastIndexOf(":"))}`);
+  return { count: ctx.commits, tags: ctx.tags, waivable: ctx.waivable, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
 }
 
 function splitBuffer(buf, sep) {
@@ -398,8 +605,14 @@ function splitBuffer(buf, sep) {
 }
 
 function main() {
+  const localOnly = [SHOW_VALUES && "--show-values", SHOW_FINGERPRINTS && "--fingerprints"].filter(Boolean);
+  if (localOnly.length > 0 && ["CI", "GITHUB_ACTIONS"].some((k) => (process.env[k] ?? "") !== "" && process.env[k] !== "false")) {
+    const one = localOnly.length === 1;
+    throw new GateError(`${localOnly.join(" and ")} ${one ? "prints" : "print"} raw values or their hashes and ${one ? "is" : "are"} for local use only; refusing in CI (CI or GITHUB_ACTIONS is set)`);
+  }
   const history = process.argv.includes("--history");
-  const r = history ? checkHistory() : checkTree(process.argv.includes("--staged"));
+  const allow = loadHistoryAllow();
+  const r = history ? checkHistory(allow.entries) : checkTree(process.argv.includes("--staged"));
   const unit = history ? "commit(s)" : "file(s)";
   if (r.optOuts.length > 0) {
     console.log(`public-safety: ${r.optOuts.length} marked synthetic opt-out(s):`);
@@ -413,17 +626,30 @@ function main() {
     console.log(`public-safety: warning: ${r.unused.length} unused entr(y/ies) in ${HISTORY_ALLOW_FILE} (history rewritten or fixed?):`);
     for (const u of r.unused) console.log(`  ${u}`);
   }
-  if (r.findings.length > 0) {
-    console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}:`);
-    for (const f of r.findings) console.error(`  ${f}`);
-    process.exit(1);
+  if (allow.errors.length > 0) {
+    console.error(`public-safety: ${allow.errors.length} refused entr(y/ies) in ${HISTORY_ALLOW_FILE} (hard error, the gate fails whatever else it finds):`);
+    for (const e of allow.errors) console.error(`  ${e}`);
   }
-  console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit} scanned)`);
+  if (r.findings.length > 0) {
+    console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""}:`);
+    for (const f of r.findings) console.error(`  ${f}`);
+    if (r.waivable > 0 && !SHOW_FINGERPRINTS) console.error(FINGERPRINT_HINT);
+  }
+  if (allow.errors.length > 0 || r.findings.length > 0) process.exit(1);
+  console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""} scanned)`);
 }
 
 try {
   main();
 } catch (err) {
-  console.error(`public-safety: internal error: ${err instanceof Error ? err.message : String(err)}`);
+  // Only our own messages are printed by default: another error's message (e.g. a failed
+  // git command with its stderr) could quote scanned content.
+  const detail =
+    err instanceof GateError || SHOW_VALUES
+      ? err instanceof Error
+        ? err.message
+        : String(err)
+      : `${err instanceof Error ? err.name : "error"}${err && typeof err === "object" && "status" in err ? ` (exit status ${err.status})` : ""}; rerun locally with --show-values for the message`;
+  console.error(`public-safety: internal error: ${detail}`);
   process.exit(2);
 }
