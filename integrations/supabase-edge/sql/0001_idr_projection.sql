@@ -99,7 +99,10 @@ comment on view public.idr_daily_company_activity is
 
 -- ---------------------------------------------------------------------------
 -- Row level security: enabled on every table. anon has no access. authenticated
--- may only read. There are deliberately no INSERT/UPDATE/DELETE policies for
+-- may only read, and only when the JWT carries app_metadata.idr_reader = true.
+-- On Supabase every self-signed-up user is `authenticated`, so the role alone
+-- is not an authorisation. app_metadata is writable only with the service role
+-- (the admin API), never by the user, unlike user_metadata. There are deliberately no INSERT/UPDATE/DELETE policies for
 -- authenticated, and table privileges are revoked as well (defence in depth).
 -- service_role bypasses RLS on Supabase; the explicit policy keeps the intent
 -- visible and works if the role lacks BYPASSRLS.
@@ -122,7 +125,7 @@ declare t text;
 begin
   foreach t in array array['idr_companies','idr_observations','idr_tombstones','idr_sync_state'] loop
     execute format('drop policy if exists %I on public.%I', t || '_authenticated_read', t);
-    execute format('create policy %I on public.%I for select to authenticated using (true)', t || '_authenticated_read', t);
+    execute format($f$create policy %I on public.%I for select to authenticated using (coalesce((select auth.jwt()) -> 'app_metadata' ->> 'idr_reader', '') = 'true')$f$, t || '_authenticated_read', t);
     execute format('drop policy if exists %I on public.%I', t || '_service_all', t);
     execute format('create policy %I on public.%I for all to service_role using (true) with check (true)', t || '_service_all', t);
   end loop;

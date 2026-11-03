@@ -22,6 +22,18 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
         `do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} NOLOGIN ${extra}; end if; end $$`,
       );
     }
+    // Emulate Supabase's auth.jwt() (only if missing, so a real Supabase schema is never touched).
+    await c.query("create schema if not exists auth");
+    await c.query(
+      `do $$ begin
+         if to_regprocedure('auth.jwt()') is null then
+           create function auth.jwt() returns jsonb language sql stable as
+             $f$ select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $f$;
+         end if;
+       end $$`,
+    );
+    await c.query("grant usage on schema auth to anon, authenticated, service_role");
+    await c.query("grant execute on function auth.jwt() to anon, authenticated, service_role");
     await c.query("drop schema public cascade");
     await c.query("create schema public");
     await c.query("grant usage on schema public to anon, authenticated, service_role");
@@ -36,11 +48,17 @@ export async function truncateAll(pool: pg.Pool): Promise<void> {
 }
 
 /** Runs fn in a transaction as the given role. */
-export async function asRole<T>(pool: pg.Pool, role: string, fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
+export async function asRole<T>(
+  pool: pg.Pool,
+  role: string,
+  fn: (c: pg.PoolClient) => Promise<T>,
+  claims?: Record<string, unknown>,
+): Promise<T> {
   const c = await pool.connect();
   try {
     await c.query("begin");
     await c.query(`set local role ${role}`);
+    if (claims) await c.query("select set_config('request.jwt.claims', $1, true)", [JSON.stringify(claims)]);
     const out = await fn(c);
     await c.query("commit");
     return out;
