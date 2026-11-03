@@ -144,8 +144,12 @@ browser events are **never** associated with companies.
   duration_ms}` and `request_rejected{route, error_code, http_status,
   reason}`; never the `event_id`, `page_key`, type, name, body or headers.
   `config_loaded` reports `events_enabled` and `event_consent_mode`.
-* **Not covered by the smoke run** (`src/ops/smoke.ts`), which checks
-  entrances and the feed only.
+* **Smoke run** (`src/ops/smoke.ts`, operator guide `docs/DEV_SMOKE.md`).
+  With `EVENTS_ENABLED=true` it checks ingestion, idempotency, the
+  rejections, the consent policy, that responses carry no address, and,
+  read-only in the database, that only the run's `browser_events` rows were
+  written and nothing on the company side. With events off it checks that
+  `POST /v1/events` is byte-identical to an unknown route.
 
 ## Migrations
 
@@ -155,7 +159,10 @@ advisory-locked, forward-only; locally `npm run migrate`). At startup the
 service compares `migrations/*.sql` with `schema_migrations` and **refuses to
 start** while any migration of this build is not applied, naming the missing
 files. A database that is ahead of the build (a rollback) is reported in the
-`migration_check` log line but not refused.
+`migration_check` log line but not refused. Rolling the development
+deployment back to a build before migration 0008 is verified from its logs and
+the public edge, optionally with the current smoke's `--mode rollback-check`
+(`docs/DEV_SMOKE.md`).
 
 Feed immutability (migration 0007, CHR-66 F5): the database refuses any
 UPDATE of a served observation column, any UPDATE or DELETE of an erasure
