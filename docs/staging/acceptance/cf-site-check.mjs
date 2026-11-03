@@ -202,7 +202,13 @@ const canary = {
       timeoutMs: 15_000,
     });
     if (r.status >= 300) throw new Error(`canary ${method} ${path} answered ${r.status}`);
-    return r.body ? JSON.parse(r.body) : null;
+    if (!r.body) return null;
+    try {
+      return JSON.parse(r.body);
+    } catch {
+      // Never JSON.parse's own message: it quotes part of the body (an edge error page can show the visitor's IP).
+      throw new Error(`canary ${method} ${path} answered a body that is not JSON`);
+    }
   },
   reset: () => canary.call("POST", "/_canary/reset", {}),
   mode: (mode) => canary.call("POST", "/_canary/mode", { mode }),
@@ -266,18 +272,23 @@ function entrancesFor(results, label, tag) {
 }
 
 function g4i8(name, records) {
-  const leaking = [...new Set(records.flatMap((r) => r.headersWithClientIp))];
-  const forged = [...new Set(records.flatMap((r) => r.headersWithForgedIp))];
-  if (LOCAL) {
-    R.info(`${name}: G4-I8 header canary (local workerd: not the production edge)`, leaking.length ? `headers with the tester IP: ${leaking.join(",")}` : "no header carried the tester IP");
+  // The canary inspects every header (every copy) and matches the IP in any spelling; it returns header NAMES only.
+  const leaking = [...new Set(records.flatMap((r) => r.headersWithClientIp))].sort();
+  const forged = [...new Set(records.flatMap((r) => r.headersWithForgedIp))].sort();
+  if (LOCAL && leaking.length === 0) {
+    // Local workerd shows only what the adapter and the local runtime send, never what the Cloudflare edge adds:
+    // no D4 transport-isolation claim is made from it (owner decision on G4-I8). A leak is still a FAIL below.
+    R.info(`${name}: G4-I8 header canary (local workerd: not the production edge, no claim)`, `no header carried the tester IP (${records.length} requests)`);
   } else {
-    R.check(`${name}: G4-I8, no request header at the resolver's hosting position carries the visitor's IP`, records.length > 0 && leaking.length === 0, leaking.length ? `headers carrying it: ${leaking.join(", ")}` : `${records.length} requests inspected`);
+    R.check(`${name}: G4-I8, no request header at the resolver's hosting position carries the visitor's IP${LOCAL ? " (local workerd)" : ""}`, records.length > 0 && leaking.length === 0, leaking.length ? `headers carrying it: ${leaking.join(", ")}` : `${records.length} requests inspected`);
   }
   R.check(`${name}: no request header carries the forged IP`, forged.length === 0, forged.join(", ") || "none");
   const cf = records.filter((r) => r.headerPresence["cf-connecting-ip"]).length;
   const xri = records.filter((r) => r.headerPresence["x-real-ip"]).length;
   const cw = records.filter((r) => r.headerPresence["cf-worker"]).length;
   R.info(`${name}: header presence at the canary`, `cf-connecting-ip ${cf}/${records.length}, x-real-ip ${xri}/${records.length}, cf-worker ${cw}/${records.length}`);
+  const seen = [...new Set(records.flatMap((r) => r.headerNames ?? []))].sort();
+  R.info(`${name}: every header name that arrived (all were inspected)`, seen.join(", ") || "none");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -440,7 +451,16 @@ async function route() {
   // answered 200 with an empty route page), so the route's own 405 is not reached. What matters: a GET is never
   // accepted as an event (nothing is forwarded; the forwarded count below would show it).
   const get = await rawRequest(url, { method: "GET", headers: base });
-  R.check("GET is not accepted as an event (no 204)", get.status !== 204, `HTTP ${get.status}${get.status === 405 ? " from the route" : " from the framework, not the route (finding G5-D-F1)"}`);
+  R.check("GET is not accepted as an event (no 204)", get.status !== 204, `HTTP ${get.status}${get.status === 405 ? " from the route" : " from the framework's page, not the route (expected with only POST registered)"}`);
+  // G5-D-F1 (remediated in the adapter): a browser navigation to the collector path is never an entrance. The
+  // canary was reset at the start of this phase and nothing in it loads a page, so it must see no entrance at all.
+  const navigations = [
+    ["GET", cfg.collectorPath],
+    ["HEAD", cfg.collectorPath],
+    ["GET", cfg.collectorPath.toUpperCase()],
+  ];
+  const navStatuses = [];
+  for (const [method, path] of navigations) navStatuses.push(`${method} ${(await rawRequest(siteUrl(path), { method, headers: browserHeaders() })).status}`);
   await expect("foreign Origin", post(ev(), { ...base, origin: "https://attacker.example.net", "sec-fetch-site": "cross-site" }), 403);
   const noOrigin = { ...base };
   delete noOrigin.origin;
@@ -497,7 +517,10 @@ async function route() {
   const keys = [...new Set(events.map((r) => r.keys.join(",")))];
   R.check("forwarded body keys are exactly the event.v1 keys", keys.length === 1 && keys[0] === "consent,contract,event_id,name,occurred_at,page_key,type,website_id", keys.join(" | "));
   R.check("forwarded bodies carry no ip field", events.every((r) => !r.ip.present));
+  if (ip) R.check("forwarded bodies carry no copy of the tester's IP anywhere", events.every((r) => r.bodyContainsClientIp === false));
   R.check("page_key is the mapped path", events.every((r) => r.pageKey === `/landing/route-${tag}`));
+  const navEntrances = res.records.filter((r) => r.route === "entrances").length;
+  R.check("G5-D-F1: a browser navigation to the collector path (GET, HEAD, upper case) produced no entrance", navEntrances === 0, `${navStatuses.join(", ")}; ${navEntrances} entrance(s) at the canary`);
   g4i8("route", events);
 }
 
@@ -639,6 +662,8 @@ const RUN = { preflight, ttfb, faults, down, route, bundle, ceiling, cold, brows
 try {
   for (const p of phases) await RUN[p]();
 } catch (e) {
-  R.check("phase completed without an error", false, redact(e instanceof Error ? e.message : String(e)));
+  // A Node network error's message can name addresses, hosts and certificate names: report its code instead.
+  const code = typeof e?.code === "string" && /^[A-Z0-9_]{2,64}$/.test(e.code) ? e.code : null;
+  R.check("phase completed without an error", false, code ?? redact(e instanceof Error ? e.message : String(e)));
 }
 finish();

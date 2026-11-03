@@ -4,10 +4,12 @@
 //   * No target has a default. Every URL, key and token comes from the environment at run time, and the
 //     operator must repeat the target host on the command line (--confirm-target).
 //   * Nothing secret is printed or written: tokens, keys, IP addresses, user ids and e-mail addresses never
-//     reach the console or the result file. Hosts are printed as labels (<site>, <canary>, <project>).
+//     reach the console or the result file. Hosts are printed as labels (<site>, <canary>, <project>), and every
+//     IP literal left in a line (any spelling) becomes [ip].
 //   * Zero dependencies beyond Node 22 built-ins.
 import http from "node:http";
 import https from "node:https";
+import { isIP } from "node:net";
 
 /** A refusal: the script stops before sending anything. */
 export class Refusal extends Error {}
@@ -54,15 +56,33 @@ export function hostInZone(host, zone) {
   return h === z || h.endsWith(`.${z}`);
 }
 
-/** Replaces every occurrence of each secret (and each host, by label) in text. */
+/** True when a token (hex digits, dots, colons) is or contains an IP literal: as is, without a port or trailing dot. */
+function isIpToken(tok) {
+  const tries = [tok, tok.replace(/\.+$/, ""), tok.replace(/:\d{1,5}$/, ""), tok.replace(/(?<!:):$/, ""), ...[...tok.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)].map((m) => m[0])];
+  return tries.some((t) => isIP(t) !== 0);
+}
+
+/**
+ * Replaces every IP literal with [ip], in any spelling: IPv4, IPv6 compressed or expanded, upper or lower case,
+ * IPv4-embedded IPv6, with a port or in brackets. Output lines and result files never need an address.
+ */
+export function scrubIps(text) {
+  return String(text).replace(/[0-9A-Fa-f:.]{2,}/g, (tok) => (isIpToken(tok) ? "[ip]" : tok));
+}
+
+/**
+ * Replaces every occurrence of each secret (case-insensitively for IP-shaped ones) and each host (by label), then
+ * every remaining IP literal.
+ */
 export function makeRedactor(secrets = [], hosts = {}) {
   const list = secrets.filter((s) => typeof s === "string" && s.length >= 4);
   const hostList = Object.entries(hosts).filter(([, h]) => typeof h === "string" && h.length > 0);
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return (text) => {
     let out = String(text);
-    for (const s of list) out = out.split(s).join("[redacted]");
+    for (const s of list) out = /^[0-9A-Fa-f:.]+$/.test(s) ? out.replace(new RegExp(escape(s), "gi"), "[redacted]") : out.split(s).join("[redacted]");
     for (const [label, h] of hostList) out = out.split(h).join(label);
-    return out;
+    return scrubIps(out);
   };
 }
 
