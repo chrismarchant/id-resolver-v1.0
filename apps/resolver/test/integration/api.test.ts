@@ -136,6 +136,10 @@ describe("resolver API: POST /v1/entrances", () => {
       entrance({ entrance_id: "x".repeat(65) }),
       entrance({ entrance_id: "has space 0123456789" }),
       entrance({ entrance_id: "dots.are.not.allowed.0123" }),
+      entrance({ entrance_id: "obs/ref/0123456789abcdef" }),
+      entrance({ entrance_id: 123 }),
+      entrance({ entrance_id: null }),
+      entrance({ entrance_id: "" }),
       entrance({ occurred_at: "2026-11-03T12:00:00" }),
       entrance({ occurred_at: "2026-11-03T12:00:00+00:00" }),
       entrance({ occurred_at: "2026-11-03 12:00:00Z" }),
@@ -277,7 +281,7 @@ describe("resolver API: POST /v1/entrances", () => {
     const completed = logger.entries.filter((e) => e["event"] === "request_completed").at(-1)!;
     expect(completed).toMatchObject({ route: ROUTE, http_status: 200, status: "qualified", source: "provider", recorded: true, company_id: 42 });
     const text = JSON.stringify(logger.entries);
-    for (const needle of [...ipVariants(TEST_IP), TEST_AUTH_TOKEN, "ent_logcheck_000000001", ENTRANCE_ID, "/secret-launch-page", "tsa-1"]) expect(text).not.toContain(needle);
+    for (const needle of [...ipVariants(TEST_IP), TEST_AUTH_TOKEN, "ent_logcheck_000000001", ENTRANCE_ID, "/secret-launch-page", "tsa-1", "example.com"]) expect(text).not.toContain(needle);
   });
 
   it("maps overload to 503 overloaded; readiness reflects capacity", async () => {
