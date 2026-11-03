@@ -24,7 +24,7 @@ causation.
 Run `sql/0001_idr_projection.sql` against the project (SQL editor or `supabase db push`
 after copying it into `supabase/migrations/`). It is idempotent. It creates the
 projection tables, the `idr_daily_company_activity` view and the `idr_*` functions, enables
-RLS on every table (no `anon` access, `authenticated` read-only) and grants function
+RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
 execution to `service_role` only.
 
 ## 2. Set secrets
@@ -76,7 +76,22 @@ Follow `sql/schedule.example.sql`: store `idr_sync_url` and `idr_sync_secret` in
 3. `select * from public.idr_daily_company_activity order by day desc limit 10;`
 4. Optional: set `IDR_RECONCILE_DAYS=3`; status `reconcile_mismatch` means the projection
    disagrees with the resolver's `/v1/reporting/summary` for those days (see troubleshooting).
-5. As a signed-in `authenticated` user the tables are readable; as `anon` they are not; neither can write.
+5. A signed-in user WITH the `idr_reader` claim can read the tables; a signed-in user without it, and `anon`, see nothing; nobody but `service_role` can write.
+
+### Who may read the projection
+
+On Supabase every self-signed-up user has the `authenticated` role, and e-mail sign-up is on
+by default, so the role alone is not an authorisation. The RLS policies therefore require the
+JWT claim `app_metadata.idr_reader = true`. `app_metadata` can be written only with the
+service role (admin API); `user_metadata` can be edited by the user and is deliberately not
+used.
+
+1. Disable public sign-ups: Dashboard > Authentication > Sign In / Providers, turn off
+   "Allow new users to sign up" (`enable_signup = false` in `config.toml`), and invite staff instead.
+2. Grant the claim to each staff member from a trusted shell (never from a browser):
+   `curl -sS -X PUT "https://<project-ref>.supabase.co/auth/v1/admin/users/<user-id>" -H "apikey: $SERVICE_ROLE_KEY" -H "Authorization: Bearer $SERVICE_ROLE_KEY" -H "Content-Type: application/json" -d '{"app_metadata":{"idr_reader":true}}'`
+3. The user must sign in again (or refresh the session) to receive a token with the claim.
+4. Revoke by setting `idr_reader` to `false`; the existing token keeps working until it expires, so keep the JWT expiry short.
 
 ## 6. Rotate tokens
 
@@ -97,6 +112,7 @@ Follow `sql/schedule.example.sql`: store `idr_sync_url` and `idr_sync_secret` in
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
+| `cursor_rejected` | resolver answered 400 to the stored cursor (its cursor key rotated); the engine reset the cursor and replayed from the buffer start | none; informational, the next run is `ok`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired` | see below |

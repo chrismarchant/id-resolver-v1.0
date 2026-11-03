@@ -9,6 +9,7 @@ const FUNCS = [
   "idr_apply_feed_page(text,text,text,jsonb)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
+  "idr_reset_cursor(text,text)",
   "idr_reconcile_counts(text,date,date)",
 ];
 
@@ -26,6 +27,7 @@ beforeEach(async () => {
     "insert into public.idr_observations (installation_id, observation_id, company_id, observed_at, method) values ($1, 1, 1, '2026-11-02T10:00:00Z', 'cache')",
     [INSTALLATION],
   );
+  await pool.query("insert into public.idr_tombstones (installation_id, tombstone_id, company_id, erased_at) values ($1, 1, 9, '2026-11-02T11:00:00Z')", [INSTALLATION]);
   await pool.query("insert into public.idr_sync_state (installation_id) values ($1)", [INSTALLATION]);
 });
 
@@ -44,12 +46,26 @@ describe("row level security", () => {
     }
   });
 
-  it("authenticated can read (tables and the view) but cannot write", async () => {
-    for (const t of TABLES) {
-      const r = await asRole(pool, "authenticated", (c) => c.query(`select count(*)::int as n from public.${t}`));
-      expect(r.rows[0].n, t).toBeGreaterThanOrEqual(0);
+  const READER = { role: "authenticated", app_metadata: { idr_reader: true } };
+  const signedUp = { role: "authenticated", sub: "u1", user_metadata: { idr_reader: true }, app_metadata: { provider: "email" } };
+
+  it("an authenticated session WITHOUT the idr_reader claim sees 0 rows (open sign-up model)", async () => {
+    for (const claims of [undefined, {}, signedUp, { app_metadata: { idr_reader: "yes" } }, { app_metadata: { idr_reader: false } }]) {
+      for (const t of TABLES) {
+        const r = await asRole(pool, "authenticated", (c) => c.query(`select count(*)::int as n from public.${t}`), claims);
+        expect(r.rows[0].n, `${t} ${JSON.stringify(claims)}`).toBe(0);
+      }
+      const v = await asRole(pool, "authenticated", (c) => c.query("select * from public.idr_daily_company_activity"), claims);
+      expect(v.rows, JSON.stringify(claims)).toEqual([]);
     }
-    const v = await asRole(pool, "authenticated", (c) => c.query("select entrances from public.idr_daily_company_activity"));
+  });
+
+  it("authenticated WITH app_metadata.idr_reader can read (tables and the view) but cannot write", async () => {
+    for (const t of TABLES) {
+      const r = await asRole(pool, "authenticated", (c) => c.query(`select count(*)::int as n from public.${t}`), READER);
+      expect(r.rows[0].n, t).toBe(1);
+    }
+    const v = await asRole(pool, "authenticated", (c) => c.query("select entrances from public.idr_daily_company_activity"), READER);
     expect(v.rows).toEqual([{ entrances: "1" }]);
 
     const writes = [
@@ -60,18 +76,18 @@ describe("row level security", () => {
       "update public.idr_sync_state set cursor = 'c99'",
       "truncate public.idr_observations",
     ];
-    for (const w of writes) await expect(asRole(pool, "authenticated", (c) => c.query(w)), w).rejects.toThrow(/permission denied/);
+    for (const w of writes) await expect(asRole(pool, "authenticated", (c) => c.query(w), READER), w).rejects.toThrow(/permission denied/);
   });
 
   it("RLS alone blocks writes even if a table privilege were granted", async () => {
     await pool.query("grant insert, update, delete on public.idr_companies to authenticated");
     try {
       await expect(
-        asRole(pool, "authenticated", (c) => c.query("insert into public.idr_companies (installation_id, company_id, domain) values ('x', 2, 'example.org')")),
+        asRole(pool, "authenticated", (c) => c.query("insert into public.idr_companies (installation_id, company_id, domain) values ('x', 2, 'example.org')"), READER),
       ).rejects.toThrow(/row-level security/);
-      const upd = await asRole(pool, "authenticated", (c) => c.query("update public.idr_companies set domain = 'example.net'"));
+      const upd = await asRole(pool, "authenticated", (c) => c.query("update public.idr_companies set domain = 'example.net'"), READER);
       expect(upd.rowCount).toBe(0);
-      const del = await asRole(pool, "authenticated", (c) => c.query("delete from public.idr_companies"));
+      const del = await asRole(pool, "authenticated", (c) => c.query("delete from public.idr_companies"), READER);
       expect(del.rowCount).toBe(0);
     } finally {
       await pool.query("revoke insert, update, delete on public.idr_companies from authenticated");
@@ -84,6 +100,7 @@ describe("row level security", () => {
       "idr_apply_feed_page(text,text,text,jsonb)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
+      "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
       "idr_reconcile_counts(text,date,date)": ["select public.idr_reconcile_counts($1, '2026-11-01', '2026-11-02')", [INSTALLATION]],
     };
     for (const f of FUNCS) {

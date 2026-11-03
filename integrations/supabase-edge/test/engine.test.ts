@@ -75,6 +75,7 @@ describe("crash and atomicity", () => {
       getState: () => store.getState(),
       recordStatus: (a) => store.recordStatus(a),
       localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => store.resetCursor(c),
       applyPage: async (a) => {
         const out = await store.applyPage(a);
         if (++applies === 1) throw new Error("process died after apply");
@@ -130,6 +131,7 @@ describe("crash and atomicity", () => {
       applyPage: (a) => store.applyPage(a),
       recordStatus: (a) => store.recordStatus(a),
       localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => store.resetCursor(c),
     };
     const [a, b] = await Promise.all([runSync(testConfig(mock), testDeps(barrier)), runSync(testConfig(mock), testDeps(barrier))]);
     const statuses = [a.status, b.status].sort();
@@ -307,5 +309,71 @@ describe("reconciliation", () => {
     const r = await runSync(testConfig(mock, { reconcileDays: 2, maxPages: 1 }), testDeps(store));
     expect(r.status).toBe("partial");
     expect(r.reconcile).toBeNull();
+  });
+});
+
+describe("rejected cursor (resolver cursor-key rotation)", () => {
+  const cfg = () => testConfig(mock, { pageLimit: 2 });
+
+  it("400 to a request carrying a cursor resets to the buffer start and replays idempotently", async () => {
+    mock.items = [1, 2, 3, 4, 5].map((i) => obs(i, i % 2 === 0 ? 7 : 8, D));
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+    expect(await storedCursor(pool)).toBe("c5");
+    const before = await counts(pool);
+
+    mock.items.push(obs(6, 7, D));
+    mock.cursorPrefix = "k2"; // key rotated: every old cursor is now a 400
+    mock.requests = [];
+    const r = await runSync(cfg(), testDeps(store));
+
+    expect(r.status).toBe("cursor_rejected");
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c5", null, "k2c2", "k2c4"]);
+    expect(await storedCursor(pool)).toBe("k2c6");
+    expect(await counts(pool)).toEqual({ ...before, observations: before.observations + 1 });
+    const dup = await pool.query("select observation_id from public.idr_observations group by 1 having count(*) > 1");
+    expect(dup.rowCount).toBe(0);
+    const st = await pool.query("select status, needs_resync from public.idr_sync_state");
+    expect(st.rows[0]).toEqual({ status: "cursor_rejected", needs_resync: false });
+
+    // The next run is back to normal.
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+  });
+
+  it("the reset is compare-and-set: a concurrent advance wins (cas_conflict), nothing is reset", async () => {
+    mock.items = [1, 2, 3].map((i) => obs(i, 7, D));
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+    mock.cursorPrefix = "k2";
+    const racing: Store = {
+      getState: () => store.getState(),
+      applyPage: (a) => store.applyPage(a),
+      recordStatus: (a) => store.recordStatus(a),
+      localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: async (c) => {
+        await pool.query("update public.idr_sync_state set cursor = 'c2'"); // another run moved it
+        return store.resetCursor(c);
+      },
+    };
+    expect((await runSync(cfg(), testDeps(racing))).status).toBe("cas_conflict");
+    expect(await storedCursor(pool)).toBe("c2");
+  });
+
+  it("400 to a request WITHOUT a cursor stays contract_error", async () => {
+    mock.items = [obs(1, 7, D)];
+    mock.overrides = [{ status: 400 }];
+    const r = await runSync(cfg(), testDeps(store));
+    expect(r.status).toBe("contract_error");
+    expect(mock.requests.length).toBe(1);
+    expect(await storedCursor(pool)).toBeNull();
+  });
+
+  it("a 400 right after a reset (cursorless request) is contract_error, not a loop", async () => {
+    mock.items = [1, 2, 3].map((i) => obs(i, 7, D));
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+    mock.cursorPrefix = "k2";
+    mock.requests = [];
+    mock.overrides = [{ status: 400 }, { status: 400 }]; // consumed in order: 400 (carried), then 400 (reset replay)
+    const r = await runSync(cfg(), testDeps(store));
+    expect(r.status).toBe("contract_error");
+    expect(mock.requests.length).toBe(2);
   });
 });

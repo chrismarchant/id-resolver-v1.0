@@ -50,6 +50,8 @@ export class MockResolver {
   overrides: Override[] = [];
   /** Cursors below this stream index answer 410 cursor_expired. */
   retentionFloor = 0;
+  /** Simulates a cursor-key rotation: cursors minted under another prefix are rejected with 400. */
+  cursorPrefix = "";
   requests: LoggedRequest[] = [];
   installationId = "inst_test";
   private server: Server;
@@ -71,6 +73,7 @@ export class MockResolver {
     this.items = [];
     this.overrides = [];
     this.retentionFloor = 0;
+    this.cursorPrefix = "";
     this.requests = [];
   }
 
@@ -94,7 +97,7 @@ export class MockResolver {
       if (!Number.isInteger(limit) || limit < 1 || limit > 500) return this.send(res, 400, { version: "1", error: "invalid_request" });
       let start = this.retentionFloor; // no cursor = start of the retained buffer
       if (after !== null) {
-        const m = /^c([0-9]{1,9})$/.exec(after);
+        const m = new RegExp(`^${this.cursorPrefix}c([0-9]{1,9})$`).exec(after);
         if (!m || Number(m[1]) > this.items.length) return this.send(res, 400, { version: "1", error: "invalid_request" });
         start = Number(m[1]);
         if (start < this.retentionFloor) return this.send(res, 410, { version: "1", error: "cursor_expired" });
@@ -106,7 +109,7 @@ export class MockResolver {
         contract: "reporting-feed.v1",
         scope,
         items: slice,
-        next_cursor: `c${end}`,
+        next_cursor: `${this.cursorPrefix}c${end}`,
         has_more: end < this.items.length,
       });
     }

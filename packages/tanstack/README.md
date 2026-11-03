@@ -73,7 +73,7 @@ exactly what `next()` returned, so it composes with any other middleware.
 | `maxInFlight` | 50 (1 to 500) | reports in flight per process/isolate; extra ones are dropped (`overload`) |
 | `onUnsupportedBackground`, `blockingBudgetMs` | `"drop"`, 250 (50 to 1000) | edge isolate with no `waitUntil` only: drop, or block for at most the budget |
 | `eligibility` | `{}` | `includePaths`, `excludePaths` (exact path, `/prefix/*`, or RegExp), `extraBotPatterns` |
-| `pageKeyMapper` | none | for example `compileRouteTemplates(["/blog/:slug", "/products/:id"])`, so ids in dynamic segments are never sent |
+| `pageKeyMapper` | `defaultPageKeyMapper` | replaces the conservative default (see below). Use `compileRouteTemplates(["/blog/:slug", "/products/:id"])` when you know your routes |
 | `siteHosts` | host of the request URL | host names counted as "internal" referrers |
 | `onDeliveryResult` | none | receives non-identifying status (below) |
 | `allowDocumentationRanges` | `false` | accept RFC 5737/3849 IPs; tests and local development only |
@@ -110,10 +110,32 @@ HTML response to a **GET** that is not excluded by any of:
 * your `excludePaths` (and anything outside `includePaths`, when set)
 
 The body is exactly: `contract`, `website_id`, `ip`, `entrance_id` (128-bit random, base64url), `occurred_at` (now, UTC),
-`page_key` (normalised path, at most 256 characters, never a query string or fragment), `acquisition` (one of
+`page_key` (normalised path with identifier-like segments replaced, see below; at most 256 characters, never a query string or fragment), `acquisition` (one of
 `direct|search|social|email|paid|referral|internal|unknown`, from the referrer **host** versus your site host and
 `utm_medium`; raw values never leave the function) and `eligibility: "tsa-1"`. No header, cookie, user agent, referrer
 or query string is sent.
+
+### `page_key` privacy: the default mapper
+
+Dynamic path segments can carry reset tokens, e-mail addresses or order numbers, and `page_key` is stored by the resolver
+and served in the reporting feed. Unless you pass your own `pageKeyMapper`, `defaultPageKeyMapper` rewrites such segments:
+
+| Segment | Becomes |
+| --- | --- |
+| e-mail address (also percent-encoded `%40`) | `:email` |
+| UUID | `:uuid` |
+| digit run of 4 or more (a plain year such as `2026` is kept) | `:n`, in place (`order-12345` becomes `order-:n`) |
+| hex/base64url token of 16+ characters that is not a readable slug, or a 12+ character run mixing letters and digits | `:token` |
+
+Readable slugs (`pricing`, `case-studies`, `2026-11-03-product-update`) are kept. This is a heuristic, not a guarantee: to
+control exactly what is sent, supply your own mapper. It replaces the default entirely:
+
+```ts
+import { compileRouteTemplates, defaultPageKeyMapper } from "@salescrusader/idr-tanstack";
+// Known routes only; anything else falls through to the conservative default.
+const templates = compileRouteTemplates(["/blog/:slug", "/products/:id"]);
+pageKeyMapper: (path) => templates(path) ?? defaultPageKeyMapper(path),
+```
 
 ## Latency and failure behaviour (verified)
 

@@ -39,6 +39,7 @@ const HTTP_BY_STATUS: Record<SyncStatus, number> = {
   auth_failed: 502,
   upstream_error: 502,
   contract_error: 502,
+  cursor_rejected: 200,
   store_error: 500,
 };
 

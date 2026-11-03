@@ -102,9 +102,14 @@ UTC days inside the retained window.
   HMAC-SHA-256 tag bound to the deployment scope. The tag key is derived from
   the resolver's server-only `IP_HMAC_SECRET` with a dedicated label (the
   reporting token is not used because the consumer holds it). **Addition:**
-  rotating that secret invalidates outstanding cursors (`400`); the consumer
-  then resynchronises from the start of the buffer, which is safe because it
-  applies idempotently.
+  rotating that secret invalidates outstanding cursors (`400`). A consumer
+  that receives `400` to a request **that carried a cursor** must automatically
+  restart from the start of the buffer (reset its stored cursor, using the same
+  compare-and-set as any cursor change, and request without `after`); this is
+  safe because it applies idempotently. A `400` to a request **without** a cursor
+  is a contract error and must not trigger a reset. This differs from `410
+  cursor_expired`, which means data was missed and requires operator action. The
+  reference engine records the status `cursor_rejected` for such a run.
 
 ### Erasure and re-observation
 

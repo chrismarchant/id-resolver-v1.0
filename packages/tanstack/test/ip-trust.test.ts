@@ -28,14 +28,14 @@ describe("parsePublicIp", () => {
 
   it("accepts a real global unicast address of each family when documentation ranges are off", () => {
     expect(parsePublicIp("11.22.33.44")).toEqual({ ok: true, ip: "11.22.33.44", family: 4 }); // public-safety: allow-synthetic parser input, never contacted
-    expect(parsePublicIp("2a0d:1234:5678::1")).toEqual({ ok: true, ip: "2a0d:1234:5678::1", family: 6 });
+    expect(parsePublicIp("2a0d:1234:5678::1")).toEqual({ ok: true, ip: "2a0d:1234:5678::1", family: 6 }); // public-safety: allow-synthetic parser input, never contacted
   });
 
   const nonPublic = [
     "0.0.0.0", "0.1.2.3", "10.0.0.1", "10.255.255.255", "100.64.0.1", "100.127.255.255", "127.0.0.1", "127.255.255.254",
     "169.254.1.1", "172.16.0.1", "172.31.255.255", "192.0.0.8", "192.168.1.1", "192.88.99.1", "198.18.0.1", "198.19.255.255", // public-safety: allow-synthetic parser inputs, never contacted
     "224.0.0.1", "239.255.255.255", "240.0.0.1", "255.255.255.255",
-    "::", "::1", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "64:ff9b::808:808", "100::1",
+    "::", "::1", "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "64:ff9b::808:808", "100::1", // public-safety: allow-synthetic parser inputs, never contacted
     "2002:c000:204::1", "2001::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:2::1", "2001:10::1", "5f00::1",
   ];
   it.each(nonPublic)("rejects non-public %s", (ip) => {

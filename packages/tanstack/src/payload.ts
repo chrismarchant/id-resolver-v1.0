@@ -26,6 +26,55 @@ export function compileRouteTemplates(templates: readonly string[]): PageKeyMapp
   };
 }
 
+const EMAIL_SEGMENT = /^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/;
+const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TOKEN_CHARSET = /^[A-Za-z0-9_-]+$/;
+/** A part of a hyphenated slug: a lower-case word, a short number (year, day) or a short mixed token such as `v2` or `2fa`. */
+const SLUG_PART = /^(?:[a-z]+|[0-9]{1,4}|[a-z0-9]{1,4})$/;
+const YEAR = /^(?:19|20)[0-9]{2}$/;
+
+function decodeForClassification(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+function isTokenLike(segment: string): boolean {
+  // Long random-looking value: hex, base64url or similar, but not a readable slug.
+  if (segment.length >= 16 && TOKEN_CHARSET.test(segment)) {
+    const parts = segment.split(/[-_]/).filter((p) => p !== "");
+    if (!parts.every((p) => SLUG_PART.test(p))) return true;
+  }
+  // A single run of 12+ characters that mixes letters and digits (order ids, reset codes).
+  return segment.split(/[-_]/).some((p) => p.length >= 12 && /[A-Za-z]/.test(p) && /[0-9]/.test(p));
+}
+
+function mapSegment(segment: string): string {
+  const decoded = decodeForClassification(segment);
+  if (EMAIL_SEGMENT.test(decoded)) return ":email";
+  if (UUID_SEGMENT.test(decoded)) return ":uuid";
+  if (isTokenLike(decoded)) return ":token";
+  // Digit runs of 4+ are identifiers (order or account numbers); a plain year is kept.
+  return segment.replace(/[0-9]{4,}/g, (run) => (YEAR.test(run) ? run : ":n"));
+}
+
+/**
+ * Conservative default `page_key` mapper, used unless the site supplies its own
+ * `pageKeyMapper`. It replaces identifier-like path segments so that reset
+ * tokens, e-mail addresses and order ids never reach the resolver or the
+ * reporting feed: e-mail addresses become `:email`, UUIDs `:uuid`, digit runs
+ * of four or more `:n` (a plain year such as 2026 is kept), long hex/base64url
+ * tokens and 12+ character letter-and-digit runs `:token`. Readable slugs
+ * (`pricing`, `case-studies`) are kept. It is a heuristic: a site that knows its
+ * routes should use `compileRouteTemplates` instead.
+ */
+export const defaultPageKeyMapper: PageKeyMapper = (path) => {
+  const out = "/" + path.split("/").filter((s) => s !== "").map(mapSegment).join("/");
+  return out === path ? null : out;
+};
+
 function cap(path: string): string {
   if (path.length <= PAGE_KEY_MAX) return path;
   const cut = path.slice(0, PAGE_KEY_MAX);

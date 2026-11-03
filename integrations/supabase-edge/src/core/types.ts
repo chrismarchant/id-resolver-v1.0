@@ -56,6 +56,7 @@ export type SyncStatus =
   | "upstream_error"
   | "cas_conflict"
   | "contract_error"
+  | "cursor_rejected"
   | "store_error"
   | "reconcile_mismatch";
 
@@ -81,6 +82,12 @@ export interface Store {
   recordStatus(args: RecordStatusArgs): Promise<void>;
   /** Inclusive UTC calendar days (YYYY-MM-DD). */
   localCounts(fromDay: string, toDay: string): Promise<LocalCounts>;
+  /**
+   * Compare-and-set reset of the stored cursor to null (start of the resolver's
+   * buffer): only if the stored cursor still equals expectedCursor. Returns
+   * false when another invocation changed it. Keeps the projection.
+   */
+  resetCursor(expectedCursor: string): Promise<boolean>;
 }
 
 export interface SyncConfig {
