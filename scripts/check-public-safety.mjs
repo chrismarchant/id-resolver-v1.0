@@ -8,7 +8,8 @@
  * identifiers or real-looking traffic data. This gate complements gitleaks
  * (which runs separately in CI) with project-specific rules.
  *
- * Scans every file tracked by git (or staged for commit) and fails when it
+ * Scans every file tracked by git (or staged for commit), its name, and every
+ * ref name (as the pseudo-locations <path> and <ref>), and fails when it
  * finds:
  *   - a concrete Railway public hostname (<name>.up.railway.app); placeholders
  *     such as "<service>.up.railway.app" are allowed
@@ -42,7 +43,8 @@
  *               introduced), every commit message and annotated tag message,
  *               and author/committer/tagger identities (every rule except
  *               `email`: an author e-mail is inherent to git), with the same
- *               rules. History is immutable, so already-reviewed historical
+ *               rules, plus every path a commit adds (<path>) and every
+ *               ref name (<ref>). History is immutable, so already-reviewed historical
  *               synthetic hits are listed as exact
  *               `commit:path:rule:sha256(value)` fingerprints in
  *               .public-safety-history-allow (see that file). Messages and
@@ -127,7 +129,10 @@ const RULES = [
   },
   {
     id: "public-ipv4",
-    re: /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])/g,
+    // Not part of a longer dotted number run (a version such as 1.2.3.4.5), but a trailing or
+    // leading dot that is not followed or preceded by a digit is fine: "192.0.2.7." ends a
+    // sentence, "logs/192.0.2.7.txt" is a file name (shown with a documentation address).
+    re: /(?<!\d|\d\.)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g,
     allowMarker: true,
     filter: (m) => isPublicIpv4(m),
     why: "public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)",
@@ -162,6 +167,50 @@ export function sha256Hex(value) {
 /** How a matched value is printed: its length only, unless --show-values (local use only). No hash: it would reveal a low-entropy value. */
 export function displayValue(value, showValues = SHOW_VALUES) {
   return showValues ? value : `[redacted: ${value.length} chars]`;
+}
+
+/**
+ * A path or ref name as printed: every rule hit in it replaced by `[redacted: <n> chars]`
+ * (unless --show-values), and control characters escaped, so a value carried by a name
+ * never reaches the log.
+ */
+export function displayName(name, showValues = SHOW_VALUES) {
+  let out = name;
+  if (!showValues) {
+    const spans = [];
+    for (const rule of RULES) {
+      rule.re.lastIndex = 0;
+      for (const m of name.matchAll(rule.re)) if (!rule.filter || rule.filter(m[0])) spans.push([m.index, m.index + m[0].length]);
+    }
+    spans.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const [a, b] of spans) {
+      const last = merged[merged.length - 1];
+      if (last && a < last[1]) last[1] = Math.max(last[1], b);
+      else merged.push([a, b]);
+    }
+    out = "";
+    let pos = 0;
+    for (const [a, b] of merged) {
+      out += `${name.slice(pos, a)}[redacted: ${b - a} chars]`;
+      pos = b;
+    }
+    out += name.slice(pos);
+  }
+  return out.replace(/[\u0000-\u001f\u007f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
+}
+
+/** Pseudo-locations for hits in names. Real paths never start with "<". */
+const PATH_NAME = "<path>";
+const REF_NAME = "<ref>";
+
+/** Every ref (branches, tags, remote-tracking refs, notes, stash) as { object, name }. Ref names cannot contain spaces. */
+function listRefs() {
+  const out = git(["for-each-ref", "--format=%(objectname) %(refname)"], { encoding: "utf8" });
+  return out
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => ({ object: line.slice(0, line.indexOf(" ")), name: line.slice(line.indexOf(" ") + 1) }));
 }
 
 /** An error whose message is ours and never contains scanned content. */
@@ -304,8 +353,11 @@ export function decodeText(buf) {
   }
 }
 
-/** Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
-function scanText(text, report, skipRules = null) {
+/**
+ * Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)`
+ * is called per hit. Names (paths, refs) pass `honourMarker = false`: the opt-out marker is for content lines.
+ */
+function scanText(text, report, skipRules = null, honourMarker = true) {
   const lines = text.split(/\r\n|\n|\r|\u2028|\u2029/);
   lines.forEach((line, i) => {
     for (const rule of RULES) {
@@ -314,7 +366,7 @@ function scanText(text, report, skipRules = null) {
       for (const m of line.matchAll(rule.re)) {
         const hit = m[0];
         if (rule.filter && !rule.filter(hit)) continue;
-        report(rule, hit, i + 1, rule.allowMarker && line.includes(MARKER));
+        report(rule, hit, i + 1, honourMarker && rule.allowMarker && line.includes(MARKER));
       }
     }
   });
@@ -326,7 +378,10 @@ function checkTree(staged) {
   const optOuts = [];
   const skippedBinary = [];
   for (const file of files) {
-    for (const f of FORBIDDEN_FILES) if (f.re.test(file)) findings.push(`${file}: ${f.why}`);
+    const shown = displayName(file);
+    for (const f of FORBIDDEN_FILES) if (f.re.test(file)) findings.push(`${shown}: ${f.why}`);
+    // The name itself is content too: a file named after an address or a host publishes it.
+    scanText(file, (rule, hit) => findings.push(`${PATH_NAME} ${shown}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`), null, false);
     if (SKIP_FILES.has(file)) continue;
     let st;
     try {
@@ -338,17 +393,22 @@ function checkTree(staged) {
     const buf = readFileSync(file);
     const dec = decodeText(buf);
     if (dec === null) {
-      skippedBinary.push(file);
+      skippedBinary.push(shown);
       continue;
     }
     if (st.size > MAX_BYTES && !REVIEWED_LARGE_TEXT.has(file)) {
-      findings.push(`${file}: large-text-file: ${st.size} bytes exceeds ${MAX_BYTES}; split it or add its exact path to REVIEWED_LARGE_TEXT after review`);
+      findings.push(`${shown}: large-text-file: ${st.size} bytes exceeds ${MAX_BYTES}; split it or add its exact path to REVIEWED_LARGE_TEXT after review`);
       continue;
     }
     scanText(dec.text, (rule, hit, line, optedOut) => {
-      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} ${displayValue(hit)}`);
-      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
+      if (optedOut) optOuts.push(`${shown}:${line}: ${rule.id} ${displayValue(hit)}`);
+      else findings.push(`${shown}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
     });
+  }
+  // Ref names (branches, tags, remote-tracking refs) are public on the host too. In tree mode a
+  // hit cannot be waived: rename or delete the ref.
+  for (const ref of listRefs()) {
+    scanText(ref.name, (rule, hit) => findings.push(`${REF_NAME} ${displayName(ref.name)}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`), null, false);
   }
   return { count: files.length, findings, optOuts, skippedBinary };
 }
@@ -499,7 +559,7 @@ function scanPatchLog(log, ctx, historyPaths) {
     // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the blob and scan it whole.
     const content = git(["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
     const dec = decodeText(content);
-    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
+    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${displayName(p)}`);
     else ctx.scan(commit, p, dec.text);
   };
 
@@ -590,6 +650,8 @@ function scanTags(ctx) {
       const message = split === -1 ? "" : body.slice(split + 2);
       const h = (name) => new RegExp(`^${name} (.*)$`, "m").exec(headers)?.[1];
       ctx.scan(sha, TAG_MESSAGE_PATH, message);
+      const name = h("tag");
+      if (name !== undefined) ctx.scan(sha, REF_NAME, name, null, false, `tag ${displayName(name)}`);
       const tagger = h("tagger");
       if (tagger !== undefined) ctx.scan(sha, TAGGER_PATH, tagger.replace(/ \d+ [+-]\d{4}$/, ""), IDENTITY_SKIP);
       [sha, type] = [h("object"), h("type")];
@@ -609,12 +671,12 @@ function checkHistory(allow) {
     tags: 0,
     waivable: 0,
     skippedBinary: [],
-    emit(commit, path, rule, hit, optedOut) {
+    emit(commit, path, rule, hit, optedOut, note = "") {
       const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
       if (seen.has(fp)) return;
       seen.add(fp);
       if (isAllowed(allow, commit, path, rule.id, hit)) return;
-      const where = `${commit.slice(0, 12)}:${path}`;
+      const where = `${commit.slice(0, 12)}:${displayName(path)}${note ? ` ${note}` : ""}`;
       // A forbidden file's "value" is its path, which the location already shows.
       const what = rule.id === "forbidden-file" ? `${rule.id}: ${rule.why}` : `${rule.id}: ${rule.why}: ${displayValue(hit)}`;
       if (optedOut) optOuts.push(`${where}: ${rule.id} ${displayValue(hit)}`);
@@ -624,16 +686,22 @@ function checkHistory(allow) {
         findings.push(`${where}: ${what}\n      ${REMEDIATION}${SHOW_FINGERPRINTS ? `\n      allow-list fingerprint: ${fp}` : ""}`);
       }
     },
-    scan(commit, path, text, skipRules = null) {
-      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
+    scan(commit, path, text, skipRules = null, honourMarker = true, note = "") {
+      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut, note), skipRules, honourMarker);
     },
   };
   // Every path each commit adds or changes, read NUL-safely: an empty or binary .env or key file
   // (no "+++" line) and a path git would C-quote (`we"ird/.env`, a tab) are both checked.
   const historyPaths = collectHistoryPaths();
   for (const [commit, entries] of historyPaths) {
-    for (const e of entries) for (const f of FORBIDDEN_FILES) if (f.re.test(e.path)) ctx.emit(commit, e.path, { id: "forbidden-file", why: f.why }, e.path, false);
+    for (const e of entries) {
+      for (const f of FORBIDDEN_FILES) if (f.re.test(e.path)) ctx.emit(commit, e.path, { id: "forbidden-file", why: f.why }, e.path, false);
+      // File names are content too: every path a commit adds is scanned, as <path> (allow-listed per commit and value).
+      if (e.added) ctx.scan(commit, PATH_NAME, e.path, null, false, displayName(e.path));
+    }
   }
+  // Ref names, as <ref>, keyed by the object the ref points to.
+  for (const ref of listRefs()) ctx.scan(ref.object, REF_NAME, ref.name, null, false, displayName(ref.name));
   // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
   const log = git(
     ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
@@ -643,7 +711,7 @@ function checkHistory(allow) {
   scanCommitMetadata(ctx);
   scanTags(ctx);
   // Unused entries are named by their line in the allow-list (whose hashes are public there anyway), not reprinted.
-  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k.slice(0, k.lastIndexOf(":"))}`);
+  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${displayName(k.slice(0, k.lastIndexOf(":")))}`);
   return { count: ctx.commits, tags: ctx.tags, waivable: ctx.waivable, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
 }
 
