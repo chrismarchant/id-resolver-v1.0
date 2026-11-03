@@ -326,7 +326,15 @@ async function fullSuite(ctx: Ctx, ops: OpsConfig | undefined, pool: Pool | unde
     if (reading !== "unreadable" && isSmokeEngagement(reading)) {
       // Stop before any other request: the switch is not this run's to probe, release or count as found.
       report.check(KS_ORPHAN, false, "engaged with the smoke's own reason");
-      writeSummary(ctx, { ...summaryBase, kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", first_source: "not_run" });
+      // The summary names the phases that did not run as not_run, not their plan (G5R1-I2).
+      writeSummary(ctx, {
+        ...summaryBase,
+        events_phase: "not_run",
+        kill_switch_phase: "not_run",
+        kill_switch_prior: "engaged",
+        kill_switch_restore: "orphan_left_engaged",
+        first_source: "not_run",
+      });
       stderr(ORPHAN_MESSAGE);
       return smokeExitCode(report.counts().failed, "orphan_left_engaged");
     }

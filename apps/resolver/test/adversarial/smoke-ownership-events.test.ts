@@ -23,7 +23,9 @@
  *   - `--mode rollback-check` passes against a target without the route,
  *     writes nothing, and fails against a target that has it, still storing
  *     nothing there; the events-disabled check stores nothing there either
- *     (G5R1-L1).
+ *     (G5R1-L1);
+ *   - a run stopped by the orphan check reports its events and kill-switch
+ *     phases as not_run (G5R1-I2).
  *
  * Production database posture (Gate 5): the service and every smoke process
  * get the production database settings: verified TLS (DATABASE_SSL=
@@ -328,7 +330,8 @@ describe("smoke ownership and events phase against the real service: documentati
       const r = await runSmoke(smokeEnv);
       expect(r.code, r.stdout + r.stderr).toBe(2);
       expect(r.checks.map((c) => [c.check, c.outcome])).toEqual([[ORPHAN_CHECK, "fail"]]);
-      expect(r.summary).toMatchObject({ kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1 });
+      // G5R1-I2: the run stopped before the events and kill-switch phases, and the summary says so.
+      expect(r.summary).toMatchObject({ events_phase: "not_run", kill_switch_phase: "not_run", kill_switch_prior: "engaged", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1 });
       expect(r.stderr).toContain("KILL SWITCH LEFT ENGAGED BY AN EARLIER SMOKE RUN");
       expect(r.stderr).toContain("node dist/ops/kill-switch.js off --reason");
       expect(r.stderr).not.toContain("left_engaged_as_found");
@@ -361,6 +364,7 @@ describe("smoke ownership and events phase against the real service: documentati
       const next = await runSmoke(smokeEnv);
       expect(next.code, next.stdout + next.stderr).toBe(2);
       expect(next.checks.map((c) => [c.check, c.outcome])).toEqual([[ORPHAN_CHECK, "fail"]]);
+      expect(next.summary).toMatchObject({ events_phase: "not_run", kill_switch_phase: "not_run", kill_switch_restore: "orphan_left_engaged", checks: 1, failed: 1, skipped: 0 });
       expect(next.stderr).toContain("KILL SWITCH LEFT ENGAGED BY AN EARLIER SMOKE RUN");
       expect(await control()).toEqual(left);
       await expectSecretFree(next, base);
