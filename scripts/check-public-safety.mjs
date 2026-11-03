@@ -57,14 +57,23 @@
  * rewriting and credential rotation, not a waiver. The allow-list is validated
  * in every mode.
  *
- * Usage: node scripts/check-public-safety.mjs [--staged | --history]
- * Exit code 0 = clean, 1 = findings, 2 = internal error.
+ * Output never contains a matched value: the repository and its CI logs are
+ * public, so a real leak must not be republished there. A finding shows its
+ * location, the rule and a redacted form (length and the first 12 hex
+ * characters of the value's SHA-256); history fingerprints carry the full
+ * SHA-256. `--show-values` prints the raw values, for local use only: it is
+ * refused when the CI or GITHUB_ACTIONS environment variable is set, and CI
+ * must never pass it.
+ *
+ * Usage: node scripts/check-public-safety.mjs [--staged | --history] [--show-values]
+ * Exit code 0 = clean, 1 = findings, 2 = internal error (or --show-values in CI).
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 
 const MARKER = "public-safety: allow-synthetic";
+const SHOW_VALUES = process.argv.includes("--show-values");
 const MAX_BYTES = 2 * 1024 * 1024;
 const HISTORY_ALLOW_FILE = ".public-safety-history-allow";
 
@@ -143,6 +152,14 @@ const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it, and rot
 export function sha256Hex(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
+
+/** How a matched value is printed: redacted unless --show-values (local use only). */
+export function displayValue(value, showValues = SHOW_VALUES) {
+  return showValues ? value : `[redacted: ${value.length} chars, sha256 ${sha256Hex(value).slice(0, 12)}]`;
+}
+
+/** An error whose message is ours and never contains scanned content. */
+class GateError extends Error {}
 
 /**
  * E-mail addresses that are never personal data: RFC 2606 / RFC 6761 reserved
@@ -223,9 +240,17 @@ function isPublicIpv4(text) {
   return true;
 }
 
+/**
+ * Runs git with its stderr captured, never echoed: a git diagnostic could quote
+ * scanned content. A failure surfaces as an internal error (see the end of this file).
+ */
+function git(args, options = {}) {
+  return execFileSync("git", args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+}
+
 function listFiles(staged) {
   const args = staged ? ["diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"] : ["ls-files", "-z", "--cached", "--others", "--exclude-standard"];
-  const out = execFileSync("git", args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
+  const out = git(args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   return out.split("\0").filter(Boolean);
 }
 
@@ -315,8 +340,8 @@ function checkTree(staged) {
       continue;
     }
     scanText(dec.text, (rule, hit, line, optedOut) => {
-      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} (${hit})`);
-      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${hit}`);
+      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} ${displayValue(hit)}`);
+      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
     });
   }
   return { count: files.length, findings, optOuts, skippedBinary };
@@ -408,7 +433,7 @@ function scanPatchLog(log, ctx) {
     const blob = resultBlob.get(p);
     if (!blob || SKIP_FILES.has(p)) return;
     // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the blob and scan it whole.
-    const content = execFileSync("git", ["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
+    const content = git(["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
     const dec = decodeText(content);
     if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
     else ctx.scan(commit, p, dec.text);
@@ -483,7 +508,7 @@ const IDENTITY_SKIP = new Set(["email"]);
 
 /** Commit messages (every rule) and author/committer identities (every rule but e-mail). */
 function scanCommitMetadata(ctx) {
-  const out = execFileSync("git", ["log", "--all", "-z", "--no-color", "--format=%H%n%an <%ae>%n%cn <%ce>%n%B"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+  const out = git(["log", "--all", "-z", "--no-color", "--format=%H%n%an <%ae>%n%cn <%ce>%n%B"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
   for (const record of out.split("\0")) {
     const m = /^([0-9a-f]{40})\n([^\n]*)\n([^\n]*)\n([\s\S]*)$/.exec(record.replace(/^\n/, ""));
     if (!m) continue;
@@ -496,14 +521,14 @@ function scanCommitMetadata(ctx) {
 
 /** Annotated tag messages (every rule) and tagger identities (every rule but e-mail), following tags of tags. */
 function scanTags(ctx) {
-  const refs = execFileSync("git", ["for-each-ref", "refs/tags", "--format=%(objectname) %(objecttype)"], { encoding: "utf8" });
+  const refs = git(["for-each-ref", "refs/tags", "--format=%(objectname) %(objecttype)"], { encoding: "utf8" });
   const done = new Set();
   for (const ref of refs.split("\n").filter(Boolean)) {
     let [sha, type] = ref.split(" ");
     while (type === "tag" && !done.has(sha)) {
       done.add(sha);
       ctx.tags++;
-      const body = execFileSync("git", ["cat-file", "tag", sha], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+      const body = git(["cat-file", "tag", sha], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
       const split = body.indexOf("\n\n");
       const headers = split === -1 ? body : body.slice(0, split);
       const message = split === -1 ? "" : body.slice(split + 2);
@@ -517,8 +542,8 @@ function scanTags(ctx) {
 }
 
 function checkHistory(allow) {
-  if (execFileSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
-    throw new Error("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
+  if (git(["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
+    throw new GateError("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
   }
   const findings = [];
   const optOuts = [];
@@ -532,17 +557,19 @@ function checkHistory(allow) {
       if (seen.has(fp)) return;
       seen.add(fp);
       if (isAllowed(allow, commit, path, rule.id, hit)) return;
-      if (optedOut) optOuts.push(`${commit.slice(0, 12)}:${path}: ${rule.id} (${hit})`);
-      else if (NEVER_ALLOW.has(rule.id)) findings.push(`${commit.slice(0, 12)}:${path}: ${rule.id}: ${rule.why}: ${hit}\n      ${NO_WAIVER}`);
-      else findings.push(`${commit.slice(0, 12)}:${path}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
+      const where = `${commit.slice(0, 12)}:${path}`;
+      // A forbidden file's "value" is its path, which the location already shows.
+      const what = rule.id === "forbidden-file" ? `${rule.id}: ${rule.why}` : `${rule.id}: ${rule.why}: ${displayValue(hit)}`;
+      if (optedOut) optOuts.push(`${where}: ${rule.id} ${displayValue(hit)}`);
+      else if (NEVER_ALLOW.has(rule.id)) findings.push(`${where}: ${what}\n      ${NO_WAIVER}`);
+      else findings.push(`${where}: ${what}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
     },
     scan(commit, path, text, skipRules = null) {
       scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
     },
   };
   // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
-  const log = execFileSync(
-    "git",
+  const log = git(
     ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
     { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
   );
@@ -567,6 +594,9 @@ function splitBuffer(buf, sep) {
 }
 
 function main() {
+  if (SHOW_VALUES && ["CI", "GITHUB_ACTIONS"].some((k) => (process.env[k] ?? "") !== "" && process.env[k] !== "false")) {
+    throw new GateError("--show-values prints raw matched values and is for local use only; refusing it in CI (CI or GITHUB_ACTIONS is set)");
+  }
   const history = process.argv.includes("--history");
   const allow = loadHistoryAllow();
   const r = history ? checkHistory(allow.entries) : checkTree(process.argv.includes("--staged"));
@@ -598,6 +628,14 @@ function main() {
 try {
   main();
 } catch (err) {
-  console.error(`public-safety: internal error: ${err instanceof Error ? err.message : String(err)}`);
+  // Only our own messages are printed by default: another error's message (e.g. a failed
+  // git command with its stderr) could quote scanned content.
+  const detail =
+    err instanceof GateError || SHOW_VALUES
+      ? err instanceof Error
+        ? err.message
+        : String(err)
+      : `${err instanceof Error ? err.name : "error"}${err && typeof err === "object" && "status" in err ? ` (exit status ${err.status})` : ""}; rerun locally with --show-values for the message`;
+  console.error(`public-safety: internal error: ${detail}`);
   process.exit(2);
 }

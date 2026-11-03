@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,7 +29,13 @@ function repoWith(files) {
 }
 
 function runGate(dir, ...args) {
-  const r = spawnSync(process.execPath, [GATE, ...args], { cwd: dir, encoding: "utf8" });
+  return runGateEnv(dir, {}, ...args);
+}
+
+/** Runs the gate with CI markers removed from the environment, plus `env`. */
+function runGateEnv(dir, env, ...args) {
+  const { CI: _ci, GITHUB_ACTIONS: _gha, ...rest } = process.env;
+  const r = spawnSync(process.execPath, [GATE, ...args], { cwd: dir, encoding: "utf8", env: { ...rest, ...env } });
   return { code: r.status, out: `${r.stdout}${r.stderr}` };
 }
 
@@ -280,6 +286,9 @@ test("--history sees an added UTF-16 file, a deleted .env, and ignores removed l
 // ---- history allow-list: hashed entries, scanned, refusals (CHR-66 N4) ------
 
 const sha256 = (v) => createHash("sha256").update(v, "utf8").digest("hex");
+/** The redacted form the gate prints for a value by default. */
+const red = (v) => `[redacted: ${v.length} chars, sha256 ${sha256(v).slice(0, 12)}]`;
+const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const ALLOW = ".public-safety-history-allow";
 const otherIp = [9, 9, 9, 8].join(".");
 
@@ -337,8 +346,8 @@ test("a hashed entry waives exactly one hit", () => {
     assert.equal(r.code, 1, r.out);
     const findings = r.out.split("\n").filter((l) => / public-ipv4: public IPv4 literal/.test(l));
     assert.deepEqual(findings.map((l) => l.trim().replace(/^[0-9a-f]{12}:/, "")).sort(), [
-      `a.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${otherIp}`,
-      `b.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${publicIp}`,
+      `a.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${red(otherIp)}`,
+      `b.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${red(publicIp)}`,
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -502,7 +511,7 @@ test("--history scans commit messages: a public IPv4 (and a host, a UUID) in a m
     assert.equal(runGate(dir).code, 0);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, new RegExp(`${sha.slice(0, 12)}:<commit message>: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, new RegExp(`${sha.slice(0, 12)}:<commit message>: public-ipv4: .*${esc(red(publicIp))}`));
     assert.match(r.out, /<commit message>: railway-public-host/);
     assert.match(r.out, /<commit message>: uuid-literal/);
     assert.match(r.out, new RegExp(`allow-list fingerprint: ${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`));
@@ -539,8 +548,8 @@ test("--history: a value introduced only in a merge resolution, then removed, is
     assert.equal(runGate(dir).code, 0);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:evil\\.txt: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
-    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:README\\.md: public-ipv4: .*${otherIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:evil\\.txt: public-ipv4: .*${esc(red(publicIp))}`));
+    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:README\\.md: public-ipv4: .*${esc(red(otherIp))}`));
   });
 });
 
@@ -569,8 +578,8 @@ test("--history: an added line whose content starts with \"++ \" is content, not
   try {
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
-    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${otherIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(red(publicIp))}`));
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(red(otherIp))}`));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -592,7 +601,7 @@ test("--history: noreply co-author trailers and example addresses in messages ar
     gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", "Fix", "-m", `Co-Authored-By: Someone <${email}>`);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, /<commit message>: email: .*someone@realcompany\.co\.uk\n\s+cannot be allow-listed/);
+    assert.match(r.out, new RegExp(`<commit message>: email: .*${esc(red(email))}\\n\\s+cannot be allow-listed`));
   });
 });
 
@@ -659,4 +668,88 @@ test("--history finds an empty or binary forbidden file (no \"+++\" line in the 
       rmSync(dir, { recursive: true, force: true });
     }
   }
+});
+
+// ---- output never republishes a matched value (public CI logs) -------------
+
+/** A repo whose HEAD has `x.txt` with a public IPv4, a real-looking e-mail and a Railway host, also in the commit message. */
+function plantedRepo() {
+  const dir = emptyRepo();
+  const text = `ip ${publicIp}\nowner ${email}\nurl https://${host}/v1\nsynthetic ${otherIp} // public-safety: allow-synthetic test input\n`;
+  writeFileSync(join(dir, "x.txt"), text);
+  gitEnv(dir, {}, "add", "-A");
+  gitEnv(dir, {}, "commit", "-q", "-m", `add x: ${publicIp} ${email} ${host}`);
+  return { dir, sha: gitEnv(dir, {}, "rev-parse", "HEAD").trim() };
+}
+
+test("by default no matched value is printed, in tree and history mode (findings and opt-outs)", () => {
+  const { dir } = plantedRepo();
+  try {
+    for (const mode of [[], ["--history"]]) {
+      const r = runGate(dir, ...mode);
+      assert.equal(r.code, 1, r.out);
+      for (const v of [publicIp, email, host, otherIp]) {
+        assert.ok(!r.out.includes(v), `${mode.join(" ") || "tree"} output contains ${v}:\n${r.out}`);
+        assert.ok(r.out.includes(red(v)), `${mode.join(" ") || "tree"} output lacks the redacted form of ${v}:\n${r.out}`);
+      }
+      for (const rule of ["public-ipv4", "email", "railway-public-host"]) assert.match(r.out, new RegExp(`x\\.txt(:1|:2|:3)?: ${rule}`));
+      assert.match(r.out, /opt-out/);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--show-values prints the raw values, and is refused in CI", () => {
+  const { dir } = plantedRepo();
+  try {
+    for (const mode of [[], ["--history"]]) {
+      const r = runGate(dir, ...mode, "--show-values");
+      assert.equal(r.code, 1, r.out);
+      for (const v of [publicIp, email, host, otherIp]) assert.ok(r.out.includes(v), `${mode.join(" ") || "tree"} --show-values lacks ${v}:\n${r.out}`);
+    }
+    for (const env of [{ CI: "true" }, { GITHUB_ACTIONS: "true" }]) {
+      const r = runGateEnv(dir, env, "--history", "--show-values");
+      assert.equal(r.code, 2, r.out);
+      assert.match(r.out, /refusing it in CI/);
+      for (const v of [publicIp, email, host]) assert.ok(!r.out.includes(v));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("redaction leaves the fingerprints unchanged", () => {
+  const { dir, sha } = plantedRepo();
+  try {
+    const fps = (out) => out.split("\n").filter((l) => l.includes("allow-list fingerprint:")).map((l) => l.trim());
+    const quiet = fps(runGate(dir, "--history").out);
+    const shown = fps(runGate(dir, "--history", "--show-values").out);
+    assert.deepEqual(quiet, shown);
+    assert.ok(quiet.includes(`allow-list fingerprint: ${sha}:x.txt:public-ipv4:${sha256(publicIp)}`), quiet.join("\n"));
+    assert.ok(quiet.includes(`allow-list fingerprint: ${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`), quiet.join("\n"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an internal error does not echo git's message unless --show-values", () => {
+  const dir = mkdtempSync(join(tmpdir(), "public-safety-nogit-"));
+  try {
+    let r = runGate(dir);
+    assert.equal(r.code, 2, r.out);
+    assert.doesNotMatch(r.out, /not a git repository|ls-files/);
+    assert.match(r.out, /internal error: Error \(exit status \d+\); rerun locally with --show-values/);
+    r = runGate(dir, "--show-values");
+    assert.equal(r.code, 2, r.out);
+    assert.match(r.out, /not a git repository/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("CI never passes --show-values", () => {
+  const ci = readFileSync(resolve(import.meta.dirname, "..", ".github", "workflows", "ci.yml"), "utf8");
+  assert.match(ci, /check-public-safety\.mjs --history/);
+  assert.ok(!ci.includes("--show-values"));
 });

@@ -42,7 +42,7 @@ time under Settings → Code security; re-check before relying on them.
 | Control | Where | Verified by |
 |---|---|---|
 | **gitleaks 8.30.1** over the full git history, default ruleset + a narrow value-level allowlist of two synthetic test values | `.github/workflows/ci.yml` job `hygiene`; config `.gitleaks.toml` | Binary pinned by sha256 from the release checksums. A negative control (random hex and base64 tokens planted in a scratch directory) is detected with the same config. |
-| **Public-safety gate**, working tree: concrete `*.up.railway.app` / `*.railway.internal` hostnames, UUID literals, public IPv4 literals outside private/reserved/RFC 5737 ranges, public IPv6 literals (global unicast outside RFC 3849 and the protocol block; times and `Foo::bar` are not addresses), non-example e-mails (RFC 2606/6761 names and their subdomains, and git noreply addresses such as `noreply@anthropic.com` and `*@users.noreply.github.com`, are allowed), private-key blocks, committed `.env`/key files. UTF-8 (BOM), UTF-16 and UTF-32 are decoded; a text file over 2 MB **fails** unless its exact path is on the reviewed list; only the root `package-lock.json` and the probe lockfile are skipped (never by basename); true binaries are not scanned and are **listed** in the output | `scripts/check-public-safety.mjs`, job `hygiene` | `scripts/check-public-safety.test.mjs` plants a violation for every rule and encoding (UTF-16 LE/BE, BOM-less, NUL, large file, nested lockfile, IPv6) and proves allowed forms pass |
+| **Public-safety gate**, working tree: concrete `*.up.railway.app` / `*.railway.internal` hostnames, UUID literals, public IPv4 literals outside private/reserved/RFC 5737 ranges, public IPv6 literals (global unicast outside RFC 3849 and the protocol block; times and `Foo::bar` are not addresses), non-example e-mails (RFC 2606/6761 names and their subdomains, and git noreply addresses such as `noreply@anthropic.com` and `*@users.noreply.github.com`, are allowed), private-key blocks, committed `.env`/key files. UTF-8 (BOM), UTF-16 and UTF-32 are decoded; a text file over 2 MB **fails** unless its exact path is on the reviewed list; only the root `package-lock.json` and the probe lockfile are skipped (never by basename); true binaries are not scanned and are **listed** in the output | `scripts/check-public-safety.mjs`, job `hygiene` | `scripts/check-public-safety.test.mjs` plants a violation for every rule and encoding (UTF-16 LE/BE, BOM-less, NUL, large file, nested lockfile, IPv6) and proves allowed forms pass; it also proves the default output (tree and history) holds no planted value, that `--show-values` does and is refused in CI, and that fingerprints are unchanged |
 | **Public-safety gate**, history: the same rules over every line **added** by any commit reachable from any ref (`git log -p --cc --all`: for a merge, what the merge resolution itself introduced; added UTF-16 blobs are decoded whole; committed `.env`/key files are caught even if later deleted, also when empty or binary; a line is a file header only between `diff --git` and the first `@@`, so added content starting with `++ ` is scanned), every **commit message** and **annotated tag message**, and **author, committer and tagger identities** with every rule except `email` (see below). Fails on a shallow clone. Reviewed historical synthetic hits are exact `commit:path:rule:sha256(value)` fingerprints in `.public-safety-history-allow` (see "History allow-list" below) | `node scripts/check-public-safety.mjs --history`, job `hygiene` (checkout `fetch-depth: 0`) | Self-test: a value added and later removed is found; a value only in a merge resolution; an added `++ ` line; public IPv4/host/UUID in a commit message, a tag message and an identity; noreply co-author trailers stay quiet; exact hashed-fingerprint allow-listing (one entry waives one hit); refused rules, missing justifications and raw values in the allow-list fail; UTF-16, empty or binary forbidden files and deleted `.env` in history; shallow clone refused |
 | Dependency audit `npm audit --audit-level=high`; `npm ci --ignore-scripts` (no install hooks) | job `verify` | CI log |
 | Actions pinned to full commit SHAs; `permissions: contents: read`; `persist-credentials: false` | `ci.yml` | Review |
@@ -75,8 +75,27 @@ Limits, stated plainly: the gate is pattern-based (no hostname or domain allowli
 the Railway patterns, no entropy checks; gitleaks covers secrets). Binary files, and
 encodings other than UTF-8/16/32, are not scanned. History fingerprints name commit SHAs, so a
 history rewrite makes entries stale (reported as warnings) and the reviewed hits must be
-re-listed. A finding line still prints the flagged value itself in the CI log, so a
-reviewer can judge it; the value is already in the scanned content.
+re-listed.
+
+### Output: matched values are never printed by default
+
+The repository and its Actions logs are public, so a real leak the gate catches must not be
+republished in the CI log (gitleaks runs with `--redact` for the same reason).
+
+* Findings and marked opt-outs show the location (path or pseudo-path, line or commit), the
+  rule and a redacted form `[redacted: <length> chars, sha256 <first 12 hex>]`. History
+  fingerprints carry the full SHA-256, with the remediation text next to them.
+* git runs with its stderr captured, and an internal error prints only the gate's own
+  messages (otherwise the error type and exit status), so no git diagnostic is echoed.
+  Large-file and binary listings name paths and sizes only.
+* `node scripts/check-public-safety.mjs [--history] --show-values` prints the raw values.
+  It is for **local use only**: the gate refuses it (exit 2) when `CI` or `GITHUB_ACTIONS`
+  is set, and `.github/workflows/ci.yml` never passes it (the self-test checks this).
+* Caveat: a SHA-256 does not hide a low-entropy value. An IPv4 address can be recovered from
+  its hash by trying all 2^32 addresses, and an e-mail address or hostname by guessing. The
+  hashes in the log are there to correlate findings with allow-list entries, not to keep a
+  real value secret. If a real value was reported, also delete the logs of the CI runs that
+  reported it, after rewriting history and rotating.
 
 Author and committer (and tagger) **e-mail addresses are not checked** by the `email` rule:
 every commit carries them, so the rule would only ever demand history rewrites for git's
