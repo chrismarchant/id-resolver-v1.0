@@ -1,5 +1,5 @@
 import type { EligibilityRules } from "./eligibility.js";
-import type { PageKeyMapper } from "./payload.js";
+import { defaultPageKeyMapper, type PageKeyMapper } from "./payload.js";
 import { validateTrustPolicy } from "./trust.js";
 import type { TrustPolicy } from "./types.js";
 
@@ -46,7 +46,7 @@ export interface IdrOptions {
   /** Only for `onUnsupportedBackground: "await"`. 50..1000, default 250: the maximum TTFB this package may add. */
   blockingBudgetMs?: number;
   eligibility?: EligibilityRules;
-  /** Route-template mapper for `page_key`, e.g. `compileRouteTemplates(["/blog/:slug"])`. */
+  /** Replaces the conservative default `page_key` mapper (identifier-like segments become `:email`, `:uuid`, `:n`, `:token`), e.g. `compileRouteTemplates(["/blog/:slug"])`. */
   pageKeyMapper?: PageKeyMapper;
   /** Host names of this site for the internal-navigation check. Default: the host of the request URL. */
   siteHosts?: readonly string[];
@@ -72,7 +72,7 @@ export interface ResolvedConfig {
   onUnsupportedBackground: "drop" | "await";
   blockingBudgetMs: number;
   eligibility: EligibilityRules;
-  pageKeyMapper: PageKeyMapper | undefined;
+  pageKeyMapper: PageKeyMapper;
   siteHosts: readonly string[] | undefined;
   allowDocumentationRanges: boolean;
   onDeliveryResult: ((result: DeliveryResult) => void | Promise<void>) | undefined;
@@ -130,7 +130,7 @@ export function resolveConfig(options: IdrOptions): ResolvedConfig {
     onUnsupportedBackground,
     blockingBudgetMs,
     eligibility: options.eligibility ?? {},
-    pageKeyMapper: options.pageKeyMapper,
+    pageKeyMapper: options.pageKeyMapper ?? defaultPageKeyMapper,
     siteHosts: options.siteHosts,
     allowDocumentationRanges: options.allowDocumentationRanges === true,
     onDeliveryResult: options.onDeliveryResult,

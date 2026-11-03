@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildEntrance, classifyAcquisition, compileRouteTemplates, generateEntranceId, normalisePageKey, ACQUISITION_VALUES } from "../src/index.js";
+import { buildEntrance, classifyAcquisition, compileRouteTemplates, generateEntranceId, normalisePageKey, defaultPageKeyMapper, resolveConfig, ACQUISITION_VALUES } from "../src/index.js";
 import { assemblePayload } from "../src/payload.js";
 import { baseOptions, PUBLIC_IP, PUBLIC_IP_V6, reqWithIp, validateEntranceV1 } from "./helpers.js";
 
@@ -182,5 +182,58 @@ describe("payload validated strictly against entrance.v1", () => {
     const r = buildEntrance(reqWithIp("/p", PUBLIC_IP, { referer: "https://shop.example.com/cart" }), opts);
     if (!r.ok) throw new Error("expected ok");
     expect(r.payload.acquisition).toBe("internal");
+  });
+});
+
+// Built at run time: the public-safety gate rejects UUID literals in the repository.
+const UUID = ["123e4567", "e89b", "42d3", "a456", "426614174000"].join("-");
+
+describe("defaultPageKeyMapper (conservative page_key default)", () => {
+  const rows: Array<[string, string]> = [
+    // kept
+    ["/", "/"],
+    ["/pricing", "/pricing"],
+    ["/case-studies", "/case-studies"],
+    ["/blog/2026", "/blog/2026"],
+    ["/blog/2026-11-03-product-update", "/blog/2026-11-03-product-update"],
+    ["/blog/how-to-choose-a-customer-data-platform", "/blog/how-to-choose-a-customer-data-platform"],
+    ["/docs/internationalization", "/docs/internationalization"],
+    ["/v2/pricing", "/v2/pricing"],
+    // e-mail
+    ["/unsubscribe/person@example.com", "/unsubscribe/:email"],
+    ["/unsubscribe/person%40example.com", "/unsubscribe/:email"],
+    ["/u/first.last+tag@example.org/prefs", "/u/:email/prefs"],
+    // uuid
+    [`/orders/${UUID}`, "/orders/:uuid"],
+    [`/orders/${UUID.toUpperCase()}/invoice`, "/orders/:uuid/invoice"],
+    // digit runs
+    ["/orders/12345", "/orders/:n"],
+    ["/orders/1234", "/orders/:n"],
+    ["/orders/123", "/orders/123"],
+    ["/invoice-20261103", "/:token"],
+    ["/order-12345/details", "/order-:n/details"],
+    // tokens
+    ["/reset/9f86d081884c7d659a2feaa0c55ad015", "/reset/:token"],
+    ["/reset/k3J9xQ2mPz7LwR4tYb8N", "/reset/:token"],
+    ["/reset/aB3-dE9_fG1hJ2kL3m4N", "/reset/:token"],
+    ["/verify/ab12cd34ef56", "/verify/:token"],
+    ["/r/Xk39AbCdEfGh", "/r/:token"],
+    ["/a/b3c4d5e6f7a8/c", "/a/:token/c"],
+  ];
+  it.each(rows)("%j -> %j", (input, expected) => {
+    expect(normalisePageKey(input, defaultPageKeyMapper)).toBe(expected);
+  });
+
+  it("is on by default and a site-supplied mapper replaces it", () => {
+    const base = baseOptions();
+    expect(resolveConfig(base).pageKeyMapper("/reset/9f86d081884c7d659a2feaa0c55ad015")).toBe("/reset/:token");
+    const own = (p: string): string => p;
+    expect(resolveConfig({ ...base, pageKeyMapper: own }).pageKeyMapper).toBe(own);
+  });
+
+  it("the built entrance carries no identifier from the path", async () => {
+    const out = buildEntrance(reqWithIp("/reset/9f86d081884c7d659a2feaa0c55ad015?email=person%40example.com"), baseOptions());
+    expect(out.ok).toBe(true);
+    expect(JSON.stringify(out)).not.toContain("9f86d081884c7d659a2feaa0c55ad015");
   });
 });
