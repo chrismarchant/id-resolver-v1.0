@@ -66,7 +66,7 @@ describe("reporting feed: retention watermark", () => {
     const exact = await consumerAt(5); // cursor at old[4], the last item retention will remove
     const ahead = await consumerAt(8); // fully caught up
     const r = await retention.pruneAllBefore(retentionCutoff(new Date(now), 5), { batch: 2 });
-    expect(r).toEqual({ deleted: 5, batches: 3 });
+    expect(r).toEqual({ deleted: 5, batches: 3, backlog: false });
     expect(await retention.watermark(FEED_SCOPE)).toEqual({ txid: BigInt(old[4]!.txid), kind: FEED_KIND_OBSERVATION, id: BigInt(old[4]!.id) });
 
     const expired = await getFeed(app, behind.cursor);
@@ -155,9 +155,9 @@ describe("reporting feed: retention watermark", () => {
     expect(await retention.pruneBefore(cutoff, 2)).toBe(2);
     const left = await db.pool.query<{ id: string }>("SELECT id::text AS id FROM company_observations ORDER BY id");
     expect(left.rows.map((r) => r.id).slice(0, 3)).toEqual(old.slice(2).map((o) => o.id));
-    expect(await retention.pruneAllBefore(cutoff, { batch: 2, maxBatches: 1 })).toEqual({ deleted: 2, batches: 1 });
-    expect(await retention.pruneAllBefore(cutoff, { batch: 10 })).toEqual({ deleted: 1, batches: 1 });
-    expect(await retention.pruneAllBefore(cutoff, { batch: 10 })).toEqual({ deleted: 0, batches: 0 });
+    expect(await retention.pruneAllBefore(cutoff, { batch: 2, maxBatches: 1 })).toEqual({ deleted: 2, batches: 1, backlog: true });
+    expect(await retention.pruneAllBefore(cutoff, { batch: 10 })).toEqual({ deleted: 1, batches: 1, backlog: false });
+    expect(await retention.pruneAllBefore(cutoff, { batch: 10 })).toEqual({ deleted: 0, batches: 0, backlog: false });
     expect((await db.pool.query("SELECT 1 FROM company_observations")).rowCount).toBe(3);
     expect((await db.pool.query("SELECT 1 FROM feed_tombstones")).rowCount).toBe(0);
     for (const bad of [0, -1, 1.5, 100_001]) await expect(retention.pruneBefore(cutoff, bad)).rejects.toMatchObject({ name: "DbError", code: "INVALID_LIMIT" });

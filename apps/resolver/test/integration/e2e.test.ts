@@ -428,6 +428,49 @@ describe("end-to-end vertical slice", () => {
       expect(manager.activeCount()).toBe(0);
     });
 
+    it("an observation write past the deadline is not cancelled: the answer says recorded=false (not confirmed), then the observation commits and the feed serves it (CHR-66 F4)", async () => {
+      const first = await resolveRef(QUALIFIED_IP, REF(1)); // provider path: creates the company and the cache row
+      expect(first.body).toEqual({ version: "1", status: "qualified", source: "provider", recorded: true });
+      const companyId = (await observationRows()).rows[0]!.company_id;
+      const lateRef = REF(2);
+      const lateRow = () => db.pool.query<{ id: string; company_id: string; page_key: string }>("SELECT id::text AS id, company_id, page_key FROM company_observations WHERE observation_ref = $1", [lateRef]);
+      // Hold the company row lock past the request deadline: the cache-hit observation write blocks on it.
+      const locker = await db.pool.connect();
+      let committed = false;
+      try {
+        await locker.query("BEGIN");
+        expect((await locker.query("SELECT 1 FROM companies WHERE id = $1 FOR UPDATE", [companyId])).rowCount).toBe(1);
+        const t0 = Date.now();
+        const late = await resolveRef(QUALIFIED_IP, lateRef, { page_key: "/late-write" });
+        expect(Date.now() - t0).toBeLessThan(2_000); // REQUEST_DEADLINE_MS in the test config
+        // Answered by the deadline, honestly: not confirmed.
+        expect(late.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: false });
+        expect(logs().some((e) => e["event"] === "activity_write_failed" && e["reason"] === "deadline_exceeded")).toBe(true);
+        // At answer time nothing is stored yet: the write is still waiting on the lock.
+        expect((await lateRow()).rowCount).toBe(0);
+        await locker.query("COMMIT");
+        committed = true;
+      } finally {
+        if (!committed) await locker.query("ROLLBACK").catch(() => undefined);
+        locker.release();
+      }
+      // The write that outlived the answer commits afterwards (it was kept, not cancelled).
+      const until = Date.now() + 5_000;
+      while ((await lateRow()).rowCount === 0 && Date.now() < until) await new Promise((r) => setTimeout(r, 25));
+      const stored = (await lateRow()).rows;
+      expect(stored).toEqual([{ id: expect.any(String), company_id: companyId, page_key: "/late-write" }]);
+      // ... and the reporting feed serves it like any other observation.
+      const feedIds = async () => (await db.reporting.feed({ installationId: "inst-test", websiteId: "site-test" }, { after: null, limit: 100 })).items.flatMap((i) => (i.type === "observation" ? [String(i.observationId)] : []));
+      const feedUntil = Date.now() + 5_000;
+      while (!(await feedIds()).includes(stored[0]!.id) && Date.now() < feedUntil) await new Promise((r) => setTimeout(r, 25));
+      expect(await feedIds()).toContain(stored[0]!.id);
+      // A retry of the same entrance_id finds it and now confirms it, without a second observation.
+      const retry = await resolveRef(QUALIFIED_IP, lateRef);
+      expect(retry.body).toEqual({ version: "1", status: "qualified", source: "cache", recorded: true });
+      expect((await lateRow()).rowCount).toBe(1);
+      expect((await observationRows()).rows).toHaveLength(2);
+    });
+
     it("the observation history carries no IP, fingerprint, header, query string or provider field", async () => {
       await resolveRef(QUALIFIED_IP, REF(1));
       await resolveRef(QUALIFIED_IP, REF(2));

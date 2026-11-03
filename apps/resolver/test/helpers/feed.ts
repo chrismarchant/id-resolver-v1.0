@@ -21,7 +21,7 @@ import type { ObservationScope } from "../../src/contracts/db.js";
 import type { FeedItemWire, FeedObservationWire, ReportingFeedResponse } from "../../src/contracts/reporting-feed.js";
 import type { Db } from "../../src/db/index.js";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { getTestDatabaseUrl } from "./db.js";
+import { getTestDatabaseUrl, resetTestDb } from "./db.js";
 import { TEST_AUTH_TOKEN, testConfig } from "./env.js";
 
 export const FEED_REPORTING_TOKEN = ["test", "reporting", "token", "0123456789abcdef0123456789abcdef"].join("-");
@@ -76,11 +76,9 @@ export async function getFeed(app: FastifyInstance, after?: string, limit?: numb
 
 export type Queryable = Pick<pg.Pool | pg.PoolClient | pg.Client, "query">;
 
-/** Truncates every application table including the feed tables (resetTestDb predates them). */
+/** Truncates every application table including the feed tables, through resetTestDb (the 0007 guards reject a plain TRUNCATE). */
 export async function resetFeedDb(db: Db): Promise<void> {
-  await db.pool.query(
-    "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE",
-  );
+  await resetTestDb(db);
 }
 
 export async function createCompany(q: Queryable, domain: string, name: string | null = `${domain} Ltd`): Promise<number> {

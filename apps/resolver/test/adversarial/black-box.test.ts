@@ -72,6 +72,19 @@ describe("black-box service process", () => {
   beforeAll(async () => {
     db = await createTestDb();
     await resetTestDb(db);
+    // Due before the process starts: the startup maintenance run must remove
+    // them without waiting one CACHE_PRUNE_INTERVAL_S (CHR-66 F1), in several batches.
+    const seedCompany = await db.pool.query<{ id: string }>("INSERT INTO companies (domain, organisation_name, first_seen_at, last_seen_at) VALUES ('maintenance-seed.example', NULL, now(), now()) RETURNING id");
+    await db.pool.query(
+      `INSERT INTO company_observations (installation_id, website_id, company_id, observed_at, observation_ref, source)
+       SELECT 'inst-test', 'site-test', $1::bigint, now() - interval '40 days', 'bb-maint-' || lpad(g::text, 16, '0'), 'cache' FROM generate_series(1, 25) g`,
+      [seedCompany.rows[0]!.id],
+    );
+    await db.pool.query(
+      `INSERT INTO ip_resolution_cache (installation_id, website_id, key_version, ip_fingerprint, status, checked_at, expires_at)
+       SELECT 'inst-test', 'site-test', 1, sha256(convert_to('bb-maintenance-' || g, 'UTF8')), 'no_match', now() - interval '2 days', now() - interval '1 hour'
+       FROM generate_series(1, 25) g`,
+    );
     mock = await startMockEnrichServer({ slowMs: 4_000 });
     const env: NodeJS.ProcessEnv = {
       PATH: process.env["PATH"] ?? "",
@@ -96,6 +109,8 @@ describe("black-box service process", () => {
       PERIOD_CALL_CAP: "100",
       ALLOW_DOCUMENTATION_RANGES: "true",
       OBSERVATION_RETENTION_DAYS: "30",
+      // Default interval (600 s): only the startup run can prune during this suite.
+      CACHE_PRUNE_BATCH: "10",
     };
     proc = spawn(process.execPath, ["--import", "tsx", resolve("src/main.ts")], { env, stdio: ["ignore", "pipe", "pipe"], cwd: resolve(".") });
     proc.stdout!.on("data", (d: Buffer) => (output += d.toString()));
@@ -124,6 +139,18 @@ describe("black-box service process", () => {
     const r = await fetch(`${BASE}/readyz`);
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual({ ok: true });
+  });
+
+  it("runs maintenance once at startup, without waiting one interval, draining every due row in batches (CHR-66 F1)", async () => {
+    const deadline = Date.now() + 10_000;
+    while (!output.includes('"event":"maintenance_run"') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    const line = output.split("\n").find((l) => l.includes('"event":"maintenance_run"'));
+    expect(line, output.slice(-2000)).toBeDefined();
+    expect(JSON.parse(line!)).toMatchObject({ level: "info", cache_rows: 25, observation_rows: 25, backlog: false, outcome: "completed" });
+    expect(output.indexOf('"event":"maintenance_run"')).toBeGreaterThan(output.indexOf("server_started"));
+    expect((await db.pool.query("SELECT 1 FROM company_observations WHERE observation_ref LIKE 'bb-maint-%'")).rowCount).toBe(0);
+    expect((await db.pool.query("SELECT 1 FROM ip_resolution_cache WHERE expires_at <= now()")).rowCount).toBe(0);
+    expect(output).not.toContain('"event":"maintenance_backlog"');
   });
 
   it("rejects bad credentials, wrong website and oversized bodies before processing", async () => {

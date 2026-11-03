@@ -35,6 +35,8 @@ export const LOG_EVENTS = [
   "activity_write_failed",
   "observation_prune",
   "migration_check",
+  "maintenance_run",
+  "maintenance_backlog",
 ] as const;
 
 export type LogEvent = (typeof LOG_EVENTS)[number];
@@ -65,6 +67,9 @@ export const LOG_FIELDS = [
   "company_id",
   "recorded",
   "previously_seen",
+  "cache_rows",
+  "observation_rows",
+  "backlog",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];

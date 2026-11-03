@@ -28,6 +28,7 @@ import type { ReportingRepository } from "../contracts/db.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
+import { createCachedProbe, READINESS_CACHE_MS } from "./readiness.js";
 import { deriveFeedCursorKey, registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
 import { EntranceBodySchema } from "./schema.js";
 
@@ -37,8 +38,10 @@ export interface ServerDeps {
   config: Config;
   logger: Logger;
   runner: Runner;
-  /** Readiness probe for dependencies (database). */
+  /** Readiness probe for dependencies (database). /readyz caches its result and never runs two at once (src/api/readiness.ts). */
   ping: () => Promise<boolean>;
+  /** How long /readyz reuses one ping result. Default READINESS_CACHE_MS (1 s). */
+  readinessCacheMs?: number;
   /** Read-only reporting repository; reporting routes are registered only when both this and REPORTING_AUTH_TOKEN are present. */
   reporting?: ReportingRepository;
   now?: () => number;
@@ -68,7 +71,8 @@ function sendError(reply: FastifyReply, error: ErrorCode): FastifyReply {
  * Defensive: the response is rebuilt from four allowlisted fields, so nothing
  * else in an outcome (activity block, company id, reason) can reach the
  * website. `recorded` is true only for a qualified outcome whose observation
- * for this entrance_id is durably recorded.
+ * for this entrance_id was confirmed durably recorded in time; false means
+ * "not confirmed" (a write past the deadline may still commit, CHR-66 F4).
  */
 function toResponse(outcome: ResolutionOutcome): EntranceResponse {
   const status = (RESOLUTION_STATUSES as readonly string[]).includes(outcome.status) ? outcome.status : "unavailable";
@@ -106,6 +110,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // The reporting credential is separate and read-only; without it the reporting routes refuse everything.
   const checkReportingCredential = config.REPORTING_AUTH_TOKEN ? createCredentialChecker(config.REPORTING_AUTH_TOKEN) : () => false;
   const isReportingRoute = (matched: string | undefined) => matched !== undefined && matched.startsWith(REPORTING_PREFIX);
+  // Unauthenticated probes must not turn 1:1 into pool demand (CHR-66 F6): cached ~1 s, single-flight.
+  const readinessPing = createCachedProbe(deps.ping, { ttlMs: deps.readinessCacheMs ?? READINESS_CACHE_MS, now });
 
   const app = Fastify({
     logger: false,
@@ -171,13 +177,9 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   app.get("/healthz", { config: { rateLimit: false } }, async (_req, reply) => reply.code(200).send({ ok: true }));
 
   app.get("/readyz", { config: { rateLimit: false } }, async (_req, reply) => {
-    let dbOk = false;
-    try {
-      dbOk = await deps.ping();
-    } catch {
-      dbOk = false;
-    }
-    // Not ready while every job slot is taken: a load balancer should prefer another instance.
+    // Never rejects: a throwing ping counts as not ready (and is cached as such).
+    const dbOk = await readinessPing();
+    // Not ready while every job slot is taken: a load balancer should prefer another instance. Checked on every request.
     const ready = dbOk && runner.activeCount() < runner.capacity();
     logger.debug("readiness", { ready });
     return reply.code(ready ? 200 : 503).send({ ok: ready });

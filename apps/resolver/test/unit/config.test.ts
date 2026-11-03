@@ -32,6 +32,13 @@ describe("bounded configuration", () => {
     expect(() => testConfig({ PROVIDER_MODE: "live", ENRICH_API_KEY: "" })).toThrow(ConfigError);
   });
 
+  it("bounds the maintenance budget and keeps it below the interval (CHR-66 F1)", () => {
+    expect(testConfig().CACHE_PRUNE_BUDGET_MS).toBe(20_000);
+    expect(testConfig({ CACHE_PRUNE_INTERVAL_S: "30", CACHE_PRUNE_BUDGET_MS: "29999" }).CACHE_PRUNE_BUDGET_MS).toBe(29_999);
+    expect(() => testConfig({ CACHE_PRUNE_INTERVAL_S: "30", CACHE_PRUNE_BUDGET_MS: "30000" })).toThrow(/CACHE_PRUNE_BUDGET_MS must be below/);
+    for (const bad of ["999", "300001", "abc"]) expect(() => testConfig({ CACHE_PRUNE_BUDGET_MS: bad })).toThrow(/CACHE_PRUNE_BUDGET_MS/);
+  });
+
   it("names variables but never values in configuration errors", () => {
     const message = errorOf(() => loadConfig({ ...REQUIRED, INSTALLATION_ID: "Bad Id!", DATABASE_URL: "postgres://u:supersecretpw@h/db", PERIOD_CALL_CAP: "-5" }));
     expect(message).toContain("INSTALLATION_ID");

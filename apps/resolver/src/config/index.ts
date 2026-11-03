@@ -82,8 +82,12 @@ export const ConfigSchema = z.object({
   LEASE_MS: intInRange(500, 60_000, 6_000),
   PENDING_WAIT_MS: intInRange(0, 10_000, 1_500),
   PENDING_POLL_MS: intInRange(10, 1_000, 75),
+  /** Period of the maintenance run (expired cache rows and observation retention); it also runs once at startup. */
   CACHE_PRUNE_INTERVAL_S: intInRange(30, 86_400, 600),
+  /** Rows per delete statement; a run repeats batches until one comes back short or its budget is spent. */
   CACHE_PRUNE_BATCH: intInRange(10, 100_000, 1_000),
+  /** Time budget of one maintenance run; must be below the interval. A run that exhausts it logs maintenance_backlog. */
+  CACHE_PRUNE_BUDGET_MS: intInRange(1_000, 300_000, 20_000),
   /**
    * Observation retention (owner decision D3): a bounded synchronisation
    * buffer, not commercial history. REQUIRED with no default: the operator
@@ -155,6 +159,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (cfg.REPORTING_AUTH_TOKEN !== undefined && cfg.REPORTING_AUTH_TOKEN === cfg.RESOLVER_AUTH_TOKEN) {
     throw new ConfigError("invalid configuration: REPORTING_AUTH_TOKEN must differ from RESOLVER_AUTH_TOKEN");
+  }
+  if (cfg.CACHE_PRUNE_BUDGET_MS >= cfg.CACHE_PRUNE_INTERVAL_S * 1000) {
+    throw new ConfigError("invalid configuration: CACHE_PRUNE_BUDGET_MS must be below CACHE_PRUNE_INTERVAL_S x 1000");
   }
   if (cfg.SHUTDOWN_GRACE_MS < cfg.REQUEST_DEADLINE_MS + SHUTDOWN_DRAIN_MARGIN_MS) {
     throw new ConfigError(`invalid configuration: SHUTDOWN_GRACE_MS must be at least REQUEST_DEADLINE_MS + ${SHUTDOWN_DRAIN_MARGIN_MS}`);

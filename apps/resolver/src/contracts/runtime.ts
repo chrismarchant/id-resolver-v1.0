@@ -72,8 +72,9 @@ export interface ResolutionJob {
 /** Durable activity outcome for a qualified resolution. Never carries an IP, a fingerprint or a payload. */
 export interface ObservationActivity {
   company_id: number;
-  /** null when the write failed (unknown). */
+  /** null when the write failed or was not confirmed (unknown). */
   previously_seen: boolean | null;
+  /** true when the write was confirmed in time; false = not confirmed (a late write may still commit, CHR-66 F4). */
   recorded: boolean;
   observation_ref: string;
 }

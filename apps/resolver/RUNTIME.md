@@ -65,6 +65,20 @@ name variables, never values. See `.env.example` for every variable.
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
   and per-company scope statistics are never pruned.
+* **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
+  rows (IP fingerprints past their TTL) and observations older than the
+  retention window. It runs once at startup (after the server listens, not
+  blocking it) and then every `CACHE_PRUNE_INTERVAL_S` (default 600 s); runs
+  never overlap. A run drains: it repeats batches of `CACHE_PRUNE_BATCH` rows
+  (one statement each) until a batch comes back short, within
+  `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may use half of
+  it, observation retention gets the rest). Each run logs
+  `maintenance_run{cache_rows, observation_rows, backlog, duration_ms}`; a run
+  that stops with rows still due (budget spent, shutdown or a database error)
+  also logs the warning `maintenance_backlog{reason, category}`. Alert on
+  repeated `maintenance_backlog`: the buffer is then growing faster than it
+  is pruned; raise the batch size or the budget. On shutdown a running drain
+  stops after its current batch.
 * `PROVIDER_MODE=mock` is refused when `NODE_ENV=production` unless
   `ALLOW_MOCK_PROVIDER=true` (the isolated development deployment, D7).
   Paid enrichment stays off unless `PROVIDER_MODE=live` and
@@ -83,11 +97,29 @@ start** while any migration of this build is not applied, naming the missing
 files. A database that is ahead of the build (a rollback) is reported in the
 `migration_check` log line but not refused.
 
+Feed immutability (migration 0007, CHR-66 F5): the database refuses any
+UPDATE of a served observation column, any UPDATE or DELETE of an erasure
+tombstone, TRUNCATE of `company_observations`, `feed_tombstones` or
+`feed_retention_watermarks`, and any DELETE or backward move of the retention
+watermark. Observations leave the feed only by DELETE (retention, erasure,
+cascades, manual statements), which the watermark or a tombstone always
+makes visible to consumers. The only bypass is
+`SET session_replication_role = replica` (superuser-only, or an explicit
+`GRANT SET` on that parameter) or disabling triggers as the table owner:
+these are out-of-band operations, used by the test reset only. Never use
+them on a live deployment except as documented break-glass maintenance, and
+then make every feed consumer resynchronise.
+
 ## Health
 
 * `GET /healthz`: liveness, always 200 while the process serves HTTP.
 * `GET /readyz`: 200 only when the database answers and a job slot is free;
-  503 during shutdown.
+  503 during shutdown. The probe is unauthenticated and not rate limited, so
+  its database ping is cached for 1 s and single-flight (CHR-66 F6): however
+  many probes arrive, at most one ping is in flight and at most one starts
+  per second, so a probe flood cannot take connections from entrance jobs or
+  the feed. A database failure therefore shows within about 1 s plus the
+  ping's own 1 s timeout; the job-slot check is made on every request.
 
 ## Residual risks of the single-process model
 
@@ -110,6 +142,10 @@ These are accepted by D1 and listed for the independent review (CHR-66):
   from `process.env` does not change it.
 * **Work after the answer.** A job that overruns its deadline keeps running
   (bounded) after the caller got `unavailable`: a provider result received
-  in that window is committed to the cache, and a delayed observation write
-  may still land, so `recorded: false` means "not confirmed", never "not
-  recorded".
+  in that window is committed to the cache. An observation write that has
+  started is never cancelled (CHR-66 F4): when it outlives its budget the
+  caller gets `qualified` with `recorded: false`, and the write may still
+  commit afterwards, after which the reporting feed serves it. So
+  `recorded: false` means "not confirmed within the deadline", never "not
+  recorded" (`docs/contracts/entrance.v1.md`); retrying the same
+  `entrance_id` never adds a second observation.
