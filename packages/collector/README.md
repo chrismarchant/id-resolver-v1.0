@@ -190,6 +190,13 @@ npm run build -w @salescrusader/idr-collector     # dist/ (tsc) + dist/idr-colle
 Dev dependencies: `esbuild` (the build and the size test; already in the repository's lockfile through `tsx`),
 `happy-dom` (DOM test environment), `typescript`, `vitest`, `@types/node`.
 
+### Verified end to end
+
+The TanStack probe app (`packages/tanstack/verification`, section "Gate 4" of `RESULTS.md`) bundles this
+collector into its client and registers `createCollectorRoute`. On local workerd and on the Node target, a page
+loaded in headless Chrome sent its `page_view` beacon through the route to a stand-in resolver: `204` to the
+browser, then `event.v1` delivered through `waitUntil`.
+
 ### Not verified
 
 * Safari and Firefox were not run. In particular, Safari and Firefox without the Navigation API use the history hook,

@@ -6,6 +6,9 @@
 //   NITRO_PRESET=node-server npm run build && PROBE_TARGET=node node harness.mjs
 import http from "node:http";
 import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SINK_PORT = 4599;
 const APP_PORT = 8799;
@@ -47,7 +50,7 @@ for (let i = 0; i < 120; i++) {
 for (let i = 0; i < 3; i++) await (await fetch(`${base}/m/none/warm${i}`, HTML)).text();
 received.length = 0;
 
-const out = { sinkMode: SINK_MODE, target: TARGET, node: process.version, lifecycle: [], idrPackage: null };
+const out = { sinkMode: SINK_MODE, target: TARGET, node: process.version, lifecycle: [], idrPackage: null, collectorRoute: null, collectorBrowser: null };
 
 // A. Raw lifecycle modes (300 ms delayed POST to the sink).
 const modes = ["none", "unawaited", "awaited", "cfworkers", "request", "event"];
@@ -97,6 +100,61 @@ function rawGet(path, headers) {
     payload: hit ? { ...hit.body, ip: "<redacted-in-log>" } : null,
     hookResults: (await (await fetch(`${base}/diag/idr`, HTML)).json()).filter((x) => !x.includes("excluded_path")),
   };
+}
+// C. The first-party collector route (createCollectorRoute, src/routes/idr.e.ts) on the same runtime.
+//    A browser-shaped POST plus hostile headers, a cross-site POST, and (when Chrome is available) a real browser
+//    loading the page so that the collector bundle in __root.tsx sends its own beacon.
+function rawPost(path, headers, body) {
+  return new Promise((resolve, reject) => {
+    const t0 = performance.now();
+    const req = http.request({ host: "127.0.0.1", port: APP_PORT, path, method: "POST", headers: { ...headers, "content-length": Buffer.byteLength(body) } }, (res) => {
+      const ttfb = performance.now() - t0;
+      let b = "";
+      res.on("data", (c) => (b += c));
+      res.on("end", () => resolve({ status: res.statusCode, ttfb, body: b, headers: res.headers }));
+    });
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+const randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(22)), (b) => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"[b & 63]).join("");
+const SECRETS = ["198.51.100.23", "203.0.113.9", "192.0.2.44", "secret-cookie", "SecretAgent", "secret-ref"];
+const HOSTILE = { "cf-connecting-ip": "198.51.100.23", "x-forwarded-for": "203.0.113.9", "x-real-ip": "192.0.2.44", cookie: "sid=secret-cookie", "user-agent": "SecretAgent/1.0", referer: `${base}/secret-ref?x=1` };
+const ORIGIN_OK = { origin: base, "sec-fetch-site": "same-origin", "content-type": "text/plain;charset=UTF-8" };
+if (SINK_MODE === "ok" || SINK_MODE === "500") {
+  received.length = 0;
+  const ev = { v: 1, event_id: randomId(), occurred_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), type: "conversion_intent", name: "cta_click", path: "/orders/12345", consent: "not_required" };
+  const accepted = await rawPost("/idr/e", { ...ORIGIN_OK, ...HOSTILE }, JSON.stringify(ev));
+  const replay = await rawPost("/idr/e", ORIGIN_OK, JSON.stringify(ev));
+  const crossSite = await rawPost("/idr/e", { ...ORIGIN_OK, origin: "https://evil.example.net", "sec-fetch-site": "cross-site" }, JSON.stringify({ ...ev, event_id: randomId() }));
+  const withQuery = await rawPost("/idr/e", ORIGIN_OK, JSON.stringify({ ...ev, event_id: randomId(), path: "/pricing?email=x" }));
+  await new Promise((x) => setTimeout(x, 1500));
+  const events = received.filter((x) => x.url === "/v1/events");
+  out.collectorRoute = {
+    accepted: { status: accepted.status, ttfb_ms: Math.round(accepted.ttfb), body: accepted.body, setCookie: accepted.headers["set-cookie"] ?? null, cacheControl: accepted.headers["cache-control"] },
+    replayStatus: replay.status, crossSiteStatus: crossSite.status, queryPathStatus: withQuery.status,
+    sinkEvents: events.length, sinkUrl: events[0]?.url ?? null, sinkHasBearer: events[0]?.hasBearer ?? null,
+    forwardedKeys: events[0] ? Object.keys(events[0].body).sort() : null,
+    forwarded: events[0]?.body ?? null,
+    forwardedContainsAnyHeaderValue: events.some((x) => SECRETS.some((s) => JSON.stringify(x.body).includes(s))),
+    hookResults: (await (await fetch(`${base}/diag/idr`, HTML)).json()).filter((x) => x.includes('"route":"collector"')),
+  };
+
+  // Real browser: the page's own collector bundle sends a page_view beacon to /idr/e on this runtime.
+  const chrome = [process.env.CHROME_PATH, "/usr/bin/google-chrome", "/usr/bin/chromium"].find((p) => p && existsSync(p));
+  if (chrome) {
+    received.length = 0;
+    const profile = mkdtempSync(join(tmpdir(), "idr-probe-chrome-"));
+    const ch = spawn(chrome, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-proxy-server", "--remote-debugging-port=0", `--user-data-dir=${profile}`, `${base}/landing/browser-check`], { stdio: "ignore", detached: true });
+    for (let i = 0; i < 100 && !received.some((x) => x.url === "/v1/events"); i++) await new Promise((x) => setTimeout(x, 100));
+    await new Promise((x) => setTimeout(x, 500));
+    try { process.kill(-ch.pid, "SIGKILL"); } catch {}
+    rmSync(profile, { recursive: true, force: true });
+    const ev2 = received.filter((x) => x.url === "/v1/events");
+    out.collectorBrowser = { chrome: true, sinkEvents: ev2.length, forwarded: ev2.map((x) => x.body), hookResults: (await (await fetch(`${base}/diag/idr`, HTML)).json()).filter((x) => x.includes('"route":"collector"')).slice(-2) };
+  } else {
+    out.collectorBrowser = { chrome: false };
+  }
 }
 console.log(JSON.stringify(out, null, 2));
 console.log("--- process log tail ---");

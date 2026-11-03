@@ -82,7 +82,10 @@ describe("package hygiene", () => {
 
 describe("bundle safety (TanStack Start probe build)", () => {
   const haveProbe = existsSync(join(probeDir, "node_modules", ".bin", "vite"));
-  const FORBIDDEN_IN_CLIENT = [TEST_TOKEN, "createIdrServerMiddleware", "idr-tanstack", "/v1/entrances", "entrance.v1", "cf-connecting-ip", "x-forwarded-for", "resolverUrl", "allowInsecureHttp"];
+  // The probe registers both server exports exactly as documented: the middleware in src/start.ts and the
+  // collector route inline in src/routes/idr.e.ts `server.handlers`. Its root route also starts the browser
+  // collector, so the client bundle legitimately holds the collector, and must hold nothing of the server side.
+  const FORBIDDEN_IN_CLIENT = [TEST_TOKEN, "createIdrServerMiddleware", "createCollectorRoute", "idr-tanstack", "/v1/entrances", "/v1/events", "entrance.v1", "event.v1", "cf-connecting-ip", "x-forwarded-for", "sec-gpc", "resolverUrl", "allowInsecureHttp", "replayCacheSize", "maxClockSkewMs"];
 
   // The probe has its own lockfile and is not an npm workspace. When its
   // node_modules are absent (for example a fresh CI checkout) this test is
@@ -91,7 +94,7 @@ describe("bundle safety (TanStack Start probe build)", () => {
   // to enable it.
   // CI sets IDR_REQUIRE_PROBE=1 so a missing probe install fails instead of skipping.
   const requireProbe = process.env["IDR_REQUIRE_PROBE"] === "1";
-  it.skipIf(!haveProbe && !requireProbe)("a production build puts neither the server code nor the token in client assets", () => {
+  it.skipIf(!haveProbe && !requireProbe)("a production build puts neither the server code (middleware, collector route) nor the token in client assets", () => {
     rmSync(join(probeDir, ".output"), { recursive: true, force: true });
     execFileSync("npm", ["run", "build"], { cwd: probeDir, stdio: "pipe", timeout: 240_000, env: { ...process.env, NITRO_PRESET: "", CI: "1" } });
     const clientDir = join(probeDir, ".output", "public");
@@ -105,6 +108,12 @@ describe("bundle safety (TanStack Start probe build)", () => {
     const serverText = walk(serverDir).filter((f) => /\.(?:m?js|json)$/.test(f)).map((f) => readFileSync(f, "utf8")).join("\n");
     expect(serverText).toContain(TEST_TOKEN);
     expect(serverText).toContain("entrance.v1");
+    expect(serverText).toContain("event.v1");
+    expect(serverText).toContain("/v1/events");
+    expect(serverText).toContain("createCollectorRoute must only run on the server");
+    // ...and the client half is really there (the collector is bundled into the client).
+    expect(clientText).toContain("data-idr-event");
+    expect(clientText).toContain("idr-collector:");
   }, 300_000);
 
   it("refuses to run when a browser global is present (defence in depth)", async () => {

@@ -1,0 +1,180 @@
+{
+  "sinkMode": "ok",
+  "target": "cloudflare",
+  "node": "v22.23.4",
+  "lifecycle": [
+    {
+      "mode": "none",
+      "status": 200,
+      "ttfb_ms": 10,
+      "total_ms": 12,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "env": "process.env.IDR_ENV_PROBE=present",
+        "ua": "Cloudflare-Workers",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "unawaited",
+      "status": 200,
+      "ttfb_ms": 16,
+      "total_ms": 17,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "awaited",
+      "status": 200,
+      "ttfb_ms": 323,
+      "total_ms": 324,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": -14,
+      "diag": {
+        "result": "sink:200",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "cfworkers",
+      "status": 200,
+      "ttfb_ms": 11,
+      "total_ms": 12,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 297,
+      "diag": {
+        "waitUntil": "cloudflare:workers ok",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "request",
+      "status": 200,
+      "ttfb_ms": 9,
+      "total_ms": 9,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 298,
+      "diag": {
+        "request": "waitUntil=function runtime.cf.ctx.waitUntil=function",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "event",
+      "status": 200,
+      "ttfb_ms": 9,
+      "total_ms": 10,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "event": "ev=false keys= wu=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    }
+  ],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 16,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "kihkIAmX1G3HUBhBgcyl4w",
+      "occurred_at": "2026-11-03T20:12:41Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":3}"
+    ]
+  },
+  "collectorRoute": {
+    "accepted": {
+      "status": 204,
+      "ttfb_ms": 10,
+      "body": "",
+      "setCookie": null,
+      "cacheControl": "no-store"
+    },
+    "replayStatus": 409,
+    "crossSiteStatus": 403,
+    "queryPathStatus": 400,
+    "sinkEvents": 1,
+    "sinkUrl": "/v1/events",
+    "sinkHasBearer": true,
+    "forwardedKeys": [
+      "consent",
+      "contract",
+      "event_id",
+      "name",
+      "occurred_at",
+      "page_key",
+      "type",
+      "website_id"
+    ],
+    "forwarded": {
+      "contract": "event.v1",
+      "website_id": "probe-site",
+      "event_id": "vPgNjMZo-Fs5JAnZkuWpSp",
+      "occurred_at": "2026-11-03T20:12:43Z",
+      "type": "conversion_intent",
+      "name": "cta_click",
+      "page_key": "/orders/:n",
+      "consent": "not_required"
+    },
+    "forwardedContainsAnyHeaderValue": false,
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":2}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:replay\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:origin\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":1}"
+    ]
+  },
+  "collectorBrowser": {
+    "chrome": true,
+    "sinkEvents": 1,
+    "forwarded": [
+      {
+        "contract": "event.v1",
+        "website_id": "probe-site",
+        "event_id": "8KWPVHznPBolTrErwgdNyp",
+        "occurred_at": "2026-11-03T20:12:45Z",
+        "type": "page_view",
+        "name": "page_view",
+        "page_key": "/landing/browser-check",
+        "consent": "not_required"
+      }
+    ],
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":1}",
+      "{\"route\":\"collector\",\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":3}"
+    ]
+  }
+}

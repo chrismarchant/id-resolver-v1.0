@@ -278,9 +278,14 @@ export const Route = createFileRoute("/idr/e")({
 });
 ```
 
-Keep the call **inside `server.handlers`**. Do not assign `createCollectorRoute(...)` to a module-level constant in
-a route file, because that file is also part of the client build. The route also
-throws at creation if a `window` exists.
+Keep the call **inside `server.handlers`**, as above. A route file is also part of the client build, and the
+TanStack compiler strips `server.handlers` from it. The bundle-safety test builds the probe app with exactly this
+pattern and checks that neither the route code nor the token reaches client assets.
+
+* A module-level constant used only by `server.handlers` was also stripped in the verified TanStack Start 1.168
+  build.
+* A reference from any client code would ship the route to the browser. There it throws at creation, because a
+  `window` exists.
 
 It uses the same server-only variables as the middleware, and the same resolver options: `resolverUrl`, `token`,
 `websiteId`, `timeoutMs`, `retry`, `retryDelayMs`, `maxInFlight`, `onUnsupportedBackground`, `blockingBudgetMs`,

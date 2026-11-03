@@ -150,3 +150,61 @@ The sink also confirmed the wire shape: `POST /v1/entrances`, `Authorization: Be
   transitive `@tanstack/start-server-core` is 1.169.39.
 * Outbound `fetch` from a real Lovable/Cloudflare deployment to the Railway resolver was not exercised (no resolver
   here); the sink stands in for it.
+
+## Gate 4 (CHR-64): the collector route and the browser collector on the same lifecycle
+
+Run date: 3 Nov 2026, same sandbox, probe and versions as above (local workerd via `wrangler dev --local`, and the
+`node-server` build), plus Google Chrome for Testing 153.0.8010.12 headless.
+
+The probe now also registers:
+
+* `createCollectorRoute` inline in `src/routes/idr.e.ts` `server.handlers.POST`, as the README documents;
+* the browser collector in `src/routes/__root.tsx`, started in `useEffect` with `endpoint: "/idr/e"` and
+  `spa: true`.
+
+Section C of `harness.mjs` sends:
+
+* a browser-shaped POST, with hostile headers added: `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`, a cookie,
+  a user agent and a referrer;
+* the same `event_id` again;
+* a cross-site POST;
+* a path with a query string.
+
+It then starts headless Chrome on `/landing/browser-check`, so that the page's own collector bundle sends a real
+beacon to the route. Raw JSON: `raw/g4-collector-cf-ok.json`, `raw/g4-collector-cf-500.json`,
+`raw/g4-collector-node-ok.json`.
+
+| scenario | route answer to the browser | what the resolver stand-in received | `onDeliveryResult` |
+|---|---|---|---|
+| workerd, browser-shaped POST plus hostile headers | `204`, empty body, no `Set-Cookie`, `Cache-Control: no-store`, TTFB 10 ms | `POST /v1/events`, bearer token, body keys exactly `consent, contract, event_id, name, occurred_at, page_key, type, website_id`; `page_key` `/orders/:n` from path `/orders/12345`; none of the header values | `delivered`, `mode: wait_until`, 1 attempt |
+| workerd, the same `event_id` again | `409` | nothing | `skipped/collector:replay` |
+| workerd, `Origin` foreign and `Sec-Fetch-Site: cross-site` | `403` | nothing | `skipped/collector:origin` |
+| workerd, path with `?email=` | `400` | nothing | `skipped/collector:path` |
+| workerd, **real Chrome** loading a page | (beacon) | one `page_view` with `page_key` `/landing/browser-check` | `delivered`, `mode: wait_until` |
+| workerd, resolver answers 500 (`SINK_MODE=500`) | still `204`, TTFB 10 ms | the POST (answered 500) | `dropped/http_5xx`, `mode: wait_until` |
+| Node target (`node-server`), same steps | `204` / `409` / `403` / `400`, TTFB 6 ms | same as workerd | `delivered`, `mode: wait_until` (srvx sets `request.waitUntil` for server routes too) |
+
+Findings:
+
+* **G4-F1. `request.waitUntil` reaches server routes.** In TanStack Start server-route handlers (not only request
+  middleware), the `request` carries the Nitro `waitUntil` on both workerd and Node. The route therefore uses the
+  same verified background path as the middleware: the `204` is not held for the resolver, and the delivery
+  survives the response.
+* **G4-F2. Nothing of the route reaches client assets.** The client build strips `server.handlers`. The extended
+  bundle-safety test scans the client assets for `createCollectorRoute`, `/v1/events`, `event.v1`, `sec-gpc`,
+  `replayCacheSize` and the token. As a positive control it also requires the collector itself (`data-idr-event`)
+  to be in the client bundle.
+  * A deliberate mutation that references `createCollectorRoute` from client code makes that test fail.
+  * A module-level constant used only by `server.handlers` was also stripped by TanStack's dead-code elimination
+    in this version. The README still recommends the inline form.
+* **G4-F3. The origin check needs no configuration here.** `wrangler dev` and the Node server keep the request
+  URL's origin (`http://127.0.0.1:8799`), so the default origin check accepted Chrome's real beacon as it was. A
+  proxy that rewrites the scheme or host needs the `origins` option. That case was not exercised here.
+
+Not verified here:
+
+* the Cloudflare production edge;
+* other browsers than Chrome;
+* a real consent platform;
+* a real resolver `POST /v1/events`: the stand-in sink answers 200 for any body. The resolver side of `event.v1` is
+  another cell's work.
