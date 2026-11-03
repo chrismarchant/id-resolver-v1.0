@@ -145,6 +145,12 @@ function classifyTlsError(e: NodeJS.ErrnoException): DbTlsError {
   return new DbTlsError("DB_TLS_VERIFY_FAILED");
 }
 
+/** A connection failure carrying only the socket error code (its message would name the host and port). */
+function connectionError(e: NodeJS.ErrnoException): Error {
+  const code = typeof e.code === "string" && /^[A-Z0-9_]{1,24}$/.test(e.code) ? e.code : "DB_TLS_CLOSED";
+  return Object.assign(new Error("database connection failed"), { code });
+}
+
 function sniFor(host: string): string | undefined {
   // SNI must not be an IP address (RFC 6066, section 3).
   return net.isIP(host) === 0 ? host : undefined;
@@ -193,7 +199,9 @@ export function negotiatePostgresTls(opts: {
     };
     raw = net.connect({ host: opts.host, port: opts.port });
     opts.onRawSocket?.(raw);
-    const onRawError = () => fail(new DbTlsError("DB_TLS_CLOSED"));
+    // Before TLS starts, a socket error is a connectivity problem, not a TLS one:
+    // keep its code (ECONNREFUSED, ENOTFOUND, ...), drop its message (it names the host).
+    const onRawError = (e: NodeJS.ErrnoException) => fail(connectionError(e));
     const onRawClose = () => fail(new DbTlsError("DB_TLS_CLOSED"));
     raw.on("error", onRawError);
     raw.once("close", onRawClose);

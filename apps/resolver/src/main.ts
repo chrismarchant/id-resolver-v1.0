@@ -2,8 +2,10 @@
  * Service entry point (single-process runtime, CHR-70 / owner decision D1).
  *
  * Loads bounded configuration, installs process-level crash containment and
- * the event-loop watchdog, refuses to start while the database has pending
- * migrations, builds the in-process job runner over one shared database
+ * the event-loop watchdog, connects with the database TLS policy and (with
+ * role separation) as the least-privilege runtime role, refusing to start when
+ * that login is not least-privilege, refuses to start while the database has
+ * pending migrations, builds the in-process job runner over one shared database
  * pool, serves the API, runs the maintenance loop (expired cache rows and
  * observation retention, drained in bounded batches within a time budget,
  * once at startup and then every CACHE_PRUNE_INTERVAL_S; never overlapping),

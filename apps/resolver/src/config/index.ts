@@ -67,7 +67,6 @@ export const ConfigSchema = z.object({
   /** NODE_ENV=production refuses to run as the DATABASE_URL owner role unless this is set (development deployment only). */
   ALLOW_OWNER_DATABASE_ROLE: boolFromString(false),
 
-
   // Provider
   PROVIDER_MODE: z.enum(["live", "mock", "disabled"]).default("disabled"),
   /** The mock provider is refused when NODE_ENV=production unless this is set (isolated development deployment only). */

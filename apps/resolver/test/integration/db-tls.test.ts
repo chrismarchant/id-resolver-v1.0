@@ -158,6 +158,21 @@ describe("DATABASE_SSL=verify-pinned (pinned leaf certificate, self-signed, CN m
     expect(Date.now() - started).toBeLessThan(8_000);
   });
 
+  it("an unreachable server is a connectivity error (its socket code), not a TLS one, and the error never names the host", async () => {
+    const t = await terminator(cert);
+    const url = t.urlFor(getTestDatabaseUrl());
+    await t.close();
+    terminators.pop();
+    const p = pool(url, { mode: "verify-pinned", pins: [cert.sha256] }, 1);
+    const err = await p.query("SELECT 1").then(
+      () => null,
+      (e: unknown) => e as Error & { code?: string },
+    );
+    expect(err?.code).toBe("ECONNREFUSED");
+    expect(err?.message).toBe("database connection failed");
+    expect(String(err?.stack)).not.toContain(String(new URL(url).port));
+  });
+
   it("a configuration without a valid pin is refused before connecting", () => {
     expect(() => createPool({ databaseUrl: getTestDatabaseUrl(), ssl: { mode: "verify-pinned" } })).toThrow(DbTlsError);
     expect(() => createPool({ databaseUrl: getTestDatabaseUrl(), ssl: "verify-pinned" })).toThrow(DbTlsError);
