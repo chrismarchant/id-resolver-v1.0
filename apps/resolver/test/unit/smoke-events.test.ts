@@ -154,6 +154,14 @@ describe("high-water-mark window verdict", () => {
     expect(windowVerdict(snap(), snap({ cacheRows: 6n }))).toMatchObject({ kind: "written_without_resolver_traffic" });
   });
 
+  it("counts resolver traffic from the start of the settle period: a job counted just before the window is concurrent traffic, not a failure", () => {
+    const since = snap({ resolverRequests: 49n });
+    expect(windowVerdict(snap(), snap({ observationsMaxId: 101n }), since)).toEqual({ kind: "inconclusive_concurrent_traffic", grew: ["company_observations"] });
+    expect(windowVerdict(snap(), snap({ cacheRows: 6n }), snap({ pendingCacheRows: 1n }))).toMatchObject({ kind: "inconclusive_concurrent_traffic" });
+    // No traffic at all since the settle period began: growth fails.
+    expect(windowVerdict(snap(), snap({ observationsMaxId: 101n }), snap())).toMatchObject({ kind: "written_without_resolver_traffic" });
+  });
+
   it("never fails on concurrent resolver traffic: inconclusive instead", () => {
     expect(windowVerdict(snap(), snap({ companiesMaxId: 11n, resolverRequests: 51n }))).toEqual({ kind: "inconclusive_concurrent_traffic", grew: ["companies"] });
     expect(windowVerdict(snap({ pendingCacheRows: 1n }), snap({ cacheRows: 6n }))).toMatchObject({ kind: "inconclusive_concurrent_traffic" });

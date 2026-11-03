@@ -16,8 +16,12 @@
  *   - the same-transaction check looks only at rows written by the very
  *     transactions that inserted this run's events (their xmin);
  *   - the high-water-mark window is reported as inconclusive (skipped), never
- *     failed, when resolver traffic ran during the window (usage counters or
- *     in-flight cache reservations).
+ *     failed, when resolver traffic ran during the window or the settle
+ *     period before it (usage counters), or a reservation was in flight at
+ *     any snapshot. The settle period covers a job that counted its request
+ *     just before the window and writes inside it: with the mock provider a
+ *     job's writes follow its count within milliseconds, and a job still
+ *     waiting on the provider holds a pending reservation.
  */
 import { guarded, type Pool } from "../db/pool.js";
 
@@ -157,16 +161,19 @@ export type WindowVerdict =
   | { kind: "inconclusive_concurrent_traffic"; grew: string[] };
 
 /**
- * Compares two snapshots taken around the event requests. Growth is an
+ * Compares the snapshots taken around the event requests. Growth is an
  * insert (a higher id, more cache rows, or a later checked_at); deletions by
- * the maintenance run only lower these marks, so they never count.
+ * the maintenance run only lower these marks, so they never count. Resolver
+ * traffic is counted from `since` (the start of the settle period before the
+ * window; defaults to `before`).
  */
-export function windowVerdict(before: ResolutionSnapshot, after: ResolutionSnapshot): WindowVerdict {
+export function windowVerdict(before: ResolutionSnapshot, after: ResolutionSnapshot, since: ResolutionSnapshot = before): WindowVerdict {
   const grew: string[] = [];
   if (after.companiesMaxId > before.companiesMaxId) grew.push("companies");
   if (after.observationsMaxId > before.observationsMaxId) grew.push("company_observations");
   if (after.cacheRows > before.cacheRows || after.cacheLatestCheckedMs > before.cacheLatestCheckedMs) grew.push("ip_resolution_cache");
   if (grew.length === 0) return { kind: "quiet" };
-  const traffic = after.resolverRequests > before.resolverRequests || before.pendingCacheRows > 0n || after.pendingCacheRows > 0n;
+  const traffic =
+    after.resolverRequests > since.resolverRequests || since.pendingCacheRows > 0n || before.pendingCacheRows > 0n || after.pendingCacheRows > 0n;
   return traffic ? { kind: "inconclusive_concurrent_traffic", grew } : { kind: "written_without_resolver_traffic", grew };
 }

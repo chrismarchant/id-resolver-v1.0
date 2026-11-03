@@ -48,7 +48,11 @@ export const UNKNOWN_ROUTE = "/v1/smoke-unknown-route";
 export const EVENT_PROBE_ADDRESS = "203.0.113.77";
 /** Address fragments that must never appear in a response (the smoke's own synthetic addresses). */
 export const ADDRESS_NEEDLES = ["203.0.113.", "2001:db8", "10.0.0.1"] as const;
-/** Wait after the last event request before the closing snapshot, so a write deferred by the service would land inside the window. */
+/**
+ * Settle periods of the high-water-mark window: before it opens (resolver
+ * traffic counted then makes growth inconclusive) and after the last event
+ * request (so a write the service deferred lands inside the window).
+ */
 export const SETTLE_MS = 500;
 
 export const EV = {
@@ -147,7 +151,13 @@ export async function runEventsPhase(deps: EventsPhaseDeps): Promise<void> {
     return `status ${a.status} recorded=${String(b?.["recorded"])}`;
   };
 
-  const before = deps.db ? await deps.db.snapshot().catch(() => undefined) : undefined;
+  let since: ResolutionSnapshot | undefined;
+  let before: ResolutionSnapshot | undefined;
+  if (deps.db) {
+    since = await deps.db.snapshot().catch(() => undefined);
+    await sleep(SETTLE_MS);
+    before = await deps.db.snapshot().catch(() => undefined);
+  }
 
   // ---- ingestion -------------------------------------------------------------
   const first = event("page_view", "page_view");
@@ -214,7 +224,7 @@ export async function runEventsPhase(deps: EventsPhaseDeps): Promise<void> {
     for (const c of EV_DB_CHECKS) rep.skip(c, "target is not this service (its database is not this environment's)");
   } else {
     await sleep(SETTLE_MS);
-    await databaseChecks(deps.db, rep, { pageKey, run: deps.run, expected, expectedRows, before, websiteId: deps.websiteId });
+    await databaseChecks(deps.db, rep, { pageKey, run: deps.run, expected, expectedRows, since, before, websiteId: deps.websiteId });
   }
 
   // ---- reporting feed afterwards -----------------------------------------------
@@ -244,6 +254,7 @@ async function databaseChecks(
     run: string;
     expected: Map<string, { type: string; name: string; consent: string }>;
     expectedRows: number;
+    since: ResolutionSnapshot | undefined;
     before: ResolutionSnapshot | undefined;
     websiteId: string;
   },
@@ -288,7 +299,7 @@ async function databaseChecks(
   }
 
   const after = await db.snapshot().catch(() => undefined);
-  if (!ctx.before || !after) {
+  if (!ctx.since || !ctx.before || !after) {
     rep.check(EV.observations, false, "database unreadable");
     rep.check(EV.hwm, false, "database unreadable");
     return;
@@ -297,10 +308,10 @@ async function databaseChecks(
   if (!obs) rep.check(EV.observations, false, "database unreadable");
   else rep.check(EV.observations, obs.withEventPageKey === 0 && obs.runSinceMark === 0, `event page_key ${obs.withEventPageKey}, run rows since mark ${obs.runSinceMark}`);
 
-  const verdict = windowVerdict(ctx.before, after);
+  const verdict = windowVerdict(ctx.before, after, ctx.since);
   if (verdict.kind === "quiet") rep.check(EV.hwm, true, "no row created");
   else if (verdict.kind === "written_without_resolver_traffic") rep.check(EV.hwm, false, `rows created with no resolver request: ${verdict.grew.join(",")}`);
-  else rep.skip(EV.hwm, `inconclusive, concurrent resolver traffic during the window (${verdict.grew.join(",")}); the scoped checks above still apply`);
+  else rep.skip(EV.hwm, `inconclusive, concurrent resolver traffic around the window (${verdict.grew.join(",")}); the scoped checks above still apply`);
 }
 
 /**
