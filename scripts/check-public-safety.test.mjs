@@ -357,7 +357,7 @@ for (const [rule, path, content, value] of [
     try {
       let r = runGate(dir, "--history");
       assert.equal(r.code, 1, r.out);
-      assert.match(r.out, new RegExp(`${rule}: .*\\n\\s+cannot be allow-listed: rewrite history to remove it and rotate or revoke the credential`));
+      assert.match(r.out, new RegExp(`${rule}: .*\\n\\s+cannot be allow-listed: rewrite history to remove it, and rotate or revoke what it exposed`));
       assert.doesNotMatch(r.out, /allow-list fingerprint/);
       writeFileSync(join(dir, ALLOW), `# reviewed: it is fine, trust me\n${sha}:${path}:${rule}:${sha256(value)}\n`);
       for (const mode of [["--history"], []]) {
@@ -463,5 +463,192 @@ test("--history refuses a shallow clone", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(clone, { recursive: true, force: true });
+  }
+});
+
+// ---- history blind spots: merges, "++ " lines, messages, identities, tags (CHR-66 N5)
+
+/** Runs git in `dir` with a fixed, example.com identity unless `env` overrides it. */
+function gitEnv(dir, env, ...args) {
+  return execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", ...args], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com", ...env },
+  });
+}
+
+function emptyRepo() {
+  const dir = mkdtempSync(join(tmpdir(), "public-safety-n5-"));
+  gitEnv(dir, {}, "init", "-q", "-b", "main");
+  writeFileSync(join(dir, "README.md"), "clean\n");
+  gitEnv(dir, {}, "add", "-A");
+  gitEnv(dir, {}, "commit", "-q", "-m", "init");
+  return dir;
+}
+
+function withRepo(fn) {
+  const dir = emptyRepo();
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("--history scans commit messages: a public IPv4 (and a host, a UUID) in a message is caught", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", `deploy to ${publicIp}`, "-m", `via ${host}, project ${uuid}`);
+    const sha = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    assert.equal(runGate(dir).code, 0);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, new RegExp(`${sha.slice(0, 12)}:<commit message>: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, /<commit message>: railway-public-host/);
+    assert.match(r.out, /<commit message>: uuid-literal/);
+    assert.match(r.out, new RegExp(`allow-list fingerprint: ${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`));
+  });
+});
+
+test("--history: a value introduced only in a merge resolution, then removed, is caught", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "checkout", "-q", "-b", "side");
+    writeFileSync(join(dir, "side.txt"), "side\n");
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "side");
+    gitEnv(dir, {}, "checkout", "-q", "main");
+    writeFileSync(join(dir, "main.txt"), "main\n");
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "main");
+    gitEnv(dir, {}, "merge", "-q", "--no-ff", "--no-commit", "side");
+    writeFileSync(join(dir, "evil.txt"), `ip ${publicIp}\n`);
+    writeFileSync(join(dir, "README.md"), `clean\nresolved with ${otherIp}\n`);
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "merge side");
+    const merge = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    gitEnv(dir, {}, "rm", "-q", "evil.txt");
+    writeFileSync(join(dir, "README.md"), "clean\n");
+    gitEnv(dir, {}, "commit", "-q", "-am", "remove");
+    assert.equal(runGate(dir).code, 0);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:evil\\.txt: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, new RegExp(`${merge.slice(0, 12)}:README\\.md: public-ipv4: .*${otherIp.replaceAll(".", "\\.")}`));
+  });
+});
+
+test("--history: a value from a merged branch is reported once, for the commit that added it", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "checkout", "-q", "-b", "side");
+    writeFileSync(join(dir, "side.txt"), `ip ${publicIp}\n`);
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "side");
+    const side = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    gitEnv(dir, {}, "checkout", "-q", "main");
+    writeFileSync(join(dir, "main.txt"), "main\n");
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "main");
+    gitEnv(dir, {}, "merge", "-q", "--no-ff", "-m", "merge side", "side");
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    const hits = r.out.split("\n").filter((l) => / public-ipv4: public IPv4 literal/.test(l));
+    assert.equal(hits.length, 1, r.out);
+    assert.match(hits[0], new RegExp(`^\\s*${side.slice(0, 12)}:side\\.txt:`));
+  });
+});
+
+test("--history: an added line whose content starts with \"++ \" is content, not a file header", () => {
+  const { dir } = historyRepo("plus.txt", `a\n++ ${publicIp} diff-header lookalike\n+++ b/${otherIp}\n`);
+  try {
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${publicIp.replaceAll(".", "\\.")}`));
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${otherIp.replaceAll(".", "\\.")}`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--history: noreply co-author trailers and example addresses in messages are quiet", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", "Fix a thing", "-m", [
+      "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>",
+      "Co-authored-by: Someone <12345+someone@users.noreply.github.com>",
+      "Committed-via: GitHub <noreply@github.com>",
+      "Reported-by: Ops <ops@mail.example.com>, QA <qa@ci.example.org>, Dev <dev@build.test>",
+    ].join("\n"));
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+  });
+  // ...but a real-looking address in a message is still caught, and cannot be allow-listed.
+  withRepo((dir) => {
+    gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", "Fix", "-m", `Co-Authored-By: Someone <${email}>`, "-m", "Reviewed-by: x <noreply@anthropic.com.evil.example.net>");
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /<commit message>: email: .*someone@realcompany\.co\.uk\n\s+cannot be allow-listed/);
+  });
+});
+
+test("the e-mail rule allows example subdomains and git noreply addresses in files too", () => {
+  const dir = repoWith({ "a.md": "ops@mail.example.com, noreply@anthropic.com, 1+x@users.noreply.github.com\n" });
+  try {
+    assert.equal(runGate(dir).code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  for (const bad of [["xnoreply", "anthropic.com"].join("@"), ["noreply", "anthropic.com.evil.net"].join("@"), ["ops", "example.com.evil.net"].join("@")]) {
+    expectFinding({ "a.md": `${bad}\n` }, "email");
+  }
+});
+
+test("--history scans author and committer identities with every rule except e-mail (documented limit)", () => {
+  withRepo((dir) => {
+    gitEnv(dir, { GIT_AUTHOR_NAME: `build ${publicIp}` }, "commit", "-q", "--allow-empty", "-m", "a");
+    let r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /<author>: public-ipv4/);
+    gitEnv(dir, {}, "reset", "-q", "--hard", "HEAD~1");
+    gitEnv(dir, { GIT_COMMITTER_EMAIL: `deploy@${host}` }, "commit", "-q", "--allow-empty", "-m", "b");
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /<committer>: railway-public-host/);
+  });
+  // The e-mail rule is not applied to identities: an author e-mail is inherent to git.
+  withRepo((dir) => {
+    gitEnv(dir, { GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_EMAIL: email }, "commit", "-q", "--allow-empty", "-m", "c");
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+  });
+});
+
+test("--history scans annotated tag messages and tagger identities", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "tag", "-a", "v1", "-m", `release, deployed to ${publicIp}`);
+    let r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /<tag message>: public-ipv4/);
+    assert.match(r.out, /in 1 commit\(s\) and 1 annotated tag\(s\):/);
+    gitEnv(dir, {}, "tag", "-d", "v1");
+    gitEnv(dir, { GIT_COMMITTER_NAME: `rel ${uuid}` }, "tag", "-a", "v2", "-m", "clean");
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /<tagger>: uuid-literal/);
+    gitEnv(dir, {}, "tag", "-d", "v2");
+    gitEnv(dir, {}, "tag", "-a", "v3", "-m", "Co-Authored-By: Claude <noreply@anthropic.com>");
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /1 annotated tag\(s\) scanned/);
+  });
+});
+
+test("--history finds an empty or binary forbidden file (no \"+++\" line in the diff)", () => {
+  for (const [path, content] of [[".env", ""], ["certs/client.p12", Buffer.from([0x30, 0x82, 0, 0x10, 0xff, 0xfe, 0, 0x81])]]) {
+    const { dir } = historyRepo(path, content);
+    try {
+      const r = runGate(dir, "--history");
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, new RegExp(`${path.replaceAll(".", "\\.")}: forbidden-file`));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });

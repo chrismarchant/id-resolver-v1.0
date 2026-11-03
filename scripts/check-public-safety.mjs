@@ -15,7 +15,9 @@
  *   - a Railway private hostname other than the generic postgres.railway.internal
  *   - a UUID literal (Railway project/service/environment/deployment ids are UUIDs)
  *   - a public IPv4 literal outside private, reserved and RFC 5737 documentation ranges
- *   - an e-mail address outside RFC 2606 reserved/example domains
+ *   - an e-mail address outside RFC 2606 reserved/example domains (git noreply
+ *     addresses such as noreply@anthropic.com and *@users.noreply.github.com
+ *     are allowed)
  *   - a public IPv6 literal (global unicast, first three bits 001, outside
  *     documentation 2001:db8::/32, 3fff::/20 and the 2001::/23 protocol block; link-local, ULA, loopback, "::" and mapped
  *     private IPv4 are never reported)
@@ -36,10 +38,16 @@
  *   (default)   every file tracked by git (or untracked and not ignored)
  *   --staged    files staged for commit
  *   --history   every line ADDED by any commit reachable from any ref
- *               (`git log -p --all`), with the same rules. History is
- *               immutable, so already-reviewed historical synthetic hits are
- *               listed as exact `commit:path:rule:sha256(value)` fingerprints
- *               in .public-safety-history-allow (see that file).
+ *               (`git log -p --cc --all`; for a merge, what the merge itself
+ *               introduced), every commit message and annotated tag message,
+ *               and author/committer/tagger identities (every rule except
+ *               `email`: an author e-mail is inherent to git), with the same
+ *               rules. History is immutable, so already-reviewed historical
+ *               synthetic hits are listed as exact
+ *               `commit:path:rule:sha256(value)` fingerprints in
+ *               .public-safety-history-allow (see that file). Messages and
+ *               identities use the pseudo-paths `<commit message>`,
+ *               `<author>`, `<committer>`, `<tag message>` and `<tagger>`.
  *
  * The allow-list file is scanned like any other file, so it can hold no raw
  * hit value: entries store the SHA-256 of the value. Every entry needs a
@@ -96,7 +104,7 @@ const RULES = [
     id: "email",
     re: /\b[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b/g,
     allowMarker: false,
-    filter: (m) => !/@(([a-z0-9-]+\.)*(example|invalid|test|localhost)|example\.(com|org|net))$/i.test(m) && !/@users\.noreply\.github\.com$/i.test(m),
+    filter: (m) => !isAllowedEmail(m),
     why: "e-mail address outside example domains",
   },
   {
@@ -130,10 +138,27 @@ const NEVER_ALLOW = new Set(["forbidden-file", "private-key-block", "email", "ra
 const KNOWN_RULES = new Set([...RULES.map((r) => r.id), "forbidden-file"]);
 const REMEDIATION =
   "only a SYNTHETIC value may be allow-listed; if the value is real, rewrite history to remove it and rotate or revoke it (do not list it)";
-const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it and rotate or revoke the credential";
+const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it, and rotate or revoke what it exposed (key, credential, host)";
 
 export function sha256Hex(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * E-mail addresses that are never personal data: RFC 2606 / RFC 6761 reserved
+ * names (any subdomain of example.com/.org/.net, and the .example, .invalid,
+ * .test and .localhost TLDs), and fixed git "noreply" identities, which appear
+ * in commit trailers such as `Co-Authored-By: Claude <noreply@anthropic.com>`.
+ */
+const ALLOWED_EMAILS = [
+  /@(?:[a-z0-9-]+\.)*(?:example|invalid|test|localhost)$/i,
+  /@(?:[a-z0-9-]+\.)*example\.(?:com|org|net)$/i,
+  /@users\.noreply\.github\.com$/i,
+  /^noreply@(?:anthropic\.com|github\.com)$/i,
+];
+
+function isAllowedEmail(address) {
+  return ALLOWED_EMAILS.some((re) => re.test(address));
 }
 
 /** Strict IPv6 text parser (RFC 4291, incl. "::" and an embedded dotted quad). Returns 8 hextets or null. */
@@ -248,11 +273,12 @@ export function decodeText(buf) {
   }
 }
 
-/** Applies every rule to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
-function scanText(text, report) {
+/** Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
+function scanText(text, report, skipRules = null) {
   const lines = text.split(/\r\n|\n|\r|\u2028|\u2029/);
   lines.forEach((line, i) => {
     for (const rule of RULES) {
+      if (skipRules?.has(rule.id)) continue;
       rule.re.lastIndex = 0;
       for (const m of line.matchAll(rule.re)) {
         const hit = m[0];
@@ -357,83 +383,174 @@ function isAllowed(allow, commit, path, rule, value) {
   return true;
 }
 
+/**
+ * Parses one `git log -p --raw --cc` stream. A file's header runs from its
+ * `diff --git`/`diff --cc` line to its first `@@` line; only there are
+ * `+++ `, `Binary files` and similar lines headers. In the hunk body every
+ * line carries one prefix column per parent, so an added line whose content
+ * starts with `++ ` (shown as `+++ ...`) is scanned as content. For a merge,
+ * `--cc` shows only what the merge itself introduced: a line is scanned when
+ * it is added relative to EVERY parent (lines taken from one parent were
+ * scanned in the commit that added them there).
+ */
+function scanPatchLog(log, ctx) {
+  let commit = "";
+  let state = "none"; // "none" (commit header / raw lines) | "header" | "body"
+  let parents = 1;
+  let path = null;
+  let skipPath = false;
+  const resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
+  const setPath = (p) => {
+    path = p;
+    skipPath = p !== null && SKIP_FILES.has(p);
+  };
+  const scanBlob = (p) => {
+    const blob = resultBlob.get(p);
+    if (!blob || SKIP_FILES.has(p)) return;
+    // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the blob and scan it whole.
+    const content = execFileSync("git", ["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
+    const dec = decodeText(content);
+    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
+    else ctx.scan(commit, p, dec.text);
+  };
+
+  for (const lineBuf of splitBuffer(log, 0x0a)) {
+    const line = lineBuf.toString("utf8");
+    // Neither a commit line nor a diff line can be hunk content: content lines start with a prefix column.
+    if (line.startsWith("commit ") && /^commit [0-9a-f]{40}$/.test(line)) {
+      commit = line.slice(7);
+      ctx.commits++;
+      state = "none";
+      setPath(null);
+      resultBlob.clear();
+      continue;
+    }
+    if (line.startsWith("diff --git ") || line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
+      state = "header";
+      setPath(line.startsWith("diff --git ") ? null : line.slice(line.indexOf(" ", 5) + 1));
+      continue;
+    }
+    if (state === "none") {
+      // Raw lines: ":<modes> <blobs> <status>\t<path>", one colon per parent. Every path the
+      // commit adds or changes is checked against the forbidden-file rules here, so an empty or
+      // binary .env or key file (which has no "+++" line) is found too.
+      const m = /^(:+)([^\t]+)\t(.+)$/.exec(line);
+      if (m) {
+        const n = m[1].length;
+        const blobs = m[2].split(" ").slice(n + 1, 2 * n + 2);
+        const result = blobs[n];
+        if (result && !/^0+$/.test(result)) {
+          resultBlob.set(m[3], result);
+          for (const f of FORBIDDEN_FILES) if (f.re.test(m[3])) ctx.emit(commit, m[3], { id: "forbidden-file", why: f.why }, m[3], false);
+        }
+      }
+      continue;
+    }
+    if (state === "header") {
+      if (line.startsWith("@@")) {
+        state = "body";
+        parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
+      } else if (line.startsWith("+++ ")) {
+        const p = line.slice(4);
+        setPath(p === "/dev/null" ? null : p.replace(/^b\//, ""));
+      } else if (line.startsWith("Binary files ")) {
+        const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
+        const p = m ? m[2] : path; // combined diffs print "Binary files differ"; the path is from "diff --cc"
+        if (p) scanBlob(p);
+      }
+      continue;
+    }
+    // Hunk body.
+    if (line.startsWith("@@")) {
+      parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
+      continue;
+    }
+    if (path === null || skipPath) continue;
+    const prefix = line.slice(0, parents);
+    if (prefix.length === parents && /^\+*$/.test(prefix)) ctx.scan(commit, path, line.slice(parents));
+  }
+}
+
+/** Pseudo-paths for content that is not a file. Real paths never start with "<". */
+const MESSAGE_PATH = "<commit message>";
+const AUTHOR_PATH = "<author>";
+const COMMITTER_PATH = "<committer>";
+const TAG_MESSAGE_PATH = "<tag message>";
+const TAGGER_PATH = "<tagger>";
+// Identities are scanned with every rule except "email": an author e-mail is inherent to git
+// (documented limitation, docs/PUBLIC_REPO_SECURITY.md).
+const IDENTITY_SKIP = new Set(["email"]);
+
+/** Commit messages (every rule) and author/committer identities (every rule but e-mail). */
+function scanCommitMetadata(ctx) {
+  const out = execFileSync("git", ["log", "--all", "-z", "--no-color", "--format=%H%n%an <%ae>%n%cn <%ce>%n%B"], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+  for (const record of out.split("\0")) {
+    const m = /^([0-9a-f]{40})\n([^\n]*)\n([^\n]*)\n([\s\S]*)$/.exec(record.replace(/^\n/, ""));
+    if (!m) continue;
+    const [, commit, author, committer, message] = m;
+    ctx.scan(commit, MESSAGE_PATH, message);
+    ctx.scan(commit, AUTHOR_PATH, author, IDENTITY_SKIP);
+    ctx.scan(commit, COMMITTER_PATH, committer, IDENTITY_SKIP);
+  }
+}
+
+/** Annotated tag messages (every rule) and tagger identities (every rule but e-mail), following tags of tags. */
+function scanTags(ctx) {
+  const refs = execFileSync("git", ["for-each-ref", "refs/tags", "--format=%(objectname) %(objecttype)"], { encoding: "utf8" });
+  const done = new Set();
+  for (const ref of refs.split("\n").filter(Boolean)) {
+    let [sha, type] = ref.split(" ");
+    while (type === "tag" && !done.has(sha)) {
+      done.add(sha);
+      ctx.tags++;
+      const body = execFileSync("git", ["cat-file", "tag", sha], { encoding: "utf8", maxBuffer: 1024 * 1024 * 1024 });
+      const split = body.indexOf("\n\n");
+      const headers = split === -1 ? body : body.slice(0, split);
+      const message = split === -1 ? "" : body.slice(split + 2);
+      const h = (name) => new RegExp(`^${name} (.*)$`, "m").exec(headers)?.[1];
+      ctx.scan(sha, TAG_MESSAGE_PATH, message);
+      const tagger = h("tagger");
+      if (tagger !== undefined) ctx.scan(sha, TAGGER_PATH, tagger.replace(/ \d+ [+-]\d{4}$/, ""), IDENTITY_SKIP);
+      [sha, type] = [h("object"), h("type")];
+    }
+  }
+}
+
 function checkHistory(allow) {
   if (execFileSync("git", ["rev-parse", "--is-shallow-repository"], { encoding: "utf8" }).trim() === "true") {
     throw new Error("history mode needs full history (this is a shallow clone; use fetch-depth: 0)");
   }
-  const log = execFileSync(
-    "git",
-    ["-c", "core.quotePath=false", "log", "--all", "-p", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
-    { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
-  );
   const findings = [];
   const optOuts = [];
-  const skippedBinary = [];
   const seen = new Set();
-  let commits = 0;
-  let commit = "";
-  let path = null;
-  let skipPath = false;
-  let combined = false;
-  const rawNew = new Map(); // path -> blob id added in this commit
-  const emit = (rule, hit, where, optedOut) => {
-    const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
-    if (seen.has(fp)) return;
-    seen.add(fp);
-    if (isAllowed(allow, commit, path, rule.id, hit)) return;
-    if (optedOut) optOuts.push(`${commit.slice(0, 12)}:${path}: ${rule.id} (${hit})`);
-    else if (NEVER_ALLOW.has(rule.id)) findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      ${NO_WAIVER}`);
-    else findings.push(`${commit.slice(0, 12)}:${path}${where}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
+  const ctx = {
+    commits: 0,
+    tags: 0,
+    skippedBinary: [],
+    emit(commit, path, rule, hit, optedOut) {
+      const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
+      if (seen.has(fp)) return;
+      seen.add(fp);
+      if (isAllowed(allow, commit, path, rule.id, hit)) return;
+      if (optedOut) optOuts.push(`${commit.slice(0, 12)}:${path}: ${rule.id} (${hit})`);
+      else if (NEVER_ALLOW.has(rule.id)) findings.push(`${commit.slice(0, 12)}:${path}: ${rule.id}: ${rule.why}: ${hit}\n      ${NO_WAIVER}`);
+      else findings.push(`${commit.slice(0, 12)}:${path}: ${rule.id}: ${rule.why}: ${hit}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
+    },
+    scan(commit, path, text, skipRules = null) {
+      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
+    },
   };
-  const addLine = (line) => scanText(line, (rule, hit, _n, optedOut) => emit(rule, hit, "", optedOut));
-
-  for (const lineBuf of splitBuffer(log, 0x0a)) {
-    const line = lineBuf.toString("utf8");
-    if (line.startsWith("commit ") && /^commit [0-9a-f]{40}$/.test(line)) {
-      commit = line.slice(7);
-      commits++;
-      path = null;
-      rawNew.clear();
-      continue;
-    }
-    if (line.startsWith(":") && !line.startsWith("::")) {
-      const m = /^:\d+ \d+ [0-9a-f]+ ([0-9a-f]+) [AM]\t(.+)$/.exec(line);
-      if (m && !/^0+$/.test(m[1])) rawNew.set(m[2], m[1]);
-      continue;
-    }
-    if (line.startsWith("diff --git ") || line.startsWith("diff --cc ")) {
-      combined = line.startsWith("diff --cc ");
-      path = combined ? line.slice("diff --cc ".length) : null;
-      skipPath = path !== null && SKIP_FILES.has(path);
-      continue;
-    }
-    if (line.startsWith("+++ ")) {
-      const p = line.slice(4);
-      path = p === "/dev/null" ? null : p.replace(/^b\//, "");
-      skipPath = path !== null && SKIP_FILES.has(path);
-      if (path !== null) for (const f of FORBIDDEN_FILES) if (f.re.test(path)) emit({ id: "forbidden-file", why: f.why }, path, "", false);
-      continue;
-    }
-    if (line.startsWith("Binary files ")) {
-      // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the added blob and scan it whole.
-      const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
-      const p = m?.[2];
-      const blob = p ? rawNew.get(p) : undefined;
-      if (p && blob && !SKIP_FILES.has(p)) {
-        path = p;
-        const content = execFileSync("git", ["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
-        const dec = decodeText(content);
-        if (dec === null) skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
-        else addLine(dec.text);
-      }
-      continue;
-    }
-    if (line.startsWith("--- ") || line.startsWith("@@") || line.startsWith("index ") || line.startsWith("new file") || line.startsWith("deleted file") || line.startsWith("old mode") || line.startsWith("new mode")) continue;
-    if (path === null || skipPath) continue;
-    if (combined ? line.startsWith("++") : line.startsWith("+")) addLine(line.slice(combined ? 2 : 1));
-  }
+  // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
+  const log = execFileSync(
+    "git",
+    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
+    { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
+  );
+  scanPatchLog(log, ctx);
+  scanCommitMetadata(ctx);
+  scanTags(ctx);
   const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k}`);
-  return { count: commits, findings, optOuts, skippedBinary, unused };
+  return { count: ctx.commits, tags: ctx.tags, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
 }
 
 function splitBuffer(buf, sep) {
@@ -471,11 +588,11 @@ function main() {
     for (const e of allow.errors) console.error(`  ${e}`);
   }
   if (r.findings.length > 0) {
-    console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}:`);
+    console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""}:`);
     for (const f of r.findings) console.error(`  ${f}`);
   }
   if (allow.errors.length > 0 || r.findings.length > 0) process.exit(1);
-  console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit} scanned)`);
+  console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""} scanned)`);
 }
 
 try {
