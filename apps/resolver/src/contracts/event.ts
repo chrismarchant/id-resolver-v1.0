@@ -24,7 +24,7 @@ export const EVENT_CONTRACT = "event.v1" as const;
  */
 export const EVENT_VOCABULARY = {
   vocabulary: "event-vocabulary.v1",
-  status: "proposed: pending owner approval in CHR-59",
+  status: "approved by the owner on 3 Nov 2026 (CHR-59)",
   types: {
     page_view: ["page_view"],
     engagement: ["scroll_50", "scroll_90", "engaged_30s", "video_start", "video_complete", "file_download", "outbound_link"],
