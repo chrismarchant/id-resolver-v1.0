@@ -17,5 +17,5 @@ packages/**
 integrations/**
 !integrations/*/package.json
 core
-core.*
+core.[0-9]*
 *.log
