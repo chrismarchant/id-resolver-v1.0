@@ -16,6 +16,7 @@
     "ops:usage": "tsx src/ops/usage.ts",
     "ops:kill-switch": "tsx src/ops/kill-switch.ts",
     "ops:prune": "tsx src/ops/prune.ts",
+    "ops:erase-company": "tsx src/ops/erase-company.ts",
     "mock-provider": "tsx src/provider/mock-server.ts",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",

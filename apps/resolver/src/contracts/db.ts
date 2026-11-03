@@ -5,6 +5,7 @@
  * separate processes.
  */
 import type { Acquisition } from "./api.js";
+import type { FeedPage, FeedPosition } from "./reporting-feed.js";
 
 export const CACHE_STATUSES = [
   "pending", // reservation held; lease_expires_at governs ownership
@@ -274,6 +275,14 @@ export interface ReportingRepository {
   ): Promise<Page<ObservationItem, ObservationsCursor>>;
   /** Half-open range [from, to). */
   summary(scope: ObservationScope, range: { from: Date; to: Date }): Promise<ActivitySummary>;
+  /**
+   * reporting-feed.v1: up to `limit` (1..FEED_MAX_LIMIT) observations and
+   * erasure tombstones strictly after `after` (null = the start of the
+   * retained buffer) in stream order, restricted to transactions that had
+   * finished when the reading statement's snapshot was taken. The retention
+   * watermark check, the horizon and the rows come from ONE snapshot.
+   */
+  feed(scope: ObservationScope, page: { after: FeedPosition | null; limit: number }): Promise<FeedPage>;
 }
 
 export function usagePeriodKey(period: "day" | "month", now: Date): string {
