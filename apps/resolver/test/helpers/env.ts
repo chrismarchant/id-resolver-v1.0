@@ -23,6 +23,8 @@ export function testConfig(overrides: Partial<Record<string, string>> = {}): Con
     PENDING_WAIT_MS: "600",
     PENDING_POLL_MS: "25",
     ALLOW_DOCUMENTATION_RANGES: "true",
+    // Required, no default (D3); tests pick a value inside the 1-365 bound.
+    OBSERVATION_RETENTION_DAYS: "30",
     ...overrides,
   });
 }

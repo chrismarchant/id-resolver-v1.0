@@ -95,6 +95,7 @@ describe("black-box service process", () => {
       SHUTDOWN_GRACE_MS: "2000",
       PERIOD_CALL_CAP: "100",
       ALLOW_DOCUMENTATION_RANGES: "true",
+      OBSERVATION_RETENTION_DAYS: "30",
     };
     proc = spawn(process.execPath, ["--import", "tsx", resolve("src/main.ts")], { env, stdio: ["ignore", "pipe", "pipe"], cwd: resolve(".") });
     proc.stdout!.on("data", (d: Buffer) => (output += d.toString()));

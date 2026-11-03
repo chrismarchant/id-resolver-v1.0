@@ -2,18 +2,19 @@
  * Service entry point (single-process runtime, CHR-70 / owner decision D1).
  *
  * Loads bounded configuration, installs process-level crash containment and
- * the event-loop watchdog, builds the in-process job runner over one shared
- * database pool, serves the API, runs bounded cache and observation pruning,
+ * the event-loop watchdog, refuses to start while the database has pending
+ * migrations, builds the in-process job runner over one shared database
+ * pool, serves the API, runs bounded cache and observation pruning,
  * and shuts down gracefully: stop accepting, answer in-flight requests, drain
  * executing jobs within SHUTDOWN_GRACE_MS, close the pool, exit.
  *
  * Exit codes: 0 graceful stop; 1 startup failure or shutdown overrun;
  * 70 fatal fault (process_fatal); 137 (SIGKILL) event loop blocked.
  */
-import { loadConfig, describeConfig, ConfigError } from "./config/index.js";
+import { loadConfig, describeConfig, ConfigError, scrubSecretEnv } from "./config/index.js";
 import { createLogger } from "./log/index.js";
 import { createDb } from "./db/index.js";
-import { applyMigrations } from "./db/migrate.js";
+import { assertSchemaCurrent, PendingMigrationsError } from "./db/migrate.js";
 import { createProvider } from "./provider/index.js";
 import { buildServer } from "./api/server.js";
 import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner.js";
@@ -22,6 +23,7 @@ import { startEventLoopWatchdog } from "./runtime/watchdog.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
+  scrubSecretEnv();
   const logger = createLogger({ level: config.LOG_LEVEL, component: "resolver" });
   const guards = installProcessGuards({ logger });
   const safe = describeConfig(config);
@@ -34,7 +36,10 @@ async function main(): Promise<void> {
   });
 
   const db = createDb({ databaseUrl: config.DATABASE_URL, ssl: config.DATABASE_SSL, max: poolSizeFor(config.MAX_CONCURRENT_JOBS), logger });
-  if (config.RUN_MIGRATIONS_ON_START) await applyMigrations(db.pool, logger);
+  // Migrations never run on start (they are the deploy pre-step). Fail closed
+  // while this build's migrations are not all applied.
+  const schema = await assertSchemaCurrent(db.pool, logger);
+  logger.info("migration_check", { outcome: schema.unknown.length > 0 ? "database_ahead" : "current", count: schema.unknown.length });
 
   const pipelineConfig = buildPipelineConfig(config);
   const runner = createRunner({
@@ -62,16 +67,14 @@ async function main(): Promise<void> {
         if (rows > 0) logger.info("cache_prune", { rows });
       })
       .catch(() => logger.warn("db_error", { category: "prune" }));
-    // Observation retention (0 = keep). Companies and scope stats are never pruned.
-    if (config.OBSERVATION_RETENTION_DAYS > 0) {
-      const cutoff = new Date(Date.now() - config.OBSERVATION_RETENTION_DAYS * 86_400_000);
-      db.activity
-        .pruneObservationsBefore(cutoff, config.CACHE_PRUNE_BATCH)
-        .then((rows) => {
-          if (rows > 0) logger.info("observation_prune", { rows });
-        })
-        .catch(() => logger.warn("db_error", { category: "observation_prune" }));
-    }
+    // Observation retention: the bounded sync buffer (D3). Companies and scope stats are never pruned.
+    const cutoff = new Date(Date.now() - config.OBSERVATION_RETENTION_DAYS * 86_400_000);
+    db.activity
+      .pruneObservationsBefore(cutoff, config.CACHE_PRUNE_BATCH)
+      .then((rows) => {
+        if (rows > 0) logger.info("observation_prune", { rows });
+      })
+      .catch(() => logger.warn("db_error", { category: "observation_prune" }));
   }, config.CACHE_PRUNE_INTERVAL_S * 1000);
   prune.unref();
 
@@ -116,8 +119,9 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  // ConfigError messages name variables, never values; anything else is generic.
-  const detail = err instanceof ConfigError ? err.message : "startup failed (check configuration and database connectivity)";
+  // ConfigError messages name variables, never values; PendingMigrationsError
+  // names migration files only; anything else is generic.
+  const detail = err instanceof ConfigError || err instanceof PendingMigrationsError ? err.message : "startup failed (check configuration and database connectivity)";
   process.stderr.write(`id-resolver: ${detail}\n`);
   process.exit(1);
 });

@@ -34,6 +34,7 @@ export const LOG_EVENTS = [
   "activity_recorded",
   "activity_write_failed",
   "observation_prune",
+  "migration_check",
 ] as const;
 
 export type LogEvent = (typeof LOG_EVENTS)[number];

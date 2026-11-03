@@ -23,6 +23,7 @@ fi
 
 # V1: migrations are NOT applied at startup. They run as a separate deploy
 # pre-step (railway.json preDeployCommand: node dist/db/migrate.js), which is
-# advisory-locked and fails the deployment if a migration fails.
+# advisory-locked and fails the deployment if a migration fails. The service
+# itself refuses to start while the database has pending migrations.
 
 exec "$@"

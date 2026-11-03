@@ -32,6 +32,7 @@ function makeConfig(over: Record<string, string> = {}): Config {
     ...SECRETS,
     PROVIDER_MODE: "mock",
     MAX_CONCURRENT_JOBS: "3",
+    OBSERVATION_RETENTION_DAYS: "30",
     ...over,
   });
 }

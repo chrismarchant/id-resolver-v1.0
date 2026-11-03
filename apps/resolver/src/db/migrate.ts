@@ -1,5 +1,7 @@
 /**
- * Plain-SQL migration runner.
+ * Plain-SQL migration runner, and the startup check that the database is
+ * current (the service never migrates on start: it refuses to start while a
+ * migration in migrations/ is not recorded in schema_migrations).
  *
  * - Reads migrations/*.sql in lexical order.
  * - Each file is applied in its own transaction together with its
@@ -38,9 +40,52 @@ function defaultDir(): URL {
   return new URL("../../migrations/", import.meta.url);
 }
 
+async function migrationNames(dir: string | URL): Promise<string[]> {
+  return (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+}
+
+export interface MigrationStatus {
+  /** Files in migrations/ not recorded in schema_migrations (all of them when the table does not exist). */
+  pending: string[];
+  /** Recorded in schema_migrations but absent from this build (the database is ahead of the code). */
+  unknown: string[];
+}
+
+/** Read-only comparison of the build's migrations with the database's schema_migrations. */
+export async function migrationStatus(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrationStatus> {
+  const names = await migrationNames(options.dir ?? defaultDir());
+  return guarded(logger, async () => {
+    const table = await pool.query<{ t: string | null }>("SELECT to_regclass('public.schema_migrations')::text AS t");
+    const applied = table.rows[0]?.t ? (await pool.query<{ name: string }>("SELECT name FROM schema_migrations")).rows.map((r) => r.name) : [];
+    const done = new Set(applied);
+    const known = new Set(names);
+    return { pending: names.filter((n) => !done.has(n)), unknown: applied.filter((n) => !known.has(n)).sort() };
+  });
+}
+
+/** The database is missing migrations this build needs. The message names files only (never a URL or credential). */
+export class PendingMigrationsError extends Error {
+  readonly pending: string[];
+  constructor(pending: string[]) {
+    super(
+      `database schema is behind this build: ${pending.length} pending migration(s): ${pending.join(", ")}. ` +
+        "Apply them with `node dist/db/migrate.js` (the Railway preDeployCommand; locally `npm run migrate`), then start the service.",
+    );
+    this.name = "PendingMigrationsError";
+    this.pending = pending;
+  }
+}
+
+/** Startup gate: throws PendingMigrationsError unless every migration in this build is applied. */
+export async function assertSchemaCurrent(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrationStatus> {
+  const status = await migrationStatus(pool, logger, options);
+  if (status.pending.length > 0) throw new PendingMigrationsError(status.pending);
+  return status;
+}
+
 export async function applyMigrations(pool: Pool, logger?: Logger, options: MigrateOptions = {}): Promise<MigrateResult> {
   const dir = options.dir ?? defaultDir();
-  const names = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
+  const names = await migrationNames(dir);
   const sqlByName = new Map<string, string>();
   for (const name of names) {
     const base = typeof dir === "string" ? pathToFileURL(dir.endsWith("/") ? dir : `${dir}/`) : dir;

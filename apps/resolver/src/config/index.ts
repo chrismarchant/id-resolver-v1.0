@@ -50,6 +50,8 @@ export const ConfigSchema = z.object({
 
   // Provider
   PROVIDER_MODE: z.enum(["live", "mock", "disabled"]).default("disabled"),
+  /** The mock provider is refused when NODE_ENV=production unless this is set (isolated development deployment only). */
+  ALLOW_MOCK_PROVIDER: boolFromString(false),
   ENRICH_API_BASE_URL: z.string().url().max(512).default("https://dev.enrich.so/api/v3"),
   ENRICH_AUTH_HEADER: z.enum(["x-api-key", "authorization-bearer"]).default("x-api-key"),
   ENRICH_TIMEOUT_MS: intInRange(200, 10_000, 2_500),
@@ -64,9 +66,6 @@ export const ConfigSchema = z.object({
   AUTH_FAILURE_LIMIT_PER_MINUTE: intInRange(1, 100_000, 60),
   BODY_LIMIT_BYTES: intInRange(128, 8_192, 1_024),
   SHUTDOWN_GRACE_MS: intInRange(500, 30_000, 8_000),
-
-  /** V1: migrations run only via the deploy pre-step (railway.json preDeployCommand) or `npm run migrate`. */
-  RUN_MIGRATIONS_ON_START: boolFromString(false),
 
   // Enrichment controls
   ENRICHMENT_ENABLED: boolFromString(true),
@@ -85,8 +84,17 @@ export const ConfigSchema = z.object({
   PENDING_POLL_MS: intInRange(10, 1_000, 75),
   CACHE_PRUNE_INTERVAL_S: intInRange(30, 86_400, 600),
   CACHE_PRUNE_BATCH: intInRange(10, 100_000, 1_000),
-  /** Durable observation retention in days; 0 keeps observations indefinitely. Companies and scope stats are never pruned. */
-  OBSERVATION_RETENTION_DAYS: intInRange(0, 3_650, 0),
+  /**
+   * Observation retention (owner decision D3): a bounded synchronisation
+   * buffer, not commercial history. REQUIRED with no default: the operator
+   * must choose it, longer than the longest Insights sync outage to be
+   * tolerated (see RUNTIME.md). Companies and scope stats are never pruned.
+   */
+  OBSERVATION_RETENTION_DAYS: z
+    .string({ error: (issue) => (issue.input === undefined ? "required: whole days 1-365, no default (owner decision D3)" : "must be whole days 1-365") })
+    .regex(/^[0-9]{1,3}$/, "must be whole days 1-365")
+    .transform(Number)
+    .pipe(z.number().int().min(1, "must be at least 1 day").max(365, "must be at most 365 days")),
 
   // Qualification policy
   QUALIFIED_USAGE_TYPES: csv(["COM", "ORG", "GOV", "EDU", "MIL", "LIB"]),
@@ -103,6 +111,17 @@ export const SHUTDOWN_DRAIN_MARGIN_MS = 500;
 
 export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL"] as const;
 
+/**
+ * Variables that existed in V0.1 / before CHR-70 and no longer have any
+ * effect. Setting one is refused rather than silently ignored, so an operator
+ * never believes a bound (e.g. a concurrency limit) is in force when it is not.
+ */
+export const REMOVED_VARIABLES: Readonly<Record<string, string>> = {
+  MAX_CONCURRENT_CHILDREN: "use MAX_CONCURRENT_JOBS (single-process runtime)",
+  CHILD_HARD_KILL_GRACE_MS: "no replacement (there are no child processes)",
+  RUN_MIGRATIONS_ON_START: "no replacement (migrations run only as the deploy pre-step: node dist/db/migrate.js)",
+};
+
 export class ConfigError extends Error {
   constructor(message: string) {
     super(message);
@@ -111,6 +130,10 @@ export class ConfigError extends Error {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const removed = Object.keys(REMOVED_VARIABLES).filter((k) => env[k] !== undefined);
+  if (removed.length > 0) {
+    throw new ConfigError(`invalid configuration: removed variable(s) set: ${removed.map((k) => `${k} (${REMOVED_VARIABLES[k]})`).join("; ")}`);
+  }
   const parsed = ConfigSchema.safeParse(env);
   if (!parsed.success) {
     // Only variable names are reported, never values.
@@ -118,6 +141,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(`invalid configuration: ${names.join("; ")}`);
   }
   const cfg = parsed.data;
+  if (cfg.PROVIDER_MODE === "mock" && cfg.NODE_ENV === "production" && !cfg.ALLOW_MOCK_PROVIDER) {
+    throw new ConfigError("invalid configuration: PROVIDER_MODE=mock is refused when NODE_ENV=production unless ALLOW_MOCK_PROVIDER=true");
+  }
   if (cfg.PROVIDER_MODE === "live" && cfg.ENRICH_API_KEY.length < 8) {
     throw new ConfigError("invalid configuration: ENRICH_API_KEY required when PROVIDER_MODE=live");
   }
@@ -134,6 +160,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(`invalid configuration: SHUTDOWN_GRACE_MS must be at least REQUEST_DEADLINE_MS + ${SHUTDOWN_DRAIN_MARGIN_MS}`);
   }
   return cfg;
+}
+
+/**
+ * Removes the secrets from the live process environment once the validated
+ * configuration holds them, so no later code path (a dependency reading
+ * process.env, a diagnostic dump) can pick them up from there. The
+ * environment the process was started with is unchanged (/proc/<pid>/environ
+ * is fixed at exec); that copy is protected by the platform, not by this.
+ */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv = process.env): void {
+  for (const k of SECRET_KEYS) delete env[k];
 }
 
 /** Non-secret view for startup logging. */
