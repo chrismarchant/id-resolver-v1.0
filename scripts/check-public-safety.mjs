@@ -8,7 +8,8 @@
  * identifiers or real-looking traffic data. This gate complements gitleaks
  * (which runs separately in CI) with project-specific rules.
  *
- * Scans every file tracked by git (or staged for commit) and fails when it
+ * Scans every file tracked by git (or staged for commit), its name, and every
+ * ref name (as the pseudo-locations <path> and <ref>), and fails when it
  * finds:
  *   - a concrete Railway public hostname (<name>.up.railway.app); placeholders
  *     such as "<service>.up.railway.app" are allowed
@@ -42,7 +43,8 @@
  *               introduced), every commit message and annotated tag message,
  *               and author/committer/tagger identities (every rule except
  *               `email`: an author e-mail is inherent to git), with the same
- *               rules. History is immutable, so already-reviewed historical
+ *               rules, plus every path a commit adds (<path>) and every
+ *               ref name (<ref>). History is immutable, so already-reviewed historical
  *               synthetic hits are listed as exact
  *               `commit:path:rule:sha256(value)` fingerprints in
  *               .public-safety-history-allow (see that file). Messages and
@@ -127,7 +129,10 @@ const RULES = [
   },
   {
     id: "public-ipv4",
-    re: /(?<![\d.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?![\d.])/g,
+    // Not part of a longer dotted number run (a version such as 1.2.3.4.5), but a trailing or
+    // leading dot that is not followed or preceded by a digit is fine: "192.0.2.7." ends a
+    // sentence, "logs/192.0.2.7.txt" is a file name (shown with a documentation address).
+    re: /(?<!\d|\d\.)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\d|\.\d)/g,
     allowMarker: true,
     filter: (m) => isPublicIpv4(m),
     why: "public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)",
@@ -162,6 +167,50 @@ export function sha256Hex(value) {
 /** How a matched value is printed: its length only, unless --show-values (local use only). No hash: it would reveal a low-entropy value. */
 export function displayValue(value, showValues = SHOW_VALUES) {
   return showValues ? value : `[redacted: ${value.length} chars]`;
+}
+
+/**
+ * A path or ref name as printed: every rule hit in it replaced by `[redacted: <n> chars]`
+ * (unless --show-values), and control characters escaped, so a value carried by a name
+ * never reaches the log.
+ */
+export function displayName(name, showValues = SHOW_VALUES) {
+  let out = name;
+  if (!showValues) {
+    const spans = [];
+    for (const rule of RULES) {
+      rule.re.lastIndex = 0;
+      for (const m of name.matchAll(rule.re)) if (!rule.filter || rule.filter(m[0])) spans.push([m.index, m.index + m[0].length]);
+    }
+    spans.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const [a, b] of spans) {
+      const last = merged[merged.length - 1];
+      if (last && a < last[1]) last[1] = Math.max(last[1], b);
+      else merged.push([a, b]);
+    }
+    out = "";
+    let pos = 0;
+    for (const [a, b] of merged) {
+      out += `${name.slice(pos, a)}[redacted: ${b - a} chars]`;
+      pos = b;
+    }
+    out += name.slice(pos);
+  }
+  return out.replace(/[\u0000-\u001f\u007f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
+}
+
+/** Pseudo-locations for hits in names. Real paths never start with "<". */
+const PATH_NAME = "<path>";
+const REF_NAME = "<ref>";
+
+/** Every ref (branches, tags, remote-tracking refs, notes, stash) as { object, name }. Ref names cannot contain spaces. */
+function listRefs() {
+  const out = git(["for-each-ref", "--format=%(objectname) %(refname)"], { encoding: "utf8" });
+  return out
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => ({ object: line.slice(0, line.indexOf(" ")), name: line.slice(line.indexOf(" ") + 1) }));
 }
 
 /** An error whose message is ours and never contains scanned content. */
@@ -304,8 +353,11 @@ export function decodeText(buf) {
   }
 }
 
-/** Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)` is called per hit. */
-function scanText(text, report, skipRules = null) {
+/**
+ * Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)`
+ * is called per hit. Names (paths, refs) pass `honourMarker = false`: the opt-out marker is for content lines.
+ */
+function scanText(text, report, skipRules = null, honourMarker = true) {
   const lines = text.split(/\r\n|\n|\r|\u2028|\u2029/);
   lines.forEach((line, i) => {
     for (const rule of RULES) {
@@ -314,7 +366,7 @@ function scanText(text, report, skipRules = null) {
       for (const m of line.matchAll(rule.re)) {
         const hit = m[0];
         if (rule.filter && !rule.filter(hit)) continue;
-        report(rule, hit, i + 1, rule.allowMarker && line.includes(MARKER));
+        report(rule, hit, i + 1, honourMarker && rule.allowMarker && line.includes(MARKER));
       }
     }
   });
@@ -326,7 +378,10 @@ function checkTree(staged) {
   const optOuts = [];
   const skippedBinary = [];
   for (const file of files) {
-    for (const f of FORBIDDEN_FILES) if (f.re.test(file)) findings.push(`${file}: ${f.why}`);
+    const shown = displayName(file);
+    for (const f of FORBIDDEN_FILES) if (f.re.test(file)) findings.push(`${shown}: ${f.why}`);
+    // The name itself is content too: a file named after an address or a host publishes it.
+    scanText(file, (rule, hit) => findings.push(`${PATH_NAME} ${shown}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`), null, false);
     if (SKIP_FILES.has(file)) continue;
     let st;
     try {
@@ -338,17 +393,22 @@ function checkTree(staged) {
     const buf = readFileSync(file);
     const dec = decodeText(buf);
     if (dec === null) {
-      skippedBinary.push(file);
+      skippedBinary.push(shown);
       continue;
     }
     if (st.size > MAX_BYTES && !REVIEWED_LARGE_TEXT.has(file)) {
-      findings.push(`${file}: large-text-file: ${st.size} bytes exceeds ${MAX_BYTES}; split it or add its exact path to REVIEWED_LARGE_TEXT after review`);
+      findings.push(`${shown}: large-text-file: ${st.size} bytes exceeds ${MAX_BYTES}; split it or add its exact path to REVIEWED_LARGE_TEXT after review`);
       continue;
     }
     scanText(dec.text, (rule, hit, line, optedOut) => {
-      if (optedOut) optOuts.push(`${file}:${line}: ${rule.id} ${displayValue(hit)}`);
-      else findings.push(`${file}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
+      if (optedOut) optOuts.push(`${shown}:${line}: ${rule.id} ${displayValue(hit)}`);
+      else findings.push(`${shown}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
     });
+  }
+  // Ref names (branches, tags, remote-tracking refs) are public on the host too. In tree mode a
+  // hit cannot be waived: rename or delete the ref.
+  for (const ref of listRefs()) {
+    scanText(ref.name, (rule, hit) => findings.push(`${REF_NAME} ${displayName(ref.name)}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`), null, false);
   }
   return { count: files.length, findings, optOuts, skippedBinary };
 }
@@ -415,6 +475,63 @@ function isAllowed(allow, commit, path, rule, value) {
 }
 
 /**
+ * Undoes git's C-style quoting of a path. git quotes a path that contains `"`,
+ * `\`, a tab, a newline or another control character (also with
+ * core.quotePath=false): `"we\"ird/.env"`, `"tab\tdir/server.key"`, octal
+ * `\303\251` for bytes. An unquoted input is returned unchanged.
+ */
+export function unquoteGitPath(text) {
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return text;
+  const chars = [...text.slice(1, -1)];
+  const bytes = [];
+  const ESC = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+  for (let i = 0; i < chars.length; i++) {
+    if (chars[i] !== "\\") {
+      bytes.push(...Buffer.from(chars[i], "utf8"));
+      continue;
+    }
+    const next = chars[++i] ?? "";
+    if (next in ESC) bytes.push(ESC[next]);
+    else if (/^[0-3]$/.test(next) && /^[0-7]{2}$/.test((chars[i + 1] ?? "") + (chars[i + 2] ?? ""))) {
+      bytes.push(parseInt(next + chars[i + 1] + chars[i + 2], 8));
+      i += 2;
+    } else bytes.push(...Buffer.from(`\\${next}`, "utf8"));
+  }
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/**
+ * Every path each commit adds or changes, read NUL-safely (`--raw -z` never
+ * quotes a path), with the blob id of the commit's (or merge's) result.
+ * Returns Map(commit -> Array<{ path, blob, added }>); `added` means new
+ * relative to every parent. Deleted paths are left out.
+ */
+function collectHistoryPaths() {
+  const out = git(["log", "--all", "--cc", "--raw", "-z", "--no-renames", "--no-abbrev", "--no-color", "--format=commit %H"], { maxBuffer: 1024 * 1024 * 1024 });
+  const byCommit = new Map();
+  let entries = null;
+  let meta = null;
+  for (const token of out.toString("utf8").split("\0")) {
+    if (meta !== null) {
+      // The token after a raw meta field is the path, verbatim (it may even start with a newline).
+      const n = /^:+/.exec(meta)[0].length;
+      const fields = meta.slice(n).split(" ");
+      const blob = fields[2 * n + 1];
+      const status = fields[2 * n + 2] ?? "";
+      if (entries && blob && !/^0+$/.test(blob)) entries.push({ path: token, blob, added: /^A+$/.test(status) });
+      meta = null;
+      continue;
+    }
+    const t = token.replace(/^\n+/, "");
+    if (/^commit [0-9a-f]{40}$/.test(t)) {
+      entries = [];
+      byCommit.set(t.slice(7), entries);
+    } else if (t.startsWith(":")) meta = t;
+  }
+  return byCommit;
+}
+
+/**
  * Parses one `git log -p --raw --cc` stream. A file's header runs from its
  * `diff --git`/`diff --cc` line to its first `@@` line; only there are
  * `+++ `, `Binary files` and similar lines headers. In the hunk body every
@@ -422,15 +539,16 @@ function isAllowed(allow, commit, path, rule, value) {
  * starts with `++ ` (shown as `+++ ...`) is scanned as content. For a merge,
  * `--cc` shows only what the merge itself introduced: a line is scanned when
  * it is added relative to EVERY parent (lines taken from one parent were
- * scanned in the commit that added them there).
+ * scanned in the commit that added them there). Quoted paths in headers are
+ * un-quoted; blob ids come from the NUL-safe path pass.
  */
-function scanPatchLog(log, ctx) {
+function scanPatchLog(log, ctx, historyPaths) {
   let commit = "";
   let state = "none"; // "none" (commit header / raw lines) | "header" | "body"
   let parents = 1;
   let path = null;
   let skipPath = false;
-  const resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
+  let resultBlob = new Map(); // path -> blob id of the commit's (or merge's) result
   const setPath = (p) => {
     path = p;
     skipPath = p !== null && SKIP_FILES.has(p);
@@ -441,7 +559,7 @@ function scanPatchLog(log, ctx) {
     // git shows no lines for NUL-containing blobs (e.g. UTF-16): decode the blob and scan it whole.
     const content = git(["cat-file", "blob", blob], { maxBuffer: 1024 * 1024 * 1024 });
     const dec = decodeText(content);
-    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${p}`);
+    if (dec === null) ctx.skippedBinary.push(`${commit.slice(0, 12)}:${displayName(p)}`);
     else ctx.scan(commit, p, dec.text);
   };
 
@@ -453,41 +571,33 @@ function scanPatchLog(log, ctx) {
       ctx.commits++;
       state = "none";
       setPath(null);
-      resultBlob.clear();
+      resultBlob = new Map((historyPaths.get(commit) ?? []).map((e) => [e.path, e.blob]));
       continue;
     }
     if (line.startsWith("diff --git ") || line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
       state = "header";
-      setPath(line.startsWith("diff --git ") ? null : line.slice(line.indexOf(" ", 5) + 1));
+      setPath(line.startsWith("diff --git ") ? null : unquoteGitPath(line.slice(line.indexOf(" ", 5) + 1)));
       continue;
     }
-    if (state === "none") {
-      // Raw lines: ":<modes> <blobs> <status>\t<path>", one colon per parent. Every path the
-      // commit adds or changes is checked against the forbidden-file rules here, so an empty or
-      // binary .env or key file (which has no "+++" line) is found too.
-      const m = /^(:+)([^\t]+)\t(.+)$/.exec(line);
-      if (m) {
-        const n = m[1].length;
-        const blobs = m[2].split(" ").slice(n + 1, 2 * n + 2);
-        const result = blobs[n];
-        if (result && !/^0+$/.test(result)) {
-          resultBlob.set(m[3], result);
-          for (const f of FORBIDDEN_FILES) if (f.re.test(m[3])) ctx.emit(commit, m[3], { id: "forbidden-file", why: f.why }, m[3], false);
-        }
-      }
-      continue;
-    }
+    if (state === "none") continue; // the commit's header lines; paths come from the NUL-safe pass
     if (state === "header") {
       if (line.startsWith("@@")) {
         state = "body";
         parents = Math.max(1, /^@+/.exec(line)[0].length - 1);
       } else if (line.startsWith("+++ ")) {
-        const p = line.slice(4);
+        const p = unquoteGitPath(line.slice(4));
         setPath(p === "/dev/null" ? null : p.replace(/^b\//, ""));
-      } else if (line.startsWith("Binary files ")) {
-        const m = /^Binary files (?:a\/(.+)|\/dev\/null) and (?:b\/(.+)|\/dev\/null) differ$/.exec(line);
-        const p = m ? m[2] : path; // combined diffs print "Binary files differ"; the path is from "diff --cc"
-        if (p) scanBlob(p);
+      } else if (line === "Binary files differ") {
+        if (path !== null) scanBlob(path); // combined diff: the path is from "diff --cc"
+      } else if (line.startsWith("Binary files ") && line.endsWith(" differ")) {
+        // "Binary files <a> and <b> differ", each side a/P, b/P (maybe quoted) or /dev/null.
+        // With --no-renames both sides name the same path, so the b side is the second half.
+        const inner = line.slice("Binary files ".length, -" differ".length);
+        let b = null;
+        if (inner.startsWith("/dev/null and ")) b = inner.slice("/dev/null and ".length);
+        else if (!inner.endsWith(" and /dev/null")) b = inner.slice((inner.length - " and ".length) / 2 + " and ".length);
+        const p = b === null ? null : unquoteGitPath(b);
+        if (p !== null && p.startsWith("b/")) scanBlob(p.slice(2));
       }
       continue;
     }
@@ -540,6 +650,8 @@ function scanTags(ctx) {
       const message = split === -1 ? "" : body.slice(split + 2);
       const h = (name) => new RegExp(`^${name} (.*)$`, "m").exec(headers)?.[1];
       ctx.scan(sha, TAG_MESSAGE_PATH, message);
+      const name = h("tag");
+      if (name !== undefined) ctx.scan(sha, REF_NAME, name, null, false, `tag ${displayName(name)}`);
       const tagger = h("tagger");
       if (tagger !== undefined) ctx.scan(sha, TAGGER_PATH, tagger.replace(/ \d+ [+-]\d{4}$/, ""), IDENTITY_SKIP);
       [sha, type] = [h("object"), h("type")];
@@ -559,12 +671,12 @@ function checkHistory(allow) {
     tags: 0,
     waivable: 0,
     skippedBinary: [],
-    emit(commit, path, rule, hit, optedOut) {
+    emit(commit, path, rule, hit, optedOut, note = "") {
       const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
       if (seen.has(fp)) return;
       seen.add(fp);
       if (isAllowed(allow, commit, path, rule.id, hit)) return;
-      const where = `${commit.slice(0, 12)}:${path}`;
+      const where = `${commit.slice(0, 12)}:${displayName(path)}${note ? ` ${note}` : ""}`;
       // A forbidden file's "value" is its path, which the location already shows.
       const what = rule.id === "forbidden-file" ? `${rule.id}: ${rule.why}` : `${rule.id}: ${rule.why}: ${displayValue(hit)}`;
       if (optedOut) optOuts.push(`${where}: ${rule.id} ${displayValue(hit)}`);
@@ -574,20 +686,32 @@ function checkHistory(allow) {
         findings.push(`${where}: ${what}\n      ${REMEDIATION}${SHOW_FINGERPRINTS ? `\n      allow-list fingerprint: ${fp}` : ""}`);
       }
     },
-    scan(commit, path, text, skipRules = null) {
-      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
+    scan(commit, path, text, skipRules = null, honourMarker = true, note = "") {
+      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut, note), skipRules, honourMarker);
     },
   };
+  // Every path each commit adds or changes, read NUL-safely: an empty or binary .env or key file
+  // (no "+++" line) and a path git would C-quote (`we"ird/.env`, a tab) are both checked.
+  const historyPaths = collectHistoryPaths();
+  for (const [commit, entries] of historyPaths) {
+    for (const e of entries) {
+      for (const f of FORBIDDEN_FILES) if (f.re.test(e.path)) ctx.emit(commit, e.path, { id: "forbidden-file", why: f.why }, e.path, false);
+      // File names are content too: every path a commit adds is scanned, as <path> (allow-listed per commit and value).
+      if (e.added) ctx.scan(commit, PATH_NAME, e.path, null, false, displayName(e.path));
+    }
+  }
+  // Ref names, as <ref>, keyed by the object the ref points to.
+  for (const ref of listRefs()) ctx.scan(ref.object, REF_NAME, ref.name, null, false, displayName(ref.name));
   // --cc: merge commits show what the merge itself introduced (git log -p shows nothing for merges by default).
   const log = git(
-    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--raw", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
+    ["-c", "core.quotePath=false", "log", "--all", "-p", "--cc", "--no-abbrev", "--no-color", "--no-ext-diff", "--no-renames", "-U0", "--format=commit %H"],
     { encoding: "buffer", maxBuffer: 1024 * 1024 * 1024 },
   );
-  scanPatchLog(log, ctx);
+  scanPatchLog(log, ctx, historyPaths);
   scanCommitMetadata(ctx);
   scanTags(ctx);
   // Unused entries are named by their line in the allow-list (whose hashes are public there anyway), not reprinted.
-  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k.slice(0, k.lastIndexOf(":"))}`);
+  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${displayName(k.slice(0, k.lastIndexOf(":")))}`);
   return { count: ctx.commits, tags: ctx.tags, waivable: ctx.waivable, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
 }
 

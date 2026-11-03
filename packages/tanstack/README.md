@@ -125,12 +125,13 @@ explicitly switch it off with `pageKeyDefaultMapper: false`:
 | Segment | Becomes |
 | --- | --- |
 | any segment over 128 characters (not classified, which bounds the work per request) | `:token` |
+| a segment that is not valid percent-encoding (a lone `%`, invalid UTF-8) | `:token` |
 | e-mail address (also percent-encoded `%40`, and several addresses in one segment) | `:email` |
 | UUID | `:uuid` |
-| digit run of 4 or more (a plain year such as `2026` is kept) | `:n`, in place (`order-12345` becomes `order-:n`) |
+| digit run of 4 or more (a plain year such as `2026` is kept) | `:n`, in place (`order-12345` becomes `order-:n`); a percent-encoded segment (`%31%32%33%34%35`) becomes `:n` as a whole |
 | hex/base64url token of 16+ characters that is not a readable slug, or a 12+ character run mixing letters and digits | `:token` |
 
-The mapper runs on the response path, so its cost is bounded: every check is linear in the segment length, and
+Every rule judges the percent-decoded segment, so encoding a value does not hide it. The mapper runs on the response path, so its cost is bounded: every check is linear in the segment length, and
 mapping stops once the output passes the 256-character `page_key` limit. The tests require a 16 KB adversarial path to
 map in under 20 ms (it takes well under 1 ms on a development machine).
 

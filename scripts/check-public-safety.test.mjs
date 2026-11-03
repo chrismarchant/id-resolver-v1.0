@@ -781,3 +781,161 @@ test("CI never passes the local-only flags --show-values or --fingerprints", () 
   assert.match(ci, /check-public-safety\.mjs --history/);
   for (const flag of ["--show-values", "--fingerprints"]) assert.ok(!ci.includes(flag), `ci.yml passes ${flag}`);
 });
+
+// ---- C-quoted paths in history (CHR-66 R2-1) ---------------------------------
+
+test("--history finds forbidden files under paths git C-quotes (a quote, a tab), committed then removed", () => {
+  for (const path of ['we"ird/.env', "tab\tdir/server.key"]) {
+    const { dir } = historyRepo(path, "X=1\n");
+    try {
+      assert.equal(runGate(dir).code, 0);
+      const r = runGate(dir, "--history");
+      assert.equal(r.code, 1, `${JSON.stringify(path)}\n${r.out}`);
+      assert.match(r.out, /forbidden-file/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("--history attributes content under a C-quoted path to the real path (text, UTF-16 and a modified binary)", () => {
+  // Text content: the fingerprint names the un-quoted path.
+  const { dir, sha } = historyRepo('q"uote/a.txt', `ip ${publicIp}\n`);
+  try {
+    const r = runGate(dir, "--history", "--fingerprints");
+    assert.equal(r.code, 1, r.out);
+    assert.ok(r.out.includes(`allow-list fingerprint: ${sha}:q"uote/a.txt:public-ipv4:${sha256(publicIp)}`), r.out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // A UTF-16 (git: binary) file under a quoted path is decoded from its blob.
+  const wide = historyRepo("tab\tdir/wide.txt", utf16le(`ip = ${publicIp}\n`));
+  try {
+    const r = runGate(wide.dir, "--history", "--fingerprints");
+    assert.equal(r.code, 1, r.out);
+    assert.ok(r.out.includes(`${wide.sha}:tab\tdir/wide.txt:public-ipv4:${sha256(publicIp)}`), r.out);
+  } finally {
+    rmSync(wide.dir, { recursive: true, force: true });
+  }
+  // A modified binary file whose path contains " and " (the "Binary files a/P and b/P differ" split).
+  const d = mkdtempSync(join(tmpdir(), "public-safety-hist-"));
+  try {
+    git(d, "init", "-q");
+    mkdirSync(join(d, 'x and "y'));
+    writeFileSync(join(d, 'x and "y', "w.txt"), utf16le("clean\n"));
+    git(d, "add", "-A");
+    git(d, "commit", "-q", "-m", "one");
+    writeFileSync(join(d, 'x and "y', "w.txt"), utf16le(`ip = ${publicIp}\n`));
+    git(d, "commit", "-q", "-am", "two");
+    const sha = git(d, "rev-parse", "HEAD").trim();
+    const r = runGate(d, "--history", "--fingerprints");
+    assert.equal(r.code, 1, r.out);
+    assert.ok(r.out.includes(`${sha}:x and "y/w.txt:public-ipv4:${sha256(publicIp)}`), r.out);
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+
+// ---- file and ref names (CHR-66 R2-2) ----------------------------------------
+
+/** Asserts that `out` holds none of `values`, none of their SHA-256 hashes and no 12-hex window of one. */
+function assertNoValues(out, values, label) {
+  for (const v of values) {
+    assert.ok(!out.includes(v), `${label}: output contains ${v}:\n${out}`);
+    const h = sha256(v);
+    for (let i = 0; i + 12 <= h.length; i++) assert.ok(!out.includes(h.slice(i, i + 12)), `${label}: output contains part of sha256(${v})`);
+  }
+}
+
+test("file names are scanned in tree and history mode, and printed redacted", () => {
+  withRepo((dir) => {
+    mkdirSync(join(dir, "logs"));
+    for (const name of [`${publicIp}.txt`, `${host}.json`, `${uuid}.json`]) writeFileSync(join(dir, "logs", name), "clean\n");
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "add logs");
+    let r = runGate(dir);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, new RegExp(`<path> logs/${esc(red(publicIp))}\\.txt: public-ipv4: .*: ${esc(red(publicIp))}`));
+    assert.match(r.out, new RegExp(`<path> logs/${esc(red(host))}\\.json: railway-public-host`));
+    assert.match(r.out, new RegExp(`<path> logs/${esc(red(uuid))}\\.json: uuid-literal`));
+    assertNoValues(r.out, [publicIp, host, uuid], "tree");
+    gitEnv(dir, {}, "rm", "-q", "-r", "logs");
+    gitEnv(dir, {}, "commit", "-q", "-m", "remove logs");
+    assert.equal(runGate(dir).code, 0);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    for (const rule of ["public-ipv4", "railway-public-host", "uuid-literal"]) assert.match(r.out, new RegExp(`:<path> logs/\\[redacted: \\d+ chars\\]\\.(txt|json): ${rule}`));
+    assertNoValues(r.out, [publicIp, host, uuid], "history");
+    // --show-values (local) shows the names.
+    assert.ok(runGate(dir, "--history", "--show-values").out.includes(`logs/${publicIp}.txt`));
+  });
+});
+
+test("ref names (a branch, a lightweight and an annotated tag) are scanned in tree and history mode, and printed redacted", () => {
+  withRepo((dir) => {
+    gitEnv(dir, {}, "branch", `rel-${publicIp}`);
+    gitEnv(dir, {}, "tag", `hotfix-${host}`);
+    gitEnv(dir, {}, "tag", "-a", `build-${uuid}`, "-m", "clean");
+    for (const mode of [[], ["--history"]]) {
+      const r = runGate(dir, ...mode);
+      const label = mode.join(" ") || "tree";
+      assert.equal(r.code, 1, `${label}\n${r.out}`);
+      assert.match(r.out, new RegExp(`<ref> refs/heads/rel-${esc(red(publicIp))}: public-ipv4`));
+      // The host rule takes the whole label, so the hit is "hotfix-<host>".
+      assert.match(r.out, new RegExp(`<ref> refs/tags/${esc(red(`hotfix-${host}`))}: railway-public-host`));
+      assert.match(r.out, new RegExp(`<ref> refs/tags/build-${esc(red(uuid))}: uuid-literal`));
+      assertNoValues(r.out, [publicIp, host, uuid], label);
+    }
+  });
+});
+
+test("a <path> or <ref> hit is allow-listed per commit (or ref target) and value; refused rules stay refused", () => {
+  withRepo((dir) => {
+    writeFileSync(join(dir, `${publicIp}.txt`), "clean\n");
+    gitEnv(dir, {}, "add", "-A");
+    gitEnv(dir, {}, "commit", "-q", "-m", "add");
+    const sha = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    gitEnv(dir, {}, "rm", "-q", `${publicIp}.txt`);
+    gitEnv(dir, {}, "commit", "-q", "-m", "rm");
+    const head = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
+    gitEnv(dir, {}, "branch", `rel-${otherIp}`);
+    let r = runGate(dir, "--history", "--fingerprints");
+    assert.equal(r.code, 1, r.out);
+    const pathEntry = `${sha}:<path>:public-ipv4:${sha256(publicIp)}`;
+    const refEntry = `${head}:<ref>:public-ipv4:${sha256(otherIp)}`;
+    assert.ok(r.out.includes(`allow-list fingerprint: ${pathEntry}`), r.out);
+    assert.ok(r.out.includes(`allow-list fingerprint: ${refEntry}`), r.out);
+    assert.ok(!r.out.includes(publicIp) && !r.out.includes(otherIp), r.out);
+    writeFileSync(join(dir, ALLOW), `# reviewed: synthetic file and branch names used as parser fixtures\n${pathEntry}\n${refEntry}\n`);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+    // A <ref> entry for a refused rule is refused like any other.
+    writeFileSync(join(dir, ALLOW), `# reviewed\n${head}:<ref>:railway-public-host:${sha256(host)}\n`);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rule railway-public-host cannot be allow-listed/);
+  });
+});
+
+test("printed paths escape control characters", () => {
+  const { dir } = historyRepo("tab\tdir/server.key", "k\n");
+  try {
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /tab\\x09dir\/server\.key: forbidden-file/);
+    assert.ok(!r.out.includes("tab\tdir"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the IPv4 rule matches before a trailing dot or a file extension, not inside a longer dotted run", () => {
+  expectFinding({ "a.md": `connect to ${publicIp}.\n` }, "public-ipv4");
+  expectFinding({ "a.md": `see logs/${publicIp}.txt\n` }, "public-ipv4");
+  const dir = repoWith({ "ok.md": "version 1.2.3.4.5 and build 10.20.30.40.1 and 5.6.7.8.9.10\n" });
+  try {
+    assert.equal(runGate(dir).code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
