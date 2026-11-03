@@ -1,0 +1,16 @@
+# gitleaks configuration for this PUBLIC repository (CHR-69, owner decision D8).
+# Default ruleset plus a narrow allowlist of deliberately synthetic test values.
+# Allowlist entries match the exact secret value, never a whole file or path, so
+# a real credential added to a test file is still reported.
+title = "id-resolver-v1"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic test-only values (not credentials)"
+regexTarget = "secret"
+regexes = [
+  '''^(0123456789abcdef)+$''',
+  '''^sk_test_placeholder$''',
+]

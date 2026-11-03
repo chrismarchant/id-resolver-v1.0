@@ -1,0 +1,109 @@
+name: ci
+
+# Public repository: standard GitHub-hosted Linux runners only. Runs on pull
+# requests and on pushes to main (not on every branch push) to avoid duplicate
+# runs; superseded runs on the same ref are cancelled.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  # sha256 of gitleaks_8.30.1_linux_x64.tar.gz from the release's checksums.txt
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+jobs:
+  hygiene:
+    name: public-repo hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Public-safety gate (infra identifiers, public IPs, e-mails, key files)
+        run: node scripts/check-public-safety.mjs
+      - name: Public-safety gate self-test
+        run: node --test scripts/check-public-safety.test.mjs
+      - name: Secret scan (gitleaks, full history)
+        run: |
+          curl -sSLf -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git . --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+  verify:
+    name: typecheck and tests
+    needs: hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: resolver
+          POSTGRES_PASSWORD: resolver
+          POSTGRES_DB: id_resolver_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U resolver -d id_resolver_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - run: npm run verify --workspaces --if-present
+
+  image:
+    name: production image
+    needs: hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the resolver image (context = repository root)
+        run: docker build -f apps/resolver/Dockerfile -t id-resolver:ci .
+      - name: Entrypoint refuses inspector flags
+        run: |
+          set +e
+          docker run --rm -e NODE_OPTIONS=--inspect id-resolver:ci node -e "1"
+          test $? -eq 1
+      - name: Image fails closed without configuration
+        run: |
+          set +e
+          out=$(docker run --rm id-resolver:ci 2>&1)
+          code=$?
+          echo "$out"
+          test $code -eq 1
+          echo "$out" | grep -q "invalid configuration"
+      - name: Migration entry point is present and refuses to run without DATABASE_URL
+        run: |
+          set +e
+          out=$(docker run --rm id-resolver:ci node dist/db/migrate.js 2>&1)
+          code=$?
+          echo "$out"
+          test $code -eq 1
+          echo "$out" | grep -q "DATABASE_URL is required"
