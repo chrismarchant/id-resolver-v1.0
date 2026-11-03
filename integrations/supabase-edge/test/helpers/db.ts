@@ -83,10 +83,14 @@ export interface GapRow {
   last_observed_at: Date | null;
   resolved_at: Date | null;
   resolution: string | null;
+  /** null for rows of earlier releases, and before the upgrade that adds the column. */
+  detected_generation: number | null;
 }
 
 export async function gapRows(pool: pg.Pool): Promise<GapRow[]> {
-  const r = await pool.query<GapRow>("select id::int as id, installation_id, kind, detected_at, expired_cursor, last_applied_at, last_observed_at, resolved_at, resolution from public.idr_sync_gaps order by id");
+  const r = await pool.query<GapRow>(
+    "select g.id::int as id, g.installation_id, g.kind, g.detected_at, g.expired_cursor, g.last_applied_at, g.last_observed_at, g.resolved_at, g.resolution, (to_jsonb(g) ->> 'detected_generation')::int as detected_generation from public.idr_sync_gaps g order by g.id",
+  );
   return r.rows;
 }
 
@@ -143,9 +147,9 @@ export class PgStore implements Store {
     return { recorded: v.recorded, newGap: v.new, superseded: v.superseded };
   }
 
-  async resolveGaps(): Promise<number> {
+  async resolveGaps(drainedCursor: string): Promise<number> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1) as r", [this.installationId]),
+      c.query<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1,$2) as r", [this.installationId, drainedCursor]),
     );
     return r.rows[0]!.r.resolved;
   }

@@ -78,7 +78,7 @@ describe("crash and atomicity", () => {
       localCounts: (a, b) => store.localCounts(a, b),
       resetCursor: (c) => store.resetCursor(c),
       recordGap: (k) => store.recordGap(k),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
       applyPage: async (a) => {
         const out = await store.applyPage(a);
         if (++applies === 1) throw new Error("process died after apply");
@@ -136,7 +136,7 @@ describe("crash and atomicity", () => {
       localCounts: (a, b) => store.localCounts(a, b),
       resetCursor: (c) => store.resetCursor(c),
       recordGap: (k) => store.recordGap(k),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
     };
     const [a, b] = await Promise.all([runSync(testConfig(mock), testDeps(barrier)), runSync(testConfig(mock), testDeps(barrier))]);
     const statuses = [a.status, b.status].sort();
@@ -384,7 +384,7 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
       recordGap: async () => {
         throw new Error("rpc failed");
       },
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
     };
     const r = await runSync(testConfig(mock), testDeps(failing));
     expect(r).toMatchObject({ status: "needs_resync", gap: { recorded: false, newGap: false } });
@@ -414,7 +414,7 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
       localCounts: (a, b) => store.localCounts(a, b),
       resetCursor: (c) => store.resetCursor(c),
       recordGap: (a) => store.recordGap(a),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
     };
     mock.requests = [];
     const r = await runSync(testConfig(mock), testDeps(stale));
@@ -546,7 +546,7 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
       localCounts: (a, b) => store.localCounts(a, b),
       resetCursor: (c) => store.resetCursor(c),
       recordGap: (a) => store.recordGap(a),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
     };
     expect((await runSync(cfg(), testDeps(crashing))).status).toBe("store_error");
     expect(await storedCursor(pool)).toBeNull();
@@ -613,7 +613,7 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
       recordStatus: (a) => store.recordStatus(a),
       localCounts: (a, b) => store.localCounts(a, b),
       recordGap: (k) => store.recordGap(k),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
       resetCursor: async (c) => {
         await pool.query("update public.idr_sync_state set cursor = 'c2'"); // another run moved it
         return store.resetCursor(c);

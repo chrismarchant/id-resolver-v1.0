@@ -103,8 +103,8 @@ export class PostgrestStore implements Store {
     return { recorded: r["recorded"], newGap: r["new"], superseded: r["superseded"] };
   }
 
-  async resolveGaps(): Promise<number> {
-    const r = obj(await this.rpc("idr_resolve_sync_gaps", { p_installation_id: this.o.installationId }));
+  async resolveGaps(drainedCursor: string): Promise<number> {
+    const r = obj(await this.rpc("idr_resolve_sync_gaps", { p_installation_id: this.o.installationId, p_drained_cursor: drainedCursor }));
     return int(r["resolved"]);
   }
 

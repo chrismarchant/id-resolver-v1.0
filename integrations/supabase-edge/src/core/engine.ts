@@ -248,10 +248,11 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
   // Drained: if a gap is open, the projection may now have been rebuilt from
   // the start of the retained buffer after idr_begin_resync(); the store
-  // resolves only gaps that precede the latest resync request.
-  if (state.gapOpen) {
+  // resolves only gaps detected before the resync whose replay this drain
+  // completed, and only if no newer replay has started since (cursor CAS).
+  if (state.gapOpen && cursor !== null) {
     try {
-      result.gapsResolved = await deps.store.resolveGaps();
+      result.gapsResolved = await deps.store.resolveGaps(cursor);
     } catch {
       return finish("store_error");
     }

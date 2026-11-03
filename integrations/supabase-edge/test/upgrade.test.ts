@@ -85,6 +85,12 @@ describe.each(["6318ab2", "f12b1ad"] as const)("upgrade from the %s release", (v
     expect(sigs).not.toContain("idr_record_sync_gap(text,text)");
     expect(sigs).toContain("idr_apply_feed_page(text,text,text,jsonb,text)");
     expect(sigs).toContain("idr_record_sync_gap(text,text,text)");
+    expect(sigs).not.toContain("idr_resolve_sync_gaps(text)");
+    expect(sigs).toContain("idr_resolve_sync_gaps(text,text)");
+    const gens = await pool.query("select resync_generation::int as resync, replay_generation::int as replay from public.idr_sync_state");
+    expect(gens.rows[0]).toEqual({ resync: 0, replay: 0 });
+    // A gap of the earlier release has no generation (treated as 0: needs a resync after the upgrade).
+    expect((await gapRows(pool)).map((g) => g.detected_generation)).toEqual(before.gaps.map(() => null));
     for (const f of fns) expect(f.acl.map((a) => a.split("=")[0]).sort(), f.sig).toEqual(["resolver", "service_role"]);
   });
 

@@ -32,7 +32,19 @@ const recordGap = async () =>
       [INSTALLATION],
     )
   ).rows[0]!.r;
-const resolveGaps = async () => (await svc<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1) as r", [INSTALLATION])).rows[0]!.r.resolved;
+/** Resolve as a run that drained to the cursor currently stored. */
+const resolveGaps = async (drained?: string) =>
+  (
+    await svc<{ r: { resolved: number } }>(
+      "select public.idr_resolve_sync_gaps($1, coalesce($2, (select s.cursor from public.idr_sync_state s where s.installation_id = $1))) as r",
+      [INSTALLATION, drained ?? null],
+    )
+  ).rows[0]!.r.resolved;
+/** The first page of a replay from the start of the buffer (the stored cursor must be null). */
+const replay = (next: string) =>
+  svc("select public.idr_apply_feed_page($1, null, $2, '[]'::jsonb, (select s.reset_from_cursor from public.idr_sync_state s where s.installation_id = $1))", [INSTALLATION, next]);
+const generations = async () =>
+  (await pool.query<{ resync: string; replay: string }>("select resync_generation::text as resync, replay_generation::text as replay from public.idr_sync_state")).rows[0];
 const beginResync = () => svc("select public.idr_begin_resync($1)", [INSTALLATION]);
 const READER = { role: "authenticated", app_metadata: { idr_reader: true } };
 
@@ -81,10 +93,13 @@ describe("recording", () => {
 });
 
 describe("resolution", () => {
-  it("begin_resync then resolve sets resolved_at once; the row persists; nothing before a resync request is resolved", async () => {
+  it("begin_resync, the replay, then resolve sets resolved_at once; the row persists; nothing before the replay is resolved", async () => {
     await recordGap();
-    expect(await resolveGaps()).toBe(0); // needs_resync still set, no resync requested
+    expect(await resolveGaps("c0")).toBe(0); // needs_resync still set, no resync requested
     await beginResync();
+    expect(await resolveGaps("c0")).toBe(0); // requested, but no replay has started
+    await replay("c1");
+    expect(await resolveGaps("c0")).toBe(0); // not the cursor the replay drained to
     expect(await resolveGaps()).toBe(1);
     const [g] = await gapRows(pool);
     expect(g).toMatchObject({ resolution: "full_resync" });
@@ -99,10 +114,52 @@ describe("resolution", () => {
 
   it("a gap detected after the latest resync request stays open", async () => {
     await beginResync();
+    await replay("c1");
     await recordGap(); // e.g. retention overtook the replay
     await pool.query("update public.idr_sync_state set needs_resync = false"); // cleared by hand, no new request
     expect(await resolveGaps()).toBe(0);
     expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
+  });
+
+  it("R2-9: a resync whose transaction started BEFORE a concurrent gap record but committed after it still resolves that gap (row-lock order, not start time)", async () => {
+    const a = await pool.connect();
+    try {
+      await a.query("begin");
+      await a.query("set local role service_role");
+      await a.query("select now()"); // the transaction's start timestamp is now fixed
+      await new Promise((r) => setTimeout(r, 20));
+      const g = await recordGap(); // commits while A is open
+      expect(g.new).toBe(true);
+      await a.query("select public.idr_begin_resync($1)", [INSTALLATION]);
+      await a.query("commit");
+    } finally {
+      a.release();
+    }
+    const [gap] = await gapRows(pool);
+    const st = (await pool.query<{ t: Date }>("select resync_requested_at as t from public.idr_sync_state")).rows[0]!;
+    expect(st.t.getTime()).toBeGreaterThanOrEqual(gap!.detected_at.getTime()); // clock_timestamp() after the lock
+    expect(await generations()).toEqual({ resync: "1", replay: "0" });
+    await replay("c1");
+    expect(await generations()).toEqual({ resync: "1", replay: "1" });
+    expect(await resolveGaps()).toBe(1);
+  });
+
+  it("R2-9: a drained run cannot resolve once a newer replay has started (cursor compare-and-set), and a gap detected during a replay needs the next resync", async () => {
+    await recordGap(); // generation 0
+    await beginResync(); // generation 1
+    await replay("c1"); // replay of generation 1 drains at c1 ...
+    await beginResync(); // ... but before its resolve call the operator resyncs again (generation 2)
+    await replay("k2c1"); // and a new replay starts
+    expect(await resolveGaps("c1")).toBe(0); // the late resolve of the old drain changes nothing
+    expect(await resolveGaps("k2c1")).toBe(1); // the new replay's drain may
+    // A gap detected during replay generation 2 is not resolved by that replay.
+    await recordGap();
+    await pool.query("update public.idr_sync_state set needs_resync = false");
+    expect(await resolveGaps()).toBe(0);
+    expect((await gapRows(pool)).map((g) => [g.detected_generation, g.resolved_at === null])).toEqual([
+      [0, false],
+      [2, true],
+    ]);
   });
 });
 
@@ -110,7 +167,8 @@ describe("append-only guard", () => {
   it("rejects DELETE, TRUNCATE, re-resolving and changing any other column, even for the table owner", async () => {
     await recordGap();
     await beginResync();
-    await resolveGaps();
+    await replay("c1");
+    expect(await resolveGaps()).toBe(1);
     const open = await recordGap();
     for (const sql of [
       "delete from public.idr_sync_gaps",
@@ -157,7 +215,7 @@ describe("row level security", () => {
       `update public.idr_sync_gaps set resolved_at = now(), resolution = 'full_resync' where id = ${g.gap_id}`,
       "delete from public.idr_sync_gaps",
       "select public.idr_record_sync_gap('x', 'cursor_expired', null)",
-      "select public.idr_resolve_sync_gaps('x')",
+      "select public.idr_resolve_sync_gaps('x', 'c1')",
     ]) {
       for (const role of ["anon", "authenticated"]) {
         await expect(asRole(pool, role, (c) => c.query(sql), READER), `${role}: ${sql}`).rejects.toThrow(/permission denied/);

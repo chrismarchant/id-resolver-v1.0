@@ -66,9 +66,19 @@ create table if not exists public.idr_sync_state (
   updated_at      timestamptz not null default now()
 );
 
--- Set by idr_begin_resync(); idr_resolve_sync_gaps() closes only gaps detected
--- before the latest resync request (re-runs: added if missing).
+-- Set by idr_begin_resync() (informational; re-runs: added if missing).
 alter table public.idr_sync_state add column if not exists resync_requested_at timestamptz null;
+-- Ordering of resyncs, gaps and replays by generation, not by timestamps
+-- (CHR-66 R2-9). Every change happens under the idr_sync_state row lock, so
+-- the order is exactly the commit order of those changes:
+--   resync_generation: incremented by every idr_begin_resync();
+--   replay_generation: resync_generation at the moment the current replay
+--     applied its first page from null (idr_apply_feed_page).
+-- A gap (idr_sync_gaps.detected_generation = resync_generation at detection)
+-- may be resolved only once a replay that started after a later resync
+-- request has drained: detected_generation < replay_generation.
+alter table public.idr_sync_state add column if not exists resync_generation bigint not null default 0;
+alter table public.idr_sync_state add column if not exists replay_generation bigint not null default 0;
 -- The cursor the resolver rejected with 400 (idr_reset_cursor) while the
 -- replay from the start of the buffer has not applied its first page yet.
 -- While it is set, every run first presents it again: a 410 then means
@@ -121,6 +131,10 @@ create table if not exists public.idr_sync_gaps (
   resolution       text        null check (resolution is null or resolution in ('full_resync')),
   constraint idr_sync_gaps_resolution_pair check ((resolved_at is null) = (resolution is null))
 );
+-- idr_sync_state.resync_generation when the gap was detected (null: recorded by
+-- an earlier release; treated as 0, so it needs a resync requested after the
+-- upgrade before it can be resolved: never a false resolution).
+alter table public.idr_sync_gaps add column if not exists detected_generation bigint null;
 create unique index if not exists idr_sync_gaps_one_open_idx
   on public.idr_sync_gaps (installation_id, kind) where resolved_at is null;
 
@@ -149,7 +163,8 @@ begin
      or new.detected_at is distinct from old.detected_at
      or new.expired_cursor is distinct from old.expired_cursor
      or new.last_applied_at is distinct from old.last_applied_at
-     or new.last_observed_at is distinct from old.last_observed_at then
+     or new.last_observed_at is distinct from old.last_observed_at
+     or new.detected_generation is distinct from old.detected_generation then
     raise exception 'idr_sync_gaps: only an open gap may be resolved, once' using errcode = '23514';
   end if;
   return new;
@@ -320,7 +335,9 @@ begin
   end loop;
 
   update public.idr_sync_state
-    set cursor = p_next_cursor, reset_from_cursor = null, last_applied_at = now(), updated_at = now()
+    set cursor = p_next_cursor, reset_from_cursor = null, last_applied_at = now(), updated_at = now(),
+        -- The first page from null starts a replay of the whole retained buffer.
+        replay_generation = case when p_expected_cursor is null then resync_generation else replay_generation end
     where installation_id = p_installation_id;
 
   return jsonb_build_object('applied', true, 'observations', v_obs, 'tombstones', v_tomb);
@@ -387,11 +404,14 @@ language plpgsql
 set search_path = ''
 as $$
 begin
-  insert into public.idr_sync_state as s (installation_id, status, needs_resync, cursor, resync_requested_at)
-    values (p_installation_id, 'resync_requested', false, null, now())
-    on conflict (installation_id) do update
-      set cursor = null, needs_resync = false, status = 'resync_requested',
-          resync_requested_at = now(), updated_at = now();
+  insert into public.idr_sync_state (installation_id) values (p_installation_id)
+    on conflict (installation_id) do nothing;
+  perform 1 from public.idr_sync_state s where s.installation_id = p_installation_id for update;
+  update public.idr_sync_state
+     set cursor = null, needs_resync = false, status = 'resync_requested',
+         resync_generation = resync_generation + 1,
+         resync_requested_at = clock_timestamp(), updated_at = now()
+   where installation_id = p_installation_id;
   return jsonb_build_object('ok', true);
 end;
 $$;
@@ -419,6 +439,7 @@ declare
   v_cursor text;
   v_reset_from text;
   v_last_applied timestamptz;
+  v_generation bigint;
   v_id bigint;
 begin
   if p_installation_id is null or p_installation_id = '' or p_kind is distinct from 'cursor_expired' then
@@ -426,7 +447,7 @@ begin
   end if;
   insert into public.idr_sync_state (installation_id) values (p_installation_id)
     on conflict (installation_id) do nothing;
-  select s.cursor, s.reset_from_cursor, s.last_applied_at into v_cursor, v_reset_from, v_last_applied
+  select s.cursor, s.reset_from_cursor, s.last_applied_at, s.resync_generation into v_cursor, v_reset_from, v_last_applied, v_generation
     from public.idr_sync_state s where s.installation_id = p_installation_id for update;
   if coalesce(v_cursor, v_reset_from) is distinct from p_expected_cursor then
     return jsonb_build_object('recorded', false, 'new', false, 'superseded', true, 'gap_id', null);
@@ -434,8 +455,8 @@ begin
   update public.idr_sync_state
      set status = 'needs_resync', needs_resync = true, reset_from_cursor = null, last_run_at = now(), updated_at = now()
    where installation_id = p_installation_id;
-  insert into public.idr_sync_gaps (installation_id, kind, expired_cursor, last_applied_at, last_observed_at)
-    values (p_installation_id, p_kind, p_expected_cursor, v_last_applied,
+  insert into public.idr_sync_gaps (installation_id, kind, detected_at, detected_generation, expired_cursor, last_applied_at, last_observed_at)
+    values (p_installation_id, p_kind, clock_timestamp(), v_generation, p_expected_cursor, v_last_applied,
             (select max(o.observed_at) from public.idr_observations o where o.installation_id = p_installation_id))
     on conflict (installation_id, kind) where resolved_at is null do nothing
     returning id into v_id;
@@ -449,11 +470,17 @@ end;
 $$;
 
 -- Called by the engine after a run that drained the resolver's buffer while a
--- gap was open. Resolves only gaps detected before the latest resync request,
--- and only while no new resync is pending: the drain then proves the
--- projection was rebuilt from the start of the retained buffer. That is the
--- meaning of resolved_at; the pruned observations stay missing.
-create or replace function public.idr_resolve_sync_gaps(p_installation_id text)
+-- gap was open. Resolves only gaps detected before the resync request whose
+-- replay has now drained (detected_generation < replay_generation: the replay
+-- applied its first page from null after a resync requested after the
+-- detection), only while no new resync is pending, and only if the stored
+-- cursor is still the one the run drained to (p_drained_cursor: no newer replay
+-- has started since that drain). Generations, not
+-- timestamps: the order is the commit order under the state row lock, so a
+-- transaction that started earlier cannot be mis-ordered (CHR-66 R2-9). That
+-- is the meaning of resolved_at; the pruned observations stay missing.
+drop function if exists public.idr_resolve_sync_gaps(text);
+create or replace function public.idr_resolve_sync_gaps(p_installation_id text, p_drained_cursor text)
 returns jsonb
 language plpgsql
 set search_path = ''
@@ -462,14 +489,15 @@ declare
   v_rows int;
 begin
   update public.idr_sync_gaps g
-     set resolved_at = now(), resolution = 'full_resync'
+     set resolved_at = clock_timestamp(), resolution = 'full_resync'
     from public.idr_sync_state s
    where g.installation_id = p_installation_id
      and g.resolved_at is null
      and s.installation_id = p_installation_id
      and not s.needs_resync
-     and s.resync_requested_at is not null
-     and g.detected_at <= s.resync_requested_at;
+     and s.cursor is not distinct from p_drained_cursor
+     and p_drained_cursor is not null
+     and coalesce(g.detected_generation, 0) < s.replay_generation;
   get diagnostics v_rows = row_count;
   return jsonb_build_object('resolved', v_rows);
 end;
@@ -497,7 +525,7 @@ revoke all on function public.idr_begin_resync(text) from public, anon, authenti
 revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
 revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated;
 revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated;
-revoke all on function public.idr_resolve_sync_gaps(text) from public, anon, authenticated;
+revoke all on function public.idr_resolve_sync_gaps(text, text) from public, anon, authenticated;
 revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text) to service_role;
@@ -506,6 +534,6 @@ grant execute on function public.idr_begin_resync(text) to service_role;
 grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
 grant execute on function public.idr_record_sync_gap(text, text, text) to service_role;
-grant execute on function public.idr_resolve_sync_gaps(text) to service_role;
+grant execute on function public.idr_resolve_sync_gaps(text, text) to service_role;
 -- A trigger function cannot be called directly; the grant only mirrors the others.
 grant execute on function public.idr_sync_gaps_guard() to service_role;

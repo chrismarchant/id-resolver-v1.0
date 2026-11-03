@@ -4,6 +4,7 @@ export interface MemoryGap {
   id: number;
   kind: GapKind;
   detectedAt: number;
+  detectedGeneration: number;
   expiredCursor: string | null;
   resolvedAt: number | null;
   resolution: "full_resync" | null;
@@ -11,9 +12,10 @@ export interface MemoryGap {
 
 /**
  * In-memory Store with the semantics of sql/0001_idr_projection.sql: cursor
- * compare-and-set, needs_resync, and an append-only gap log with at most one
- * open gap per kind, resolved only for gaps detected before the latest resync
- * request while no new resync is pending. Gaps are never removed.
+ * compare-and-set, needs_resync, reset_from_cursor, and an append-only gap log
+ * with at most one open gap per kind, resolved only for gaps detected before
+ * the resync whose replay has drained (generations), while no new resync is
+ * pending. Gaps are never removed.
  */
 export class MemoryStore implements Store {
   cursor: string | null = null;
@@ -21,6 +23,8 @@ export class MemoryStore implements Store {
   needsResync = false;
   status = "never_run";
   resyncRequestedAt: number | null = null;
+  resyncGeneration = 0;
+  replayGeneration = 0;
   readonly observations = new Map<string, unknown>();
   readonly statuses: string[] = [];
   readonly gaps: MemoryGap[] = [];
@@ -37,6 +41,7 @@ export class MemoryStore implements Store {
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     if (a.expectedCursor !== this.cursor || a.expectedResetFrom !== this.resetFromCursor) return { applied: false, observations: 0, tombstones: 0 };
     this.resetFromCursor = null;
+    if (a.expectedCursor === null) this.replayGeneration = this.resyncGeneration;
     let n = 0;
     for (const it of a.items) {
       if (it.type === "observation" && !this.observations.has(it.observation_id)) {
@@ -69,13 +74,14 @@ export class MemoryStore implements Store {
     this.statuses.push("needs_resync");
     this.needsResync = true;
     if (this.gaps.some((g) => g.kind === kind && g.resolvedAt === null)) return { recorded: true, newGap: false, superseded: false };
-    this.gaps.push({ id: this.gaps.length + 1, kind, detectedAt: this.now(), expiredCursor: expectedCursor, resolvedAt: null, resolution: null });
+    this.gaps.push({ id: this.gaps.length + 1, kind, detectedAt: this.now(), detectedGeneration: this.resyncGeneration, expiredCursor: expectedCursor, resolvedAt: null, resolution: null });
     return { recorded: true, newGap: true, superseded: false };
   }
-  async resolveGaps(): Promise<number> {
+  async resolveGaps(drainedCursor: string): Promise<number> {
+    if (this.needsResync || this.cursor !== drainedCursor) return 0;
     let n = 0;
     for (const g of this.gaps) {
-      if (g.resolvedAt === null && !this.needsResync && this.resyncRequestedAt !== null && g.detectedAt <= this.resyncRequestedAt) {
+      if (g.resolvedAt === null && g.detectedGeneration < this.replayGeneration) {
         g.resolvedAt = this.now();
         g.resolution = "full_resync";
         n += 1;
@@ -88,6 +94,7 @@ export class MemoryStore implements Store {
     this.cursor = null;
     this.needsResync = false;
     this.status = "resync_requested";
+    this.resyncGeneration += 1;
     this.resyncRequestedAt = this.now();
   }
 }

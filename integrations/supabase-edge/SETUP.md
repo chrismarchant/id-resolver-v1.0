@@ -143,6 +143,10 @@ If recording ever failed, the response says `"gap_recorded": false` and the next
    Replays are idempotent, so overlap with data already stored is harmless.
 4. Let the function run until a run drains the buffer (`status = ok`). That run sets
    `resolved_at` and `resolution = 'full_resync'` on the open gap and reports `"gaps_resolved": 1`.
+   Only a replay that started after the resync request can resolve a gap: resyncs, gaps and
+   replays are ordered by a generation number under the state row lock (`resync_generation`,
+   `detected_generation`, `replay_generation`), not by timestamps, so a gap detected while a
+   replay is running stays open until the next resync.
    **`resolved_at` marks the rebuild from what the resolver still retains, NOT a recovery:**
    observations pruned before the resync are permanently absent from the projection, and the
    row stays as the permanent record of the gap (rows are never deleted; `resolved_at` is set

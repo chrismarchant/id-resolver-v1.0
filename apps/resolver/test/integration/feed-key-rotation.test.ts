@@ -611,7 +611,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
         return store.resetCursor(c);
       },
       recordGap: (k) => store.recordGap(k),
-      resolveGaps: () => store.resolveGaps(),
+      resolveGaps: (c) => store.resolveGaps(c),
     };
     const r = await runSync(cfg(afterUrl), deps(watching));
     expect(r.status).toBe("needs_resync");

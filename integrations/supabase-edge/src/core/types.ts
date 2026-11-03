@@ -133,11 +133,13 @@ export interface Store {
    */
   recordGap(args: RecordGapArgs): Promise<RecordGapResult>;
   /**
-   * After a run that drained the resolver's buffer: mark open gaps detected
-   * before the latest resync request as resolved (rebuilt from the retained
-   * buffer, NOT recovered). Returns how many were resolved.
+   * After a run that drained the resolver's buffer up to drainedCursor: mark
+   * open gaps resolved whose detection precedes the resync request that
+   * started the replay now drained (ordered by generation under the state row
+   * lock), only while the stored cursor is still drainedCursor. Rebuilt from
+   * the retained buffer, NOT recovered. Returns how many were resolved.
    */
-  resolveGaps(): Promise<number>;
+  resolveGaps(drainedCursor: string): Promise<number>;
 }
 
 export interface SyncConfig {
