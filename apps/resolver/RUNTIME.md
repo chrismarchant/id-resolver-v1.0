@@ -70,7 +70,10 @@ name variables, never values. See `.env.example` for every variable.
   and the pruned observations are not recoverable from the resolver. Shorter is better for privacy; longer is safer for sync. The owner
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
-  and per-company scope statistics are never pruned.
+  and per-company scope statistics are never pruned. How to choose the value,
+  what pruning does and does not remove, and erasure:
+  [docs/RETENTION.md](../../docs/RETENTION.md) (operational justification,
+  not legal advice, pending owner/legal confirmation).
 * **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
   rows (IP fingerprints past their TTL), and observations and browser events
   older than the retention window. It runs once at startup (after the server
