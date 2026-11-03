@@ -163,6 +163,7 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
 }
 
 const RuntimeRoleSchema = ConfigSchema.pick({ DATABASE_RUNTIME_ROLE: true, DATABASE_RUNTIME_PASSWORD: true });
+const DatabaseUrlSchema = ConfigSchema.pick({ DATABASE_URL: true });
 
 export class MigrationError extends DbError {
   readonly migration: string;
@@ -191,6 +192,14 @@ async function main(): Promise<void> {
   const databaseUrl = process.env["DATABASE_URL"];
   if (!databaseUrl) {
     console.error("migrate: DATABASE_URL is required");
+    process.exitCode = 1;
+    return;
+  }
+  // The service's own validation of the variable (G5R2-L2: a string WHATWG URL
+  // cannot parse would otherwise reach node-postgres's parser). Names the variable, never the value.
+  const urlCheck = DatabaseUrlSchema.safeParse({ DATABASE_URL: databaseUrl });
+  if (!urlCheck.success) {
+    console.error(`migrate: invalid configuration: ${urlCheck.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
     process.exitCode = 1;
     return;
   }
