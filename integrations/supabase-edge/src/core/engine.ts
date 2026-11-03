@@ -1,4 +1,4 @@
-import type { FeedPage, ReconcileOutcome, SyncConfig, SyncDeps, SyncResult, SyncStatus } from "./types.ts";
+import { PROJECTION_SCHEMA_VERSION, type FeedPage, type ReconcileOutcome, type SyncConfig, type SyncDeps, type SyncResult, type SyncStatus } from "./types.ts";
 import { parseFeedPage, parseSummary } from "./validate.ts";
 
 const MAX_BODY_CHARS = 8 * 1024 * 1024;
@@ -43,6 +43,11 @@ export function reconcileWindow(nowMs: number, days: number): { from: string; to
  * buffer marks the gap resolved (Store.resolveGaps): the projection was
  * rebuilt from what is still retained; the pruned observations stay missing
  * and the gap record stays.
+ *
+ * A 400 to a stored cursor resets it, but the store keeps the rejected cursor
+ * (resetFromCursor) until the first page of the replay is applied; a later
+ * run re-presents it first, so retention passing it in between becomes a 410
+ * and a recorded gap, never a silent loss.
  */
 export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResult> {
   const deadline = deps.now() + cfg.budgetMs;
@@ -59,16 +64,28 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   }
 
   /**
-   * needs_resync: record the gap durably (idempotent while open). If that
-   * fails, still mark needs_resync and report gap.recorded=false; the next run
-   * finds needs_resync set and retries the record.
+   * needs_resync: record the gap durably (idempotent while open), as a
+   * compare-and-set on `expectedCursor`, the cursor that got the 410. If the
+   * stored position has moved on, an overlapping run already applied pages
+   * past it: nothing is written and this run ends cas_conflict (no false gap,
+   * no halt). If an operator requested a resync after that position (a run
+   * that overlapped a voluntary idr_begin_resync), the gap is recorded but the
+   * requested replay already covers the rebuild: no halt, cas_conflict for
+   * this stale run. If the record fails, still mark needs_resync and report
+   * gap.recorded=false; the next run finds needs_resync set and retries.
    */
-  async function finishGap(): Promise<SyncResult> {
+  async function finishGap(expectedCursor: string | null): Promise<SyncResult> {
     result.status = "needs_resync";
     try {
-      result.gap = await deps.store.recordGap("cursor_expired");
+      const g = await deps.store.recordGap({ kind: "cursor_expired", expectedCursor });
+      if (g.superseded) {
+        result.status = "cas_conflict";
+        return result; // the stale run touches nothing
+      }
+      result.gap = g;
+      if (!g.needsResync) result.status = "cas_conflict";
     } catch {
-      result.gap = { recorded: false, newGap: false };
+      result.gap = { recorded: false, newGap: false, superseded: false, needsResync: true };
       try {
         await deps.store.recordStatus({ status: "needs_resync", needsResync: true });
       } catch {
@@ -153,13 +170,65 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   } catch {
     return finish("store_error");
   }
+  // Code/SQL version skew (CHR-66 R2-6): a projection without the gap
+  // functions this code relies on could lose gap evidence. Refuse loudly,
+  // before any fetch, and write nothing (the old schema may not even accept
+  // this status).
+  if (state.schemaVersion !== PROJECTION_SCHEMA_VERSION) {
+    result.status = "schema_mismatch";
+    return result;
+  }
   // A pending resync is an operator decision; never fetch, advance or skip.
   // Re-recording is idempotent and covers a gap whose record failed earlier.
-  if (state.needsResync) return finishGap();
+  if (state.needsResync) return finishGap(state.cursor ?? state.resetFromCursor ?? null);
 
   let cursor = state.cursor;
+  /** What the store holds as reset_from_cursor (compare-and-set on every apply). */
+  let resetFrom: string | null = state.resetFromCursor ?? null;
+  let gapOpen = state.gapOpen;
   let drained = false;
   let cursorReset = false;
+
+  // The cursor was reset to null without the replay having applied its first
+  // page yet: after a 400 (rejected cursor), or by an operator's voluntary
+  // idr_begin_resync. Retention may have passed that old position, and a null
+  // cursor can never get a 410, so present it again first:
+  //  - 410: a continuity gap, recorded (compare-and-set on reset_from_cursor).
+  //    If a resync was requested after that position, the replay it asked for
+  //    continues in this run and the gap resolves once it drains; otherwise
+  //    halt with needs_resync.
+  //  - 400 or 200: nothing after it was pruned; replay from the start now.
+  // Any failure, including a failed record, leaves it set, so the next run
+  // checks again.
+  if (cursor === null && resetFrom !== null) {
+    const check = await getJson(`/v1/reporting/observations?limit=1&after=${encodeURIComponent(resetFrom)}`, true, true);
+    if (check.kind === "stop") {
+      if (check.status === "needs_resync") {
+        let g;
+        try {
+          g = await deps.store.recordGap({ kind: "cursor_expired", expectedCursor: resetFrom });
+        } catch {
+          return finish("store_error");
+        }
+        if (g.superseded) {
+          result.status = "cas_conflict";
+          return result;
+        }
+        result.gap = g;
+        if (g.needsResync) {
+          result.status = "needs_resync";
+          return result;
+        }
+        resetFrom = null; // the record ended the re-check, in its transaction
+        gapOpen = true;
+      } else if (check.status === "cursor_rejected") {
+        cursorReset = true;
+      } else {
+        return finish(check.status);
+      }
+    }
+  }
+
   while (result.pages < cfg.maxPages) {
     if (deps.now() >= deadline) break;
     const q = `limit=${cfg.pageLimit}${cursor === null ? "" : `&after=${encodeURIComponent(cursor)}`}`;
@@ -177,6 +246,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         }
         if (!reset) return finish("cas_conflict");
         cursorReset = true;
+        resetFrom = cursor;
         cursor = null;
         try {
           await deps.store.recordStatus({ status: "cursor_rejected", needsResync: null });
@@ -186,7 +256,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         continue;
       }
       if (fetched.status === "cursor_rejected") return finish("contract_error");
-      if (fetched.status === "needs_resync") return finishGap();
+      if (fetched.status === "needs_resync") return finishGap(cursor ?? resetFrom);
       return finish(fetched.status);
     }
     const page: FeedPage | null = parseFeedPage(fetched.body, cfg.installationId);
@@ -195,13 +265,14 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
     let applied;
     try {
-      applied = await deps.store.applyPage({ expectedCursor: cursor, nextCursor: page.nextCursor, items: page.items });
+      applied = await deps.store.applyPage({ expectedCursor: cursor, expectedResetFrom: resetFrom, nextCursor: page.nextCursor, items: page.items });
     } catch {
       return finish("store_error");
     }
     // Lost the compare-and-set: another invocation advanced the cursor.
     if (!applied.applied) return finish("cas_conflict");
     cursor = page.nextCursor;
+    resetFrom = null; // cleared in the same transaction as the page
     result.pages++;
     result.observations += applied.observations;
     result.tombstones += applied.tombstones;
@@ -215,10 +286,11 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
   // Drained: if a gap is open, the projection may now have been rebuilt from
   // the start of the retained buffer after idr_begin_resync(); the store
-  // resolves only gaps that precede the latest resync request.
-  if (state.gapOpen) {
+  // resolves only gaps detected before the resync whose replay this drain
+  // completed, and only if no newer replay has started since (cursor CAS).
+  if (gapOpen && cursor !== null) {
     try {
-      result.gapsResolved = await deps.store.resolveGaps();
+      result.gapsResolved = await deps.store.resolveGaps(cursor);
     } catch {
       return finish("store_error");
     }

@@ -29,15 +29,34 @@ export interface FeedPage {
   hasMore: boolean;
 }
 
+/**
+ * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
+ * this code requires. The engine refuses to run against any other.
+ */
+export const PROJECTION_SCHEMA_VERSION = 4;
+
 export interface SyncState {
+  /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
+  schemaVersion: number | null;
   cursor: string | null;
   needsResync: boolean;
+  /**
+   * The position the cursor held before it was reset to null: the cursor the
+   * resolver rejected with 400 (Store.resetCursor), or the cursor discarded by
+   * a voluntary idr_begin_resync. Kept until the first page from null is
+   * applied. While set (with cursor null), each run re-presents it before
+   * replaying, so a prune past it becomes a 410 and a recorded gap rather than
+   * a silent loss.
+   */
+  resetFromCursor: string | null;
   /** An unresolved continuity gap is recorded (see Store.recordGap). */
   gapOpen: boolean;
 }
 
 export interface ApplyPageArgs {
   expectedCursor: string | null;
+  /** Compare-and-set on the stored reset_from_cursor too; a successful apply clears it. */
+  expectedResetFrom: string | null;
   nextCursor: string;
   items: FeedItem[];
 }
@@ -60,6 +79,7 @@ export type SyncStatus =
   | "contract_error"
   | "cursor_rejected"
   | "store_error"
+  | "schema_mismatch"
   | "reconcile_mismatch";
 
 export interface RecordStatusArgs {
@@ -71,11 +91,29 @@ export interface RecordStatusArgs {
 /** The only gap kind: the resolver answered 410 cursor_expired. */
 export type GapKind = "cursor_expired";
 
+export interface RecordGapArgs {
+  kind: GapKind;
+  /** The cursor that got the 410 (compare-and-set against the stored one). */
+  expectedCursor: string | null;
+}
+
 export interface RecordGapResult {
   /** A durable gap record exists for this incident (inserted now or already open). */
   recorded: boolean;
   /** This call inserted it (false: an open gap of this kind already existed). */
   newGap: boolean;
+  /**
+   * The stored cursor no longer equals expectedCursor: another run applied
+   * pages past that position, so nothing was missed there. Nothing was
+   * written; the run ends cas_conflict.
+   */
+  superseded: boolean;
+  /**
+   * The record halted sync (needs_resync set). False when a resync requested
+   * after that position already covers the rebuild (a voluntary resync): the
+   * gap is on record and the requested replay continues.
+   */
+  needsResync: boolean;
 }
 
 export interface LocalCounts {
@@ -97,22 +135,28 @@ export interface Store {
   /**
    * Compare-and-set reset of the stored cursor to null (start of the resolver's
    * buffer): only if the stored cursor still equals expectedCursor. Returns
-   * false when another invocation changed it. Keeps the projection.
+   * false when another invocation changed it. Keeps the projection. In the
+   * same transaction, keeps the rejected cursor as resetFromCursor until the
+   * first page from null is applied.
    */
   resetCursor(expectedCursor: string): Promise<boolean>;
   /**
-   * A potential synchronisation continuity gap (410 cursor_expired). In ONE
+   * A potential synchronisation continuity gap (410 cursor_expired).
+   * Compare-and-set on the cursor that got the 410: if the stored cursor has
+   * moved on, write nothing and report superseded. Otherwise, in ONE
    * transaction: mark needs_resync (status needs_resync) and append a durable
    * gap record, unless an unresolved gap of this kind is already open (never a
    * duplicate). The record is never deleted; a later resync does not erase it.
    */
-  recordGap(kind: GapKind): Promise<RecordGapResult>;
+  recordGap(args: RecordGapArgs): Promise<RecordGapResult>;
   /**
-   * After a run that drained the resolver's buffer: mark open gaps detected
-   * before the latest resync request as resolved (rebuilt from the retained
-   * buffer, NOT recovered). Returns how many were resolved.
+   * After a run that drained the resolver's buffer up to drainedCursor: mark
+   * open gaps resolved whose detection precedes the resync request that
+   * started the replay now drained (ordered by generation under the state row
+   * lock), only while the stored cursor is still drainedCursor. Rebuilt from
+   * the retained buffer, NOT recovered. Returns how many were resolved.
    */
-  resolveGaps(): Promise<number>;
+  resolveGaps(drainedCursor: string): Promise<number>;
 }
 
 export interface SyncConfig {

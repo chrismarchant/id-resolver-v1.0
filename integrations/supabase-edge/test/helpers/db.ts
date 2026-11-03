@@ -1,13 +1,13 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
+import type { ApplyPageArgs, ApplyPageResult, LocalCounts, RecordGapArgs, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
 
 export const TEST_DB_URL =
   process.env["TEST_DATABASE_URL"] ?? "postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test_edge";
 export const INSTALLATION = "inst_test";
 
-const SQL_PATH = fileURLToPath(new URL("../../sql/0001_idr_projection.sql", import.meta.url));
+export const SQL_PATH = fileURLToPath(new URL("../../sql/0001_idr_projection.sql", import.meta.url));
 
 export function newPool(): pg.Pool {
   return new pg.Pool({ connectionString: TEST_DB_URL, max: 8 });
@@ -25,7 +25,7 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
  * SQL template applied (it is idempotent) to whatever public schema exists.
  * Used directly by suites that share the database with other tables.
  */
-export async function ensureProjection(pool: pg.Pool): Promise<void> {
+export async function ensureProjection(pool: pg.Pool, sqlPath: string = SQL_PATH): Promise<void> {
   const c = await pool.connect();
   try {
     for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
@@ -46,7 +46,7 @@ export async function ensureProjection(pool: pg.Pool): Promise<void> {
     await c.query("grant usage on schema auth to anon, authenticated, service_role");
     await c.query("grant execute on function auth.jwt() to anon, authenticated, service_role");
     await c.query("grant usage on schema public to anon, authenticated, service_role");
-    await c.query(readFileSync(SQL_PATH, "utf8"));
+    await c.query(readFileSync(sqlPath, "utf8"));
   } finally {
     c.release();
   }
@@ -83,10 +83,14 @@ export interface GapRow {
   last_observed_at: Date | null;
   resolved_at: Date | null;
   resolution: string | null;
+  /** null for rows of earlier releases, and before the upgrade that adds the column. */
+  detected_generation: number | null;
 }
 
 export async function gapRows(pool: pg.Pool): Promise<GapRow[]> {
-  const r = await pool.query<GapRow>("select id::int as id, installation_id, kind, detected_at, expired_cursor, last_applied_at, last_observed_at, resolved_at, resolution from public.idr_sync_gaps order by id");
+  const r = await pool.query<GapRow>(
+    "select g.id::int as id, g.installation_id, g.kind, g.detected_at, g.expired_cursor, g.last_applied_at, g.last_observed_at, g.resolved_at, g.resolution, (to_jsonb(g) ->> 'detected_generation')::int as detected_generation from public.idr_sync_gaps g order by g.id",
+  );
   return r.rows;
 }
 
@@ -122,22 +126,36 @@ export class PgStore implements Store {
 
   async getState(): Promise<SyncState> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ s: { cursor: string | null; needs_resync: boolean } }>("select public.idr_get_sync_state($1) as s", [this.installationId]),
+      c.query<{ s: { cursor: string | null; needs_resync: boolean; gap_open?: boolean; reset_from_cursor?: string | null; schema_version?: number } }>(
+        "select public.idr_get_sync_state($1) as s",
+        [this.installationId],
+      ),
     );
     const s = r.rows[0]!.s;
-    return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: (s as { gap_open?: boolean }).gap_open === true };
+    return {
+      schemaVersion: typeof s.schema_version === "number" ? s.schema_version : null,
+      cursor: s.cursor,
+      needsResync: s.needs_resync,
+      gapOpen: s.gap_open === true,
+      resetFromCursor: s.reset_from_cursor ?? null,
+    };
   }
 
-  async recordGap(kind: GapKind): Promise<RecordGapResult> {
+  async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { recorded: boolean; new: boolean } }>("select public.idr_record_sync_gap($1,$2) as r", [this.installationId, kind]),
+      c.query<{ r: { recorded: boolean; new: boolean; superseded: boolean; needs_resync: boolean } }>("select public.idr_record_sync_gap($1,$2,$3) as r", [
+        this.installationId,
+        a.kind,
+        a.expectedCursor,
+      ]),
     );
-    return { recorded: r.rows[0]!.r.recorded, newGap: r.rows[0]!.r.new };
+    const v = r.rows[0]!.r;
+    return { recorded: v.recorded, newGap: v.new, superseded: v.superseded, needsResync: v.needs_resync };
   }
 
-  async resolveGaps(): Promise<number> {
+  async resolveGaps(drainedCursor: string): Promise<number> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1) as r", [this.installationId]),
+      c.query<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1,$2) as r", [this.installationId, drainedCursor]),
     );
     return r.rows[0]!.r.resolved;
   }
@@ -145,8 +163,8 @@ export class PgStore implements Store {
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
       c.query<{ r: { applied: boolean; observations?: number; tombstones?: number } }>(
-        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb) as r",
-        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items)],
+        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5) as r",
+        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom],
       ),
     );
     const v = r.rows[0]!.r;
