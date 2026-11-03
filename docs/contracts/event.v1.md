@@ -1,7 +1,7 @@
 # Contract `event.v1`: optional browser collector → website → resolver
 
 Status: **frozen interface for Gate 4 implementation; the event vocabulary is
-proposed and pending owner approval (CHR-59)**. This contract is additive. It
+approved by the owner on 3 Nov 2026 (CHR-59)**. This contract is additive. It
 does not change `entrance.v1` or `reporting-feed.v1`.
 
 ## Owner constraints (D4, 3 Nov 2026)
@@ -90,7 +90,7 @@ Errors use the existing mapping: `400 invalid_request`, `401 unauthorized`,
   `reporting-feed.v1`. How they reach Insights (for example an aggregate-only
   summary) is a separate owner decision. It is not part of this contract.
 
-## Vocabulary `event-vocabulary.v1` (proposed, CHR-59)
+## Vocabulary `event-vocabulary.v1` (approved by the owner, 3 Nov 2026, CHR-59)
 
 The canonical list is
 [`event-vocabulary.v1.json`](event-vocabulary.v1.json). Every package embeds a

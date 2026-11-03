@@ -1,6 +1,6 @@
 {
   "vocabulary": "event-vocabulary.v1",
-  "status": "proposed: pending owner approval in CHR-59",
+  "status": "approved by the owner on 3 Nov 2026 (CHR-59)",
   "types": {
     "page_view": ["page_view"],
     "engagement": [
