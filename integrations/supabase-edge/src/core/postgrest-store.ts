@@ -63,7 +63,9 @@ export class PostgrestStore implements Store {
     const r = obj(await this.rpc("idr_get_sync_state", { p_installation_id: this.o.installationId }));
     const cursor = r["cursor"];
     if (cursor !== null && typeof cursor !== "string") throw new StoreError("bad_rpc_response");
-    return { cursor: cursor ?? null, needsResync: r["needs_resync"] === true, gapOpen: r["gap_open"] === true };
+    const resetFrom = r["reset_from_cursor"] ?? null;
+    if (resetFrom !== null && typeof resetFrom !== "string") throw new StoreError("bad_rpc_response");
+    return { cursor: cursor ?? null, needsResync: r["needs_resync"] === true, gapOpen: r["gap_open"] === true, resetFromCursor: resetFrom };
   }
 
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
@@ -73,6 +75,7 @@ export class PostgrestStore implements Store {
         p_expected_cursor: a.expectedCursor,
         p_next_cursor: a.nextCursor,
         p_items: a.items,
+        p_expected_reset_from: a.expectedResetFrom,
       }),
     );
     if (r["applied"] !== true) return { applied: false, observations: 0, tombstones: 0 };

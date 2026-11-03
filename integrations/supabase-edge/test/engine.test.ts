@@ -99,7 +99,7 @@ describe("crash and atomicity", () => {
   it("applying and cursor advance roll back together", async () => {
     await expect(
       asRole(pool, "service_role", async (c) => {
-        await c.query("select public.idr_apply_feed_page($1,null,'c1',$2::jsonb)", [INSTALLATION, JSON.stringify([obs(1, 3, D)])]);
+        await c.query("select public.idr_apply_feed_page($1,null,'c1',$2::jsonb,null)", [INSTALLATION, JSON.stringify([obs(1, 3, D)])]);
         throw new Error("crash before commit");
       }),
     ).rejects.toThrow();
@@ -108,11 +108,11 @@ describe("crash and atomicity", () => {
   });
 
   it("a stale expected cursor changes nothing (CAS)", async () => {
-    const a = await store.applyPage({ expectedCursor: null, nextCursor: "c1", items: [obs(1, 3, D)] as never });
+    const a = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(1, 3, D)] as never });
     expect(a.applied).toBe(true);
-    const stale = await store.applyPage({ expectedCursor: null, nextCursor: "c1", items: [obs(2, 3, D)] as never });
+    const stale = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(2, 3, D)] as never });
     expect(stale.applied).toBe(false);
-    const wrong = await store.applyPage({ expectedCursor: "c9", nextCursor: "c10", items: [obs(3, 3, D)] as never });
+    const wrong = await store.applyPage({ expectedCursor: "c9", expectedResetFrom: null, nextCursor: "c10", items: [obs(3, 3, D)] as never });
     expect(wrong.applied).toBe(false);
     expect((await counts(pool)).observations).toBe(1);
     expect(await storedCursor(pool)).toBe("c1");
@@ -470,6 +470,113 @@ describe("reconciliation", () => {
 
 describe("rejected cursor (resolver cursor-key rotation)", () => {
   const cfg = () => testConfig(mock, { pageLimit: 2 });
+  const resetFromCursor = async () =>
+    (await pool.query<{ r: string | null }>("select reset_from_cursor as r from public.idr_sync_state where installation_id = $1", [INSTALLATION])).rows[0]?.r ?? null;
+  /** fetch that answers 503 to the first request WITHOUT a cursor (the replay start), once. */
+  const failFirstCursorless = (): typeof fetch => {
+    let failed = false;
+    return (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(url));
+      if (!failed && u.pathname.endsWith("/observations") && !u.searchParams.has("after")) {
+        failed = true;
+        return new Response("", { status: 503 });
+      }
+      return fetch(url, init);
+    }) as typeof fetch;
+  };
+  /** Consumer at c2 of obs 1-5, then the resolver's key rotates and the replay start fails once. */
+  const resetButReplayFailed = async () => {
+    mock.items = [1, 2, 3, 4, 5].map((i) => obs(i, 7, D));
+    expect((await runSync(testConfig(mock, { maxPages: 1 }), testDeps(store))).status).toBe("partial");
+    expect(await storedCursor(pool)).toBe("c2");
+    mock.cursorPrefix = "k2";
+    mock.requests = [];
+    const r = await runSync(testConfig(mock, { maxRetries: 0 }), testDeps(store, { fetch: failFirstCursorless() }));
+    expect(r.status).toBe("upstream_error");
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2"]); // the 503 never reached the mock
+    expect(await storedCursor(pool)).toBeNull();
+    expect(await resetFromCursor()).toBe("c2"); // kept by idr_reset_cursor in the same transaction
+  };
+
+  it("R2-5: retention passes the rejected cursor before the replay starts -> the next run re-presents it, gets 410 and records the gap (no silent loss)", async () => {
+    await resetButReplayFailed();
+    mock.retentionFloor = 3; // obs 1-3 pruned; obs 3 was never delivered
+    mock.requests = [];
+    const r = await runSync(cfg(), testDeps(store));
+    expect(r).toMatchObject({ status: "needs_resync", gap: { recorded: true, newGap: true, superseded: false } });
+    expect(mock.requests.map((q) => [q.query.get("after"), q.query.get("limit")])).toEqual([["c2", "1"]]);
+    const gaps = await gapRows(pool);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: "c2", resolved_at: null });
+    expect(await resetFromCursor()).toBeNull(); // the re-check ended with the record
+    const st = await pool.query("select status, needs_resync, cursor from public.idr_sync_state");
+    expect(st.rows[0]).toEqual({ status: "needs_resync", needs_resync: true, cursor: null });
+    // The operator's resync rebuilds from what is retained; obs 3 stays missing, and is on record.
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    const ok = await runSync(cfg(), testDeps(store));
+    expect(ok).toMatchObject({ status: "ok", gapsResolved: 1 });
+    const ids = await pool.query<{ id: string }>("select observation_id::text as id from public.idr_observations order by observation_id");
+    expect(ids.rows.map((x) => x.id)).toEqual(["1", "2", "4", "5"]);
+  });
+
+  it("R2-5: still within retention -> the next run re-checks (400), replays once in the same run (cursor_rejected) and clears reset_from_cursor with the first page", async () => {
+    await resetButReplayFailed();
+    mock.requests = [];
+    const r = await runSync(cfg(), testDeps(store));
+    expect(r.status).toBe("cursor_rejected");
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2", null, "k2c2", "k2c4"]);
+    expect(await resetFromCursor()).toBeNull();
+    expect(await storedCursor(pool)).toBe("k2c5");
+    expect((await counts(pool)).observations).toBe(5);
+    expect(await gapRows(pool)).toHaveLength(0);
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+  });
+
+  it("R2-5: a crash between the reset and the first page (apply fails), or a failed re-check, leaves reset_from_cursor set; the next run re-checks", async () => {
+    mock.items = [1, 2, 3, 4, 5].map((i) => obs(i, 7, D));
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");
+    mock.cursorPrefix = "k2";
+    const crashing: Store = {
+      getState: () => store.getState(),
+      applyPage: async (a) => {
+        if (a.expectedCursor === null) throw new Error("function killed before the first page committed");
+        return store.applyPage(a);
+      },
+      recordStatus: (a) => store.recordStatus(a),
+      localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => store.resetCursor(c),
+      recordGap: (a) => store.recordGap(a),
+      resolveGaps: () => store.resolveGaps(),
+    };
+    expect((await runSync(cfg(), testDeps(crashing))).status).toBe("store_error");
+    expect(await storedCursor(pool)).toBeNull();
+    expect(await resetFromCursor()).toBe("c5");
+    // The re-check itself fails (resolver down): still set, nothing applied.
+    mock.overrides = [{ status: 503 }];
+    expect((await runSync(testConfig(mock, { maxRetries: 0 }), testDeps(store))).status).toBe("upstream_error");
+    expect(await resetFromCursor()).toBe("c5");
+    // Next healthy run: re-check (400), replay, cleared.
+    mock.requests = [];
+    expect((await runSync(cfg(), testDeps(store))).status).toBe("cursor_rejected");
+    expect(mock.requests[0]!.query.get("after")).toBe("c5");
+    expect(await resetFromCursor()).toBeNull();
+    expect((await counts(pool)).observations).toBe(5);
+  });
+
+  it("R2-5 SQL: the reset keeps the rejected cursor; apply is a compare-and-set on it and clears it atomically", async () => {
+    await pool.query("insert into public.idr_sync_state (installation_id, cursor) values ($1, 'c7')", [INSTALLATION]);
+    const svc = (sql: string, args: unknown[]) => asRole(pool, "service_role", (c) => c.query<{ r: { applied: boolean } }>(sql, args));
+    expect((await svc("select public.idr_reset_cursor($1, 'c7') as r", [INSTALLATION])).rows[0]!.r.applied).toBe(true);
+    expect(await resetFromCursor()).toBe("c7");
+    const apply = (expectedResetFrom: string | null) =>
+      svc("select public.idr_apply_feed_page($1, null, 'k2c1', $2::jsonb, $3) as r", [INSTALLATION, JSON.stringify([obs(1, 7, D)]), expectedResetFrom]);
+    // A run that did not see the reset (expects no pending re-check) loses the compare-and-set.
+    expect((await apply(null)).rows[0]!.r.applied).toBe(false);
+    expect((await counts(pool)).observations).toBe(0);
+    expect((await apply("c7")).rows[0]!.r.applied).toBe(true);
+    expect(await resetFromCursor()).toBeNull();
+    expect(await storedCursor(pool)).toBe("k2c1");
+  });
 
   it("400 to a request carrying a cursor resets to the buffer start and replays idempotently", async () => {
     mock.items = [1, 2, 3, 4, 5].map((i) => obs(i, i % 2 === 0 ? 7 : 8, D));
@@ -490,6 +597,7 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
     expect(dup.rowCount).toBe(0);
     const st = await pool.query("select status, needs_resync from public.idr_sync_state");
     expect(st.rows[0]).toEqual({ status: "cursor_rejected", needs_resync: false });
+    expect(await resetFromCursor()).toBeNull(); // cleared with the first page from null
 
     // The next run is back to normal.
     expect((await runSync(cfg(), testDeps(store))).status).toBe("ok");

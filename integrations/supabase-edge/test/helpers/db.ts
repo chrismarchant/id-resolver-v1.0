@@ -7,7 +7,7 @@ export const TEST_DB_URL =
   process.env["TEST_DATABASE_URL"] ?? "postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test_edge";
 export const INSTALLATION = "inst_test";
 
-const SQL_PATH = fileURLToPath(new URL("../../sql/0001_idr_projection.sql", import.meta.url));
+export const SQL_PATH = fileURLToPath(new URL("../../sql/0001_idr_projection.sql", import.meta.url));
 
 export function newPool(): pg.Pool {
   return new pg.Pool({ connectionString: TEST_DB_URL, max: 8 });
@@ -25,7 +25,7 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
  * SQL template applied (it is idempotent) to whatever public schema exists.
  * Used directly by suites that share the database with other tables.
  */
-export async function ensureProjection(pool: pg.Pool): Promise<void> {
+export async function ensureProjection(pool: pg.Pool, sqlPath: string = SQL_PATH): Promise<void> {
   const c = await pool.connect();
   try {
     for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
@@ -46,7 +46,7 @@ export async function ensureProjection(pool: pg.Pool): Promise<void> {
     await c.query("grant usage on schema auth to anon, authenticated, service_role");
     await c.query("grant execute on function auth.jwt() to anon, authenticated, service_role");
     await c.query("grant usage on schema public to anon, authenticated, service_role");
-    await c.query(readFileSync(SQL_PATH, "utf8"));
+    await c.query(readFileSync(sqlPath, "utf8"));
   } finally {
     c.release();
   }
@@ -122,10 +122,13 @@ export class PgStore implements Store {
 
   async getState(): Promise<SyncState> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ s: { cursor: string | null; needs_resync: boolean } }>("select public.idr_get_sync_state($1) as s", [this.installationId]),
+      c.query<{ s: { cursor: string | null; needs_resync: boolean; gap_open?: boolean; reset_from_cursor?: string | null } }>(
+        "select public.idr_get_sync_state($1) as s",
+        [this.installationId],
+      ),
     );
     const s = r.rows[0]!.s;
-    return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: (s as { gap_open?: boolean }).gap_open === true };
+    return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: s.gap_open === true, resetFromCursor: s.reset_from_cursor ?? null };
   }
 
   async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
@@ -150,8 +153,8 @@ export class PgStore implements Store {
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
       c.query<{ r: { applied: boolean; observations?: number; tombstones?: number } }>(
-        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb) as r",
-        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items)],
+        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5) as r",
+        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom],
       ),
     );
     const v = r.rows[0]!.r;

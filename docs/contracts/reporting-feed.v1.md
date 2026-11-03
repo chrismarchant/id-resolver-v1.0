@@ -153,12 +153,25 @@ UTC days inside the retained window.
   restarted after a `400`, and `needs_resync` plus an `idr_sync_gaps` row
   after a `410`.
 
+  **Clarification (CHR-66 R2-5), consumer obligation, no wire change:** the
+  `400` only proves that nothing after the rejected cursor was pruned *at
+  that moment*, and a cursorless position can never receive a `410`. So the
+  consumer must keep the rejected cursor until the first page of the replay
+  is applied (atomically with that page), and every later attempt must first
+  present it again (`after=<rejected cursor>`): a `410` then means retention
+  passed it in the meantime (a potential gap: record it); a `400` means it is
+  still within retention and the replay starts at once. The reference adapter
+  keeps it in `idr_sync_state.reset_from_cursor`, written by
+  `idr_reset_cursor` and cleared by `idr_apply_feed_page` with the first page
+  from the start (or by the gap record). A failure anywhere between the reset
+  and that first page therefore leaves it set and the next run checks again.
+
   In short: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
   is behind the retention watermark, and otherwise `400` followed by a safe
-  replay. Known limit: the watermark check and the consumer's restarted
-  request are two reads, so a retention run that passes the consumer's
-  position in the moment between them is not reported. Positions are not
-  secret, so answering from the claimed position leaks nothing.
+  replay. Known limit: the last `400` (or re-check) and the snapshot of the
+  first page from the start are two reads, so a retention run that passes the
+  rejected position in the milliseconds between them is not reported. Positions
+  are not secret, so answering from the claimed position leaks nothing.
 
 ### Erasure and re-observation
 

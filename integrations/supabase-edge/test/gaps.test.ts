@@ -38,7 +38,7 @@ const READER = { role: "authenticated", app_metadata: { idr_reader: true } };
 
 describe("recording", () => {
   it("410: one gap row and needs_resync in the same call; bounds come from the stored state", async () => {
-    await svc("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb)", [
+    await svc("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null)", [
       INSTALLATION,
       JSON.stringify([{ type: "observation", observation_id: "1", company_id: 7, domain: "example.com", organisation_name: null, observed_at: "2026-11-02T09:00:00.000Z", method: "cache", page_key: "/", acquisition: null, entrance_contract: null }]),
     ]);
@@ -60,7 +60,7 @@ describe("recording", () => {
   });
 
   it("R2-7: a record for a cursor other than the stored one is superseded and writes nothing", async () => {
-    await svc("select public.idr_apply_feed_page($1, null, 'c6', '[]'::jsonb)", [INSTALLATION]);
+    await svc("select public.idr_apply_feed_page($1, null, 'c6', '[]'::jsonb, null)", [INSTALLATION]);
     const before = (await pool.query("select cursor, status, needs_resync, updated_at from public.idr_sync_state")).rows[0];
     for (const stale of ["c2", null]) {
       const r = (await svc<{ r: unknown }>("select public.idr_record_sync_gap($1, 'cursor_expired', $2) as r", [INSTALLATION, stale])).rows[0]!.r;

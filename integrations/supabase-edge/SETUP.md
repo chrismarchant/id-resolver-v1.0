@@ -23,7 +23,9 @@ causation.
 
 Run `sql/0001_idr_projection.sql` against the project (SQL editor or `supabase db push`
 after copying it into `supabase/migrations/`). It is idempotent (re-run it to upgrade an
-existing project: it adds `idr_sync_gaps` and `idr_sync_state.resync_requested_at`). It creates the
+existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_state` columns
+`resync_requested_at` and `reset_from_cursor`, and replaces `idr_apply_feed_page` and
+`idr_record_sync_gap` with new signatures, so re-run the SQL and redeploy the function together). It creates the
 projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
 execution to `service_role` only.
@@ -114,7 +116,7 @@ used.
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
-| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
+| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. Only the milliseconds between that check and the first page remain unchecked | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |

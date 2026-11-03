@@ -69,6 +69,13 @@ create table if not exists public.idr_sync_state (
 -- Set by idr_begin_resync(); idr_resolve_sync_gaps() closes only gaps detected
 -- before the latest resync request (re-runs: added if missing).
 alter table public.idr_sync_state add column if not exists resync_requested_at timestamptz null;
+-- The cursor the resolver rejected with 400 (idr_reset_cursor) while the
+-- replay from the start of the buffer has not applied its first page yet.
+-- While it is set, every run first presents it again: a 410 then means
+-- retention passed it in the meantime (a gap, recorded); a 400 means it is
+-- still within retention and the replay may start. Cleared atomically with the
+-- first page applied from null (idr_apply_feed_page) or by the gap record.
+alter table public.idr_sync_state add column if not exists reset_from_cursor text null;
 
 -- Re-runs on an existing installation: widen the status check (idempotent).
 alter table public.idr_sync_state drop constraint if exists idr_sync_state_status_check;
@@ -232,31 +239,38 @@ stable
 set search_path = ''
 as $$
   select coalesce(
-    (select jsonb_build_object('cursor', s.cursor, 'needs_resync', s.needs_resync)
+    (select jsonb_build_object('cursor', s.cursor, 'needs_resync', s.needs_resync, 'reset_from_cursor', s.reset_from_cursor)
        from public.idr_sync_state s where s.installation_id = p_installation_id),
-    jsonb_build_object('cursor', null, 'needs_resync', false))
+    jsonb_build_object('cursor', null, 'needs_resync', false, 'reset_from_cursor', null))
     || jsonb_build_object('gap_open', exists (
          select 1 from public.idr_sync_gaps g
           where g.installation_id = p_installation_id and g.resolved_at is null));
 $$;
 
 -- Applies one feed page atomically, only if the stored cursor equals
--- p_expected_cursor (NULL = "no cursor yet"). Observations are idempotent on
--- (installation_id, observation_id). A company_erased item deletes that
--- company's rows. Items are processed in stream order. The row lock on
--- idr_sync_state serialises concurrent callers; the loser sees the advanced
--- cursor and gets {"applied": false} without writing anything.
+-- p_expected_cursor (NULL = "no cursor yet") and the stored reset_from_cursor
+-- equals p_expected_reset_from (compare-and-set on both). Observations are
+-- idempotent on (installation_id, observation_id). A company_erased item
+-- deletes that company's rows. Items are processed in stream order. The row
+-- lock on idr_sync_state serialises concurrent callers; the loser sees the
+-- advanced state and gets {"applied": false} without writing anything. The
+-- applied page always clears reset_from_cursor: applying the first page from
+-- null after a 400-reset ends the pending re-check in the same transaction.
+-- (The four-argument version of earlier releases is dropped on re-run.)
+drop function if exists public.idr_apply_feed_page(text, text, text, jsonb);
 create or replace function public.idr_apply_feed_page(
   p_installation_id text,
   p_expected_cursor text,
   p_next_cursor text,
-  p_items jsonb
+  p_items jsonb,
+  p_expected_reset_from text
 ) returns jsonb
 language plpgsql
 set search_path = ''
 as $$
 declare
   v_cursor text;
+  v_reset_from text;
   v_item jsonb;
   v_obs int := 0;
   v_tomb int := 0;
@@ -269,10 +283,10 @@ begin
 
   insert into public.idr_sync_state (installation_id) values (p_installation_id)
     on conflict (installation_id) do nothing;
-  select s.cursor into v_cursor from public.idr_sync_state s
+  select s.cursor, s.reset_from_cursor into v_cursor, v_reset_from from public.idr_sync_state s
     where s.installation_id = p_installation_id for update;
 
-  if v_cursor is distinct from p_expected_cursor then
+  if v_cursor is distinct from p_expected_cursor or v_reset_from is distinct from p_expected_reset_from then
     return jsonb_build_object('applied', false);
   end if;
 
@@ -306,7 +320,7 @@ begin
   end loop;
 
   update public.idr_sync_state
-    set cursor = p_next_cursor, last_applied_at = now(), updated_at = now()
+    set cursor = p_next_cursor, reset_from_cursor = null, last_applied_at = now(), updated_at = now()
     where installation_id = p_installation_id;
 
   return jsonb_build_object('applied', true, 'observations', v_obs, 'tombstones', v_tomb);
@@ -335,8 +349,12 @@ $$;
 
 -- Automatic recovery when the resolver rejects a stored cursor (400, e.g. its
 -- cursor MAC key rotated). Compare-and-set so concurrent runs stay safe; the
--- projection is kept and the replay from the buffer start is idempotent. This
--- is NOT for cursor_expired (410): that is a potential continuity gap, recorded
+-- projection is kept and the replay from the buffer start is idempotent. The
+-- rejected cursor is kept in reset_from_cursor, in the same transaction,
+-- until the first page from null is applied: if the replay does not start in
+-- this run, the next run re-presents it, so a retention prune past it in the
+-- meantime becomes a 410 and a recorded gap instead of a silent loss. This is
+-- NOT for cursor_expired (410): that is a potential continuity gap, recorded
 -- in idr_sync_gaps by idr_record_sync_gap(), and needs the operator action
 -- idr_begin_resync().
 create or replace function public.idr_reset_cursor(p_installation_id text, p_expected_cursor text)
@@ -348,7 +366,7 @@ declare
   v_rows int;
 begin
   update public.idr_sync_state
-     set cursor = null, updated_at = now()
+     set cursor = null, reset_from_cursor = p_expected_cursor, updated_at = now()
    where installation_id = p_installation_id
      and cursor is not distinct from p_expected_cursor
      and p_expected_cursor is not null
@@ -380,10 +398,13 @@ $$;
 
 -- Called by the engine on 410 cursor_expired (and on every run that finds
 -- needs_resync already set). Compare-and-set like every other cursor change:
--- p_expected_cursor is the cursor that got the 410 (the one the run holds).
--- If the stored cursor no longer equals it, another run has moved on (it
--- applied pages past that position, so nothing was missed there): the call
--- writes nothing and returns {"superseded": true}. Otherwise, in ONE
+-- p_expected_cursor is the cursor that got the 410 (the one the run holds, or
+-- the re-presented reset_from_cursor). The stored position is the cursor, or
+-- reset_from_cursor while the cursor is null after a 400-reset. If it no
+-- longer equals p_expected_cursor, another run has moved on (it applied pages
+-- past that position, so nothing was missed there): the call writes nothing
+-- and returns {"superseded": true}. A recorded gap also ends a pending
+-- re-check (reset_from_cursor is cleared). Otherwise, in ONE
 -- transaction, it marks needs_resync and the status and records the gap
 -- unless an open gap of this kind already exists (the partial unique index
 -- makes that race-free). expired_cursor is the cursor that got the 410; the
@@ -396,6 +417,7 @@ set search_path = ''
 as $$
 declare
   v_cursor text;
+  v_reset_from text;
   v_last_applied timestamptz;
   v_id bigint;
 begin
@@ -404,13 +426,13 @@ begin
   end if;
   insert into public.idr_sync_state (installation_id) values (p_installation_id)
     on conflict (installation_id) do nothing;
-  select s.cursor, s.last_applied_at into v_cursor, v_last_applied
+  select s.cursor, s.reset_from_cursor, s.last_applied_at into v_cursor, v_reset_from, v_last_applied
     from public.idr_sync_state s where s.installation_id = p_installation_id for update;
-  if v_cursor is distinct from p_expected_cursor then
+  if coalesce(v_cursor, v_reset_from) is distinct from p_expected_cursor then
     return jsonb_build_object('recorded', false, 'new', false, 'superseded', true, 'gap_id', null);
   end if;
   update public.idr_sync_state
-     set status = 'needs_resync', needs_resync = true, last_run_at = now(), updated_at = now()
+     set status = 'needs_resync', needs_resync = true, reset_from_cursor = null, last_run_at = now(), updated_at = now()
    where installation_id = p_installation_id;
   insert into public.idr_sync_gaps (installation_id, kind, expired_cursor, last_applied_at, last_observed_at)
     values (p_installation_id, p_kind, p_expected_cursor, v_last_applied,
@@ -469,7 +491,7 @@ as $$
 $$;
 
 revoke all on function public.idr_get_sync_state(text) from public, anon, authenticated;
-revoke all on function public.idr_apply_feed_page(text, text, text, jsonb) from public, anon, authenticated;
+revoke all on function public.idr_apply_feed_page(text, text, text, jsonb, text) from public, anon, authenticated;
 revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated;
 revoke all on function public.idr_begin_resync(text) from public, anon, authenticated;
 revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
@@ -478,7 +500,7 @@ revoke all on function public.idr_record_sync_gap(text, text, text) from public,
 revoke all on function public.idr_resolve_sync_gaps(text) from public, anon, authenticated;
 revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
 grant execute on function public.idr_get_sync_state(text) to service_role;
-grant execute on function public.idr_apply_feed_page(text, text, text, jsonb) to service_role;
+grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
 grant execute on function public.idr_begin_resync(text) to service_role;
 grant execute on function public.idr_reset_cursor(text, text) to service_role;

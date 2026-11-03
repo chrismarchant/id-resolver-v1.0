@@ -6,7 +6,7 @@ let pool: pg.Pool;
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 const FUNCS = [
   "idr_get_sync_state(text)",
-  "idr_apply_feed_page(text,text,text,jsonb)",
+  "idr_apply_feed_page(text,text,text,jsonb,text)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
@@ -105,7 +105,7 @@ describe("row level security", () => {
   it("only service_role can execute the functions", async () => {
     const calls: Record<string, [string, unknown[]]> = {
       "idr_get_sync_state(text)": ["select public.idr_get_sync_state($1)", [INSTALLATION]],
-      "idr_apply_feed_page(text,text,text,jsonb)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb)", [INSTALLATION]],
+      "idr_apply_feed_page(text,text,text,jsonb,text)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
       "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],

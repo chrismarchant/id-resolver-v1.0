@@ -17,6 +17,7 @@ export interface MemoryGap {
  */
 export class MemoryStore implements Store {
   cursor: string | null = null;
+  resetFromCursor: string | null = null;
   needsResync = false;
   status = "never_run";
   resyncRequestedAt: number | null = null;
@@ -31,10 +32,11 @@ export class MemoryStore implements Store {
   }
 
   async getState(): Promise<SyncState> {
-    return { cursor: this.cursor, needsResync: this.needsResync, gapOpen: this.gaps.some((g) => g.resolvedAt === null) };
+    return { cursor: this.cursor, needsResync: this.needsResync, gapOpen: this.gaps.some((g) => g.resolvedAt === null), resetFromCursor: this.resetFromCursor };
   }
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
-    if (a.expectedCursor !== this.cursor) return { applied: false, observations: 0, tombstones: 0 };
+    if (a.expectedCursor !== this.cursor || a.expectedResetFrom !== this.resetFromCursor) return { applied: false, observations: 0, tombstones: 0 };
+    this.resetFromCursor = null;
     let n = 0;
     for (const it of a.items) {
       if (it.type === "observation" && !this.observations.has(it.observation_id)) {
@@ -56,11 +58,13 @@ export class MemoryStore implements Store {
   async resetCursor(expected: string): Promise<boolean> {
     if (this.cursor !== expected || this.needsResync) return false;
     this.cursor = null;
+    this.resetFromCursor = expected;
     this.resets += 1;
     return true;
   }
   async recordGap({ kind, expectedCursor }: RecordGapArgs): Promise<RecordGapResult> {
-    if (this.cursor !== expectedCursor) return { recorded: false, newGap: false, superseded: true };
+    if ((this.cursor ?? this.resetFromCursor) !== expectedCursor) return { recorded: false, newGap: false, superseded: true };
+    this.resetFromCursor = null;
     this.status = "needs_resync";
     this.statuses.push("needs_resync");
     this.needsResync = true;

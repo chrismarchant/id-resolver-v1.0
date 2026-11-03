@@ -43,6 +43,11 @@ export function reconcileWindow(nowMs: number, days: number): { from: string; to
  * buffer marks the gap resolved (Store.resolveGaps): the projection was
  * rebuilt from what is still retained; the pruned observations stay missing
  * and the gap record stays.
+ *
+ * A 400 to a stored cursor resets it, but the store keeps the rejected cursor
+ * (resetFromCursor) until the first page of the replay is applied; a later
+ * run re-presents it first, so retention passing it in between becomes a 410
+ * and a recorded gap, never a silent loss.
  */
 export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResult> {
   const deadline = deps.now() + cfg.budgetMs;
@@ -163,11 +168,29 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   }
   // A pending resync is an operator decision; never fetch, advance or skip.
   // Re-recording is idempotent and covers a gap whose record failed earlier.
-  if (state.needsResync) return finishGap(state.cursor);
+  if (state.needsResync) return finishGap(state.cursor ?? state.resetFromCursor ?? null);
 
   let cursor = state.cursor;
+  /** What the store holds as reset_from_cursor (compare-and-set on every apply). */
+  let resetFrom: string | null = state.resetFromCursor ?? null;
   let drained = false;
   let cursorReset = false;
+
+  // An earlier run reset a rejected cursor (400) but the replay never applied
+  // its first page. Retention may have passed the old position since, and a
+  // null cursor can never get a 410, so present the rejected cursor again
+  // first: 410 -> a continuity gap, recorded; 400 (or 200) -> nothing after it
+  // was pruned, replay from the start now. Any failure here leaves it set, so
+  // the next run checks again.
+  if (cursor === null && resetFrom !== null) {
+    const check = await getJson(`/v1/reporting/observations?limit=1&after=${encodeURIComponent(resetFrom)}`, true, true);
+    if (check.kind === "stop") {
+      if (check.status === "needs_resync") return finishGap(resetFrom);
+      if (check.status !== "cursor_rejected") return finish(check.status);
+    }
+    cursorReset = true;
+  }
+
   while (result.pages < cfg.maxPages) {
     if (deps.now() >= deadline) break;
     const q = `limit=${cfg.pageLimit}${cursor === null ? "" : `&after=${encodeURIComponent(cursor)}`}`;
@@ -185,6 +208,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         }
         if (!reset) return finish("cas_conflict");
         cursorReset = true;
+        resetFrom = cursor;
         cursor = null;
         try {
           await deps.store.recordStatus({ status: "cursor_rejected", needsResync: null });
@@ -194,7 +218,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         continue;
       }
       if (fetched.status === "cursor_rejected") return finish("contract_error");
-      if (fetched.status === "needs_resync") return finishGap(cursor);
+      if (fetched.status === "needs_resync") return finishGap(cursor ?? resetFrom);
       return finish(fetched.status);
     }
     const page: FeedPage | null = parseFeedPage(fetched.body, cfg.installationId);
@@ -203,13 +227,14 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
     let applied;
     try {
-      applied = await deps.store.applyPage({ expectedCursor: cursor, nextCursor: page.nextCursor, items: page.items });
+      applied = await deps.store.applyPage({ expectedCursor: cursor, expectedResetFrom: resetFrom, nextCursor: page.nextCursor, items: page.items });
     } catch {
       return finish("store_error");
     }
     // Lost the compare-and-set: another invocation advanced the cursor.
     if (!applied.applied) return finish("cas_conflict");
     cursor = page.nextCursor;
+    resetFrom = null; // cleared in the same transaction as the page
     result.pages++;
     result.observations += applied.observations;
     result.tombstones += applied.tombstones;

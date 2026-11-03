@@ -32,12 +32,21 @@ export interface FeedPage {
 export interface SyncState {
   cursor: string | null;
   needsResync: boolean;
+  /**
+   * The cursor the resolver rejected with 400, kept by Store.resetCursor until
+   * the first page from null is applied. While set (with cursor null), each
+   * run re-presents it before replaying, so a prune past it becomes a 410 and
+   * a recorded gap rather than a silent loss.
+   */
+  resetFromCursor: string | null;
   /** An unresolved continuity gap is recorded (see Store.recordGap). */
   gapOpen: boolean;
 }
 
 export interface ApplyPageArgs {
   expectedCursor: string | null;
+  /** Compare-and-set on the stored reset_from_cursor too; a successful apply clears it. */
+  expectedResetFrom: string | null;
   nextCursor: string;
   items: FeedItem[];
 }
@@ -109,7 +118,9 @@ export interface Store {
   /**
    * Compare-and-set reset of the stored cursor to null (start of the resolver's
    * buffer): only if the stored cursor still equals expectedCursor. Returns
-   * false when another invocation changed it. Keeps the projection.
+   * false when another invocation changed it. Keeps the projection. In the
+   * same transaction, keeps the rejected cursor as resetFromCursor until the
+   * first page from null is applied.
    */
   resetCursor(expectedCursor: string): Promise<boolean>;
   /**
