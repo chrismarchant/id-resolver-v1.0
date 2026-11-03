@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { containsIp, createCanary, headersContaining, ipLiterals, loadConfig, scrubIps as canaryScrub } from "./canary-sink.mjs";
+import { containsIp, createCanary, headersContaining, headersContainingAny, ipLiterals, loadConfig, scrubIps as canaryScrub } from "./canary-sink.mjs";
 import { Refusal, confirmTarget, hostInZone, makeRedactor, parseTarget, percentile, rawRequest, scrubIps } from "./lib/common.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -328,4 +328,110 @@ test("cf-site-check: a stand-in site that leaks nothing gives INFO (local: no ed
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /INFO \[ttfb \(canary mode ok\)\] ttfb: G4-I8 header canary \(local workerd: not the production edge, no claim\) \(no header carried the tester IP/);
   assert.deepEqual(ipLiterals(r.stdout + r.file), []);
+});
+
+// G5R2-L5: the header check must never PASS without a comparison basis, and must catch a header carrying the
+// entrance body's own IP even when no expected tester IP was set (the browser phase never sets one).
+const BODY_IP = "192.0.2.77"; // RFC 5737; deliberately not the script's local tester IP
+function entranceBody(n, ip, pageKey) {
+  return { contract: "entrance.v1", website_id: "w", ip, entrance_id: `entranceL5${String(n).padStart(8, "0")}`, occurred_at: "2026-11-03T10:00:00Z", page_key: pageKey, acquisition: "direct", eligibility: "tsa-1" };
+}
+function eventBody(n, pageKey) {
+  return { contract: "event.v1", website_id: "w", event_id: `eventL5${String(n).padStart(11, "0")}`, occurred_at: "2026-11-03T10:00:00Z", type: "conversion_intent", name: "cta_click", page_key: pageKey, consent: "granted" };
+}
+
+test("canary: with no expectation, a request is marked uncompared; an entrance's own ip and earlier visitor IPs are compared", async () => {
+  assert.deepEqual(headersContainingAny({ "x-real-ip": IP }, []), []);
+  assert.deepEqual(headersContainingAny({ "x-real-ip": IP, via: "1.1 edge" }, [null, IP6, IP]), ["x-real-ip"]);
+  const { server } = createCanary(loadConfig({ CANARY_TOKEN: TOKEN, CANARY_BIND: "127.0.0.1", PORT: "1" }));
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const post = (path, body, extra = {}) => rawRequest(`${base}${path}`, { method: "POST", headers: { ...auth, ...extra }, body: JSON.stringify(body) });
+  try {
+    assert.equal((await post("/v1/events", eventBody(1, "/landing/a"), { "x-real-ip": BODY_IP })).status, 200);
+    assert.equal((await post("/v1/entrances", entranceBody(1, BODY_IP, "/landing/a"), { "cf-connecting-ip": BODY_IP })).status, 200);
+    assert.equal((await post("/v1/events", eventBody(2, "/landing/a"), { "x-real-ip": `::ffff:${BODY_IP}` })).status, 200);
+    assert.equal((await post("/v1/events", eventBody(3, "/landing/a"))).status, 200);
+    const res = await rawRequest(`${base}/_canary/results`, { headers: auth });
+    assert.deepEqual(ipLiterals(res.body), [], "the results hold no IP");
+    const j = JSON.parse(res.body);
+    assert.deepEqual([j.expectationSet, j.visitorIpsKnown], [false, 1]);
+    const [ev1, ent, ev2, ev3] = j.records;
+    assert.deepEqual([ev1.compared, ev1.headersWithClientIp], [false, []], "before any entrance: nothing to compare against");
+    assert.deepEqual([ent.compared, ent.headersWithClientIp], [true, ["cf-connecting-ip"]], "the entrance's own ip");
+    assert.deepEqual([ev2.compared, ev2.headersWithClientIp], [true, ["x-real-ip"]], "an earlier visitor's ip, in another spelling");
+    assert.deepEqual([ev3.compared, ev3.headersWithClientIp], [true, []]);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+/** Runs cf-site-check --local-probe --phase browser against an in-process canary pre-seeded by `seed`. */
+async function runBrowserPhase(seed) {
+  const { server: canary } = createCanary(loadConfig({ CANARY_TOKEN: TOKEN, CANARY_BIND: "127.0.0.1", PORT: "1" }));
+  await new Promise((r) => canary.listen(0, "127.0.0.1", r));
+  const canaryPort = canary.address().port;
+  const site = http.createServer((req, res) => res.writeHead(200, { "content-type": "text/html" }).end("<html></html>"));
+  await new Promise((r) => site.listen(0, "127.0.0.1", r));
+  const sitePort = site.address().port;
+  const dir = mkdtempSync(join(tmpdir(), "idr-selftest-"));
+  const outFile = join(dir, "out.json");
+  const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const post = (path, body, extra = {}) => rawRequest(`http://127.0.0.1:${canaryPort}${path}`, { method: "POST", headers: { ...auth, ...extra }, body: JSON.stringify(body) });
+  try {
+    await seed(post);
+    const env = { ACCEPT_SITE_URL: `http://127.0.0.1:${sitePort}`, ACCEPT_SITE_ZONE: "probe.invalid", ACCEPT_RESOLVER_URL: `http://127.0.0.1:${canaryPort}`, ACCEPT_CANARY_URL: `http://127.0.0.1:${canaryPort}`, ACCEPT_CANARY_TOKEN: TOKEN };
+    const r = await new Promise((resolve) => {
+      const p = spawn(process.execPath, [join(HERE, "cf-site-check.mjs"), "--local-probe", "--phase", "browser", "--browser-wait-s", "1", "--confirm-target", `127.0.0.1:${sitePort}`, "--out", outFile], { env: { PATH: process.env.PATH, ...env } });
+      let stdout = "";
+      let stderr = "";
+      p.stdout.on("data", (d) => (stdout += d));
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    return { ...r, file: readFileSync(outFile, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    site.closeAllConnections();
+    canary.closeAllConnections();
+    await new Promise((r) => site.close(r));
+    await new Promise((r) => canary.close(r));
+  }
+}
+
+test("cf-site-check browser phase: requests with nothing to compare against can never PASS G4-I8", async () => {
+  const r = await runBrowserPhase(async (post) => {
+    // Events only (no entrance, no expectation): a leaking header could not even be recognised here.
+    assert.equal((await post("/v1/events", eventBody(10, "/landing/browser-a"), { "x-real-ip": BODY_IP })).status, 200);
+    assert.equal((await post("/v1/events", eventBody(11, "/landing/browser-a"))).status, 200);
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /FAIL \[browser \(manual, real browsers\)\] browser: G4-I8, no request header at the resolver's hosting position carries the visitor's IP \(local workerd\) \(2 of 2 requests could not be compared/);
+  assert.ok(!/PASS .*G4-I8/.test(r.stdout) && !/INFO .*no header carried/.test(r.stdout), r.stdout);
+  assert.deepEqual(ipLiterals(r.stdout + r.stderr + r.file), []);
+});
+
+test("cf-site-check browser phase: a header carrying the entrance body's own IP is a FAIL without any expected IP", async () => {
+  const r = await runBrowserPhase(async (post) => {
+    assert.equal((await post("/v1/entrances", entranceBody(20, BODY_IP, "/landing/browser-b"), { "cf-connecting-ip": BODY_IP, "x-real-ip": BODY_IP })).status, 200);
+    assert.equal((await post("/v1/events", eventBody(20, "/landing/browser-b"), { "x-forwarded-for": `198.51.100.1, ${BODY_IP}` })).status, 200);
+  });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /FAIL \[browser \(manual, real browsers\)\] browser: G4-I8, .*\(headers carrying it: cf-connecting-ip, x-forwarded-for, x-real-ip\)/);
+  assert.match(r.stdout, /expected tester IP set: false; visitor IPs known from entrance bodies: 1/);
+  for (const [where, text] of [["stdout", r.stdout], ["stderr", r.stderr], ["--out file", r.file]]) {
+    assert.deepEqual(ipLiterals(text), [], `${where} holds no IP literal`);
+    assert.ok(!text.includes("192.0.2"), `${where} must not contain the visitor IP`);
+  }
+});
+
+test("cf-site-check browser phase: compared and clean is INFO locally (no claim), exit 0", async () => {
+  const r = await runBrowserPhase(async (post) => {
+    assert.equal((await post("/v1/entrances", entranceBody(30, BODY_IP, "/landing/browser-c"))).status, 200);
+    assert.equal((await post("/v1/events", eventBody(30, "/landing/browser-c"))).status, 200);
+  });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /INFO \[browser \(manual, real browsers\)\] browser: G4-I8 header canary \(local workerd: not the production edge, no claim\) \(no header carried the tester IP \(2 requests, each compared\)\)/);
 });

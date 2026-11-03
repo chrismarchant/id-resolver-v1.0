@@ -432,7 +432,7 @@ describe("middleware: a navigation to the collector path is never an entrance (G
     expect(results).toEqual([expect.objectContaining({ outcome: "delivered", reason: "ok" })]);
   });
 
-  it.each(["/IDR/E", "/idr/e/", "/Idr/E//", "/idr/%65", "/%69dr/e", "//idr/e", "/idr/e?utm_medium=email"])("variant %s: nothing sent", async (path) => {
+  it.each(["/IDR/E", "/idr/e/", "/Idr/E//", "/idr/%65", "/%69dr/e", "//idr/e", "/idr/e?utm_medium=email", "/idr/e%20", "/IDR/E%20%20", "/idr/%65%20"])("variant %s: nothing sent", async (path) => {
     const { results, calls } = await run({}, navigation(path));
     expect(calls).toEqual([]);
     expect(fx.captured).toHaveLength(0);

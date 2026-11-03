@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isCollectorPath } from "../src/collector-path.js";
 import { TEST_TOKEN } from "./helpers.js";
 
 const pkgDir = resolve(import.meta.dirname, "..");
@@ -151,12 +152,12 @@ describe("real stack: the probe app under local workerd (G5-D-F1)", () => {
   };
 
   /** node:http, because fetch (undici) rewrites Sec-Fetch-Mode and normalises the path. */
-  function send(port: number, method: string, path: string, headers: Record<string, string> = NAVIGATION): Promise<{ status: number; type: string; body: string }> {
+  function send(port: number, method: string, path: string, headers: Record<string, string> = NAVIGATION): Promise<{ status: number; type: string; body: string; cacheControl: string }> {
     return new Promise((resolve, reject) => {
       const r = http.request({ host: "127.0.0.1", port, method, path, headers, agent: false }, (res) => {
         let body = "";
         res.on("data", (c) => (body += c));
-        res.on("end", () => resolve({ status: res.statusCode ?? 0, type: String(res.headers["content-type"] ?? ""), body }));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, type: String(res.headers["content-type"] ?? ""), body, cacheControl: String(res.headers["cache-control"] ?? "") }));
       });
       r.on("error", reject);
       r.end();
@@ -213,9 +214,30 @@ describe("real stack: the probe app under local workerd (G5-D-F1)", () => {
       const hookCount = (JSON.parse((await send(port, "GET", "/diag/idr")).body) as string[]).length;
       entrances.length = 0;
 
-      const collectorRequests: Array<[string, string]> = [["GET", "/idr/e"], ["HEAD", "/idr/e"], ["GET", "/IDR/E"], ["GET", "/idr/e/"], ["GET", "/idr/%65"], ["GET", "/%69dr/e"], ["GET", "//idr/e"], ["GET", "/idr//e"]];
+      const collectorRequests: Array<[string, string]> = [
+        ["GET", "/idr/e"], ["HEAD", "/idr/e"], ["GET", "/IDR/E"], ["GET", "/idr/e/"], ["GET", "/idr/%65"], ["GET", "/%69dr/e"], ["GET", "//idr/e"], ["GET", "/idr//e"],
+        // G5R2-L1: a trailing encoded space reaches the route (decoded, then stripped by the router's second URL parse).
+        ["GET", "/idr/e%20"], ["GET", "/idr/e%20%20"], ["GET", "/IDR/E%20"], ["GET", "/IDR/E%20%20"], ["GET", "/idr/%65%20"], ["HEAD", "/idr/e%20"],
+        // A stray "%" plus decoded "2e" forms an encoded dot segment that the router's second URL parse resolves.
+        ["GET", "/x/%2%65%2%65/idr/e"],
+      ];
       const answers = [];
       for (const [method, path] of collectorRequests) answers.push({ method, path, ...(await send(port, method, path)) });
+
+      // Differential on the real stack: which spellings does the router really dispatch to the collector route? A
+      // POST without Origin that reaches createCollectorRoute gets its bare 403 (no body, Cache-Control: no-store).
+      // Each spelling is also loaded as a browser navigation (GET).
+      const grid: string[] = [];
+      for (const a of ["idr", "IDR", "%69dr"])
+        for (const sep of ["/", "//"])
+          for (const b of ["e", "E", "%65"])
+            for (const tail of ["", "/", "%20", "%20%20", "/%20", "%20/", "%09", "%C2%A0", "?q=1", "%20?q=1"]) grid.push(`/${a}${sep}${b}${tail}`);
+      const dispatched: string[] = [];
+      for (const path of grid) {
+        const post = await send(port, "POST", path, { "content-type": "text/plain;charset=UTF-8", "content-length": "0", "user-agent": NAVIGATION["user-agent"] });
+        if (post.status === 403 && post.body === "" && post.cacheControl === "no-store") dispatched.push(path);
+        answers.push({ method: "GET", path, ...(await send(port, "GET", path)) });
+      }
       const control = `/landing/control${Date.now().toString(36).replace(/[0-9]/g, "")}`;
       const controlAnswer = await send(port, "GET", control);
       await new Promise((r) => setTimeout(r, 1500));
@@ -232,10 +254,17 @@ describe("real stack: the probe app under local workerd (G5-D-F1)", () => {
       // skipped as collector_path. (Verified with TanStack Start 1.168: GET, HEAD, /IDR/E, /idr/%65 and /%69dr/e are
       // served 200 text/html; the router redirects /idr/e/ and /idr//e (307) and //idr/e (308) to /idr/e.)
       const reportable = answers.filter((a) => a.status >= 200 && a.status <= 299);
-      expect(reportable.length).toBeGreaterThanOrEqual(5);
+      expect(reportable.length).toBeGreaterThanOrEqual(10);
       const middlewareHooks = hooks.filter((h) => h.route === undefined);
       expect(middlewareHooks.filter((h) => h.reason === "eligibility:collector_path")).toHaveLength(reportable.length);
       expect(middlewareHooks.filter((h) => h.outcome === "delivered")).toHaveLength(1);
+      // Every spelling the real router dispatched to the collector route is one the exclusion matches, and the route
+      // never saw a path that the middleware would not exclude (no collector:path_mismatch).
+      console.log(`real-stack differential: ${JSON.stringify({ spellings: grid.length, dispatchedToCollectorRoute: dispatched.length, getAnswered2xx: reportable.length, collectorPathSkips: middlewareHooks.filter((h) => h.reason === "eligibility:collector_path").length, entrances: entrances.length })}`);
+      expect(dispatched.length).toBeGreaterThanOrEqual(50);
+      expect(dispatched).toContain("/idr/e%20");
+      expect(dispatched.filter((p) => !isCollectorPath(new URL(`http://127.0.0.1${p}`).pathname, "/idr/e"))).toEqual([]);
+      expect(hooks.filter((h) => h.route === "collector" && h.reason === "collector:path_mismatch")).toEqual([]);
     } finally {
       try {
         process.kill(-wrangler.pid!, "SIGTERM");

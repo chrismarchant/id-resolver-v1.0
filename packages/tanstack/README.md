@@ -76,7 +76,7 @@ exactly what `next()` returned, so it composes with any other middleware.
 | `maxInFlight` | 50 (1 to 500) | reports in flight per process/isolate; extra ones are dropped (`overload`) |
 | `onUnsupportedBackground`, `blockingBudgetMs` | `"drop"`, 250 (50 to 1000) | edge isolate with no `waitUntil` only: drop, or block for at most the budget |
 | `eligibility` | `{}` | `includePaths`, `excludePaths` (exact path, `/prefix/*`, or RegExp), `extraBotPatterns` |
-| `collectorPath` | `/idr/e` | the path of the collector route (`createCollectorRoute`), never reported, see "What is sent, and when". A plain path: no query string, fragment, wildcard, percent-encoding, empty or dot segment; at most 256 characters; not `/` |
+| `collectorPath` | `/idr/e` | the request path of the collector route (`createCollectorRoute`) as the browser sends it, including any router `basepath`; never reported, see "What is sent, and when". A plain path: no query string, fragment, wildcard, percent-encoding, empty or dot segment; at most 256 characters; not `/` |
 | `pageKeyMapper` | none | your own mapper, e.g. `compileRouteTemplates(["/blog/:slug", "/products/:id"])`. The conservative default mapper still runs after it (see below) |
 | `pageKeyDefaultMapper` | `true` | `false` switches the default mapper off so that `pageKeyMapper` alone decides; requires `pageKeyMapper` (see below) |
 | `siteHosts` | host of the request URL | host names counted as "internal" referrers |
@@ -123,22 +123,45 @@ page, `200 text/html`. Before Gate 5 the middleware reported such a browser navi
 
 * whether or not the site mounts `createCollectorRoute`, whatever the route's `allow` list or `consent` mode;
 * for every HTTP method (it is checked before the method rule, on its own);
-* in every spelling the router routes there: upper or mixed case (TanStack Router matches static segments
-  case-insensitively by default), trailing or repeated slashes, percent-encoded characters (`/idr/%65`), and a
-  doubled leading slash. An encoded `%2F` separator is excluded too. That is deliberate over-exclusion of this one
-  path. A different path is never excluded: `/idr/ex`, `/idr/e-mail`, `/idr` and `/idr/e/x` stay eligible;
+* for every request path that TanStack Start's own canonicalisation turns into the collector path. The adapter
+  repeats the router's steps: it percent-decodes the path as the router does (except `%25` and `%5C`), parses it
+  again as a URL (which strips trailing spaces, so `/idr/e%20` reaches the route, and resolves dot segments, also
+  ones that only appear after decoding), trims trailing slashes, and compares in lower case (TanStack Router matches
+  static segments case-insensitively by default). This was derived from, and is tested against, the router code the
+  repository's probe app pins (`@tanstack/start-server-core` 1.169.39, `@tanstack/router-core` 1.171.34): a
+  differential test replays the router's dispatch on hand-written spellings, a grid of combinations and 50,000 random
+  mutations, and the probe app under local workerd confirms it end to end. Another TanStack version may canonicalise
+  differently; the differential test is the place to re-check it after an upgrade;
+* deliberately also for a few spellings the router does not dispatch to the route, all of the same path: a doubled
+  leading slash (the router answers it with a redirect to the path), repeated inner slashes, an encoded `%2F` or `%5C`
+  separator, trailing spaces followed by a query string, and upper case on a case-sensitive router. A different
+  path is never excluded: `/idr/ex`, `/idr/e-mail`, `/idr`, `/idr/e/x` and `/idr/x%20` stay eligible;
 * `includePaths` cannot re-admit it, and `excludePaths: ["/idr/e"]` is no longer needed (it is harmless).
 
 Such a request is reported to `onDeliveryResult` as `skipped/eligibility:collector_path`. Only the report is
 skipped: the page, its status and its headers are exactly what your router answered, and the response object is
 returned untouched.
 
-**One path, three places.** The collector's `endpoint`, the route file's path (`createFileRoute("/idr/e")`) and
-`collectorPath` must be the same value. With the documented `/idr/e` the default already matches and you configure
-nothing. If you mount the route elsewhere, set `collectorPath` to that path in the options of **both** the middleware
-and the route (one shared options object does both). If a `POST` reaches the route on any other path, the route
-reports `skipped/collector:path_mismatch` once per instance (its answers do not change). That signal means the
-middleware is not excluding the path the route really lives on.
+**`collectorPath` is the request path, as the browser sends it.** It must equal the collector's `endpoint`. Without a
+router `basepath`, that is also the route file's path (`createFileRoute("/idr/e")`). With the documented `/idr/e`
+the default already matches and you configure nothing. If you mount the route elsewhere, set `collectorPath` to
+that path in the options of **both** the middleware and the route (one shared options object does both). If a
+`POST` reaches the route on any other path, the route reports `skipped/collector:path_mismatch` once per instance
+(its answers do not change). That signal means the middleware is not excluding the path the route really lives on.
+
+**Basepath and input rewrites are not covered.** The middleware sees the request path before the router applies
+its `basepath` or a `rewrite.input` (createStartHandler.js:479 in the pinned version):
+
+* With `basepath: "/app"`, the browser posts to `/app/idr/e`, so set `collectorPath: "/app/idr/e"` (the full request
+  path, not the route file's `/idr/e`). TanStack's basepath rewrite also passes paths without the base through
+  unchanged (router-core `rewrite.js`, `rewriteBasepath`), so `/idr/e` reaches the same route too. That spelling is
+  not excluded: add it to `excludePaths` (for example `excludePaths: ["/idr/e"]`).
+* With an input rewrite, for example locale prefixes (`/de/idr/e` rewritten to `/idr/e`), every rewritten
+  spelling reaches the route and none of them is excluded. List them in `excludePaths`, for example
+  `excludePaths: [/^\/[a-z]{2}\/idr\/e\/?$/i]`.
+
+`excludePaths` matches the raw path (exact, prefix or RegExp). It does not repeat the router's decoding, so encoded
+variants of those extra spellings (such as `/de/idr/%65`) are not excluded.
 
 The body is exactly: `contract`, `website_id`, `ip`, `entrance_id` (128-bit random, base64url), `occurred_at` (now, UTC),
 `page_key` (normalised path with identifier-like segments replaced, see below; at most 256 characters, never a query string or fragment), `acquisition` (one of
@@ -370,7 +393,7 @@ body, no `Set-Cookie`, `Cache-Control: no-store`. A refusal is reported to `onDe
 `body_timeout`, `malformed`, `schema`, `path`, `vocabulary`, `not_allowed`, `consent_off`, `gpc`, `consent`,
 `consent_timeout`, `occurred_at`, `replay` or `rate`. One more `collector:` reason is a signal, not a refusal:
 `path_mismatch`, reported once per route instance when a `POST` arrives on a path other than `collectorPath` (the
-event is still handled as usual; see "One path, three places").
+event is still handled as usual; see "`collectorPath` is the request path").
 
 ### What it forwards, and what it never reads
 

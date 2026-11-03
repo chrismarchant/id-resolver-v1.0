@@ -200,6 +200,18 @@ describe("tsa-1 eligibility: the collector path is never eligible (G5-D-F1)", ()
     ["backslash (a separator for http URLs)", "/idr\\e"],
     ["query string", "/idr/e?utm_medium=email"],
     ["fragment", "/idr/e#top"],
+    // G5R2-L1: TanStack Start decodes %20 and its second URL parse strips trailing spaces, so these reach the route.
+    ["trailing encoded space", "/idr/e%20"],
+    ["two trailing encoded spaces", "/idr/e%20%20"],
+    ["upper case with a trailing encoded space", "/IDR/E%20"],
+    ["upper case with two trailing encoded spaces", "/IDR/E%20%20"],
+    ["encoded letter and a trailing encoded space", "/idr/%65%20"],
+    ["mixed spelling with a trailing encoded space", "/Idr/%45%20"],
+    ["trailing slash then encoded space (the router redirects it to /idr/e)", "/idr/e/%20"],
+    ["trailing encoded space before a query (over-excluded: the router keeps the space when a query follows)", "/idr/e%20?x=1"],
+    // A stray "%" before a decoded "2" and "e" forms "%2e%2e", a dot segment for the router's second URL parse.
+    ["stray percent forming an encoded parent segment", "/x/%2%65%2%65/idr/e"],
+    ["stray percent forming an encoded parent segment, upper case", "/x/%2%45%2%45/IDR/E%20"],
   ])("variant: %s (%s)", (_n, path) => {
     expect(isEligible(nav(path))).toEqual({ eligible: false, reason: "collector_path" });
     expect(isEligible(nav(path, "HEAD"))).toEqual({ eligible: false, reason: "collector_path" });
@@ -217,7 +229,15 @@ describe("tsa-1 eligibility: the collector path is never eligible (G5-D-F1)", ()
     "/idre",
     "/xidr/e",
     "/e",
-    "/idr/e%20",
+    "/idr/x%20",
+    "/nonexistent%20",
+    "/idr/e%20x",
+    "/idr%20/e",
+    "/%20idr/e",
+    "/idr/e%09",
+    "/idr/e%00",
+    "/idr/e%C2%A0",
+    "/idr/e%E2%80%8B",
     "/idr/e;x",
     "/idr/%66",
     "/blog/idr/e",
@@ -301,15 +321,37 @@ describe("tsa-1 eligibility: the collector path is never eligible (G5-D-F1)", ()
     expect(isEligible(nav(longest), {}, longest)).toEqual({ eligible: false, reason: "collector_path" });
   });
 
-  it("matching is linear: 16 KB adversarial paths are classified in under 20 ms", () => {
-    const paths = ["/" + "/".repeat(16_000) + "idr/e", "/idr" + "%2F".repeat(5_000) + "e", "/" + "%".repeat(16_000), "/" + "%41%".repeat(4_000) + "/idr/e"];
-    const t0 = performance.now();
-    const reasons = paths.map((p) => {
-      const r = isEligible(nav(p));
-      return r.eligible ? "eligible" : r.reason;
-    });
-    expect(performance.now() - t0).toBeLessThan(20);
+  it("matching is linear: nine 16 KB adversarial paths are classified in under 60 ms", () => {
+    // Includes inputs on which decodeURI throws per escape (non-ASCII and %25 runs), long encoded-space runs, and
+    // space runs before a final segment (G5R2-L1 canonicalisation).
+    const paths = [
+      "/" + "/".repeat(16_000) + "idr/e",
+      "/idr" + "%2F".repeat(5_000) + "e",
+      "/" + "%".repeat(16_000),
+      "/" + "%41%".repeat(4_000) + "/idr/e",
+      "/" + "%C0x".repeat(4_000),
+      "/" + "%25%".repeat(4_000),
+      "/" + "%E0%A4/".repeat(2_000),
+      "/idr/e" + "%20".repeat(5_000),
+      "/idr/e" + "%20".repeat(5_000) + "x",
+    ];
+    const classify = () =>
+      paths.map((p) => {
+        const r = isEligible(nav(p));
+        return r.eligible ? "eligible" : r.reason;
+      });
+    // Best of five runs (the first warms up): wall-clock time in a parallel test run is noisy, a quadratic step is
+    // not (it would take seconds on nine 16 KB paths).
+    let best = Infinity;
+    let reasons: string[] = [];
+    for (let run = 0; run < 5; run++) {
+      const t0 = performance.now();
+      reasons = classify();
+      best = Math.min(best, performance.now() - t0);
+    }
+    expect(best).toBeLessThan(60);
     expect(reasons.slice(0, 2)).toEqual(["collector_path", "collector_path"]);
     expect(reasons[2]).toBe("eligible");
+    expect(reasons.slice(7)).toEqual(["collector_path", "eligible"]);
   });
 });
