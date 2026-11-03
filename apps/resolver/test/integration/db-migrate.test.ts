@@ -159,9 +159,9 @@ describe("privacy guard: no IP-bearing schema", () => {
 
       const statsBefore = (await p.query("SELECT installation_id, website_id, company_id, first_observed_at, last_observed_at, observation_count FROM company_scope_stats ORDER BY website_id, company_id")).rows;
 
-      // Upgrade: 0003 then 0004 apply.
+      // Upgrade: 0003 then 0004 apply (then the additive V1 0005, which leaves existing rows' values unchanged).
       const upgrade = await applyMigrations(p);
-      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql"]);
+      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql"]);
       const identities = await p.query<{ website_id: string; company_id: string; first_observation_ref: string | null }>(
         "SELECT website_id, company_id, first_observation_ref FROM company_scope_stats ORDER BY website_id, company_id",
       );

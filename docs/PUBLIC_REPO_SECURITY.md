@@ -30,6 +30,12 @@ time under Settings → Code security; re-check before relying on them.
 4. Neither control detects infrastructure identifiers (Railway project,
    service, environment or deployment UUIDs, concrete hostnames), real IP
    addresses or personal data, all of which matter in a public repository.
+5. **On-demand scanning through the GitHub API is not available.** A
+   pre-push call to GitHub's secret-scanning API on 2026-11-03 was refused
+   with "Repository does not have GitHub Advanced Security enabled". This
+   project therefore cannot use GitHub's engine on demand, nor custom
+   patterns. The pre-push evidence comes from gitleaks and the public-safety
+   gate (section 3). GitHub's scanning applies only to what is pushed.
 
 ## 3. Equivalent CI safeguards (always on, every PR and push to `main`)
 
