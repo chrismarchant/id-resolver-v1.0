@@ -18,7 +18,7 @@ export async function createTestDb(opts: { max?: number } = {}): Promise<Db> {
 }
 
 export const RESET_TABLES_SQL =
-  "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE";
+  "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls, browser_events RESTART IDENTITY CASCADE";
 
 /**
  * Truncates every application table (not schema_migrations).
