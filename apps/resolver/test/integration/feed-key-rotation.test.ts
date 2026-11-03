@@ -615,7 +615,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     };
     const r = await runSync(cfg(afterUrl), deps(watching));
     expect(r.status).toBe("needs_resync");
-    expect(r.gap).toEqual({ recorded: true, newGap: true });
+    expect(r.gap).toEqual({ recorded: true, newGap: true, superseded: false });
     expect(resets).toEqual([]); // never reset, never cursor_rejected
     expect(await syncState()).toEqual({ cursor: stalledAt, status: "needs_resync", needs_resync: true });
     expect(await projected()).toEqual([old[0]!.id, old[1]!.id]);
@@ -624,7 +624,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect(gaps[0]).toMatchObject({ installation_id: INSTALLATION, kind: "cursor_expired", expired_cursor: stalledAt, resolved_at: null, resolution: null });
 
     // It stays that way (one row) until an operator resynchronises.
-    expect((await runSync(cfg(afterUrl), deps(store))).gap).toEqual({ recorded: true, newGap: false });
+    expect((await runSync(cfg(afterUrl), deps(store))).gap).toEqual({ recorded: true, newGap: false, superseded: false });
     expect(await gapRows(projection)).toHaveLength(1);
 
     // Operator resync: the drained run marks the gap resolved; obs 3 and 4 stay missing; the row stays.

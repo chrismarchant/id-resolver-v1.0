@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
+import type { ApplyPageArgs, ApplyPageResult, LocalCounts, RecordGapArgs, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
 
 export const TEST_DB_URL =
   process.env["TEST_DATABASE_URL"] ?? "postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test_edge";
@@ -128,11 +128,16 @@ export class PgStore implements Store {
     return { cursor: s.cursor, needsResync: s.needs_resync, gapOpen: (s as { gap_open?: boolean }).gap_open === true };
   }
 
-  async recordGap(kind: GapKind): Promise<RecordGapResult> {
+  async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { recorded: boolean; new: boolean } }>("select public.idr_record_sync_gap($1,$2) as r", [this.installationId, kind]),
+      c.query<{ r: { recorded: boolean; new: boolean; superseded: boolean } }>("select public.idr_record_sync_gap($1,$2,$3) as r", [
+        this.installationId,
+        a.kind,
+        a.expectedCursor,
+      ]),
     );
-    return { recorded: r.rows[0]!.r.recorded, newGap: r.rows[0]!.r.new };
+    const v = r.rows[0]!.r;
+    return { recorded: v.recorded, newGap: v.new, superseded: v.superseded };
   }
 
   async resolveGaps(): Promise<number> {

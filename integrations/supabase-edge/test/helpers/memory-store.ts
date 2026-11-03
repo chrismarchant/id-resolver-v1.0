@@ -1,4 +1,4 @@
-import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
+import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapArgs, RecordGapResult, RecordStatusArgs, Store, SyncState } from "../../src/core/index.ts";
 
 export interface MemoryGap {
   id: number;
@@ -59,13 +59,14 @@ export class MemoryStore implements Store {
     this.resets += 1;
     return true;
   }
-  async recordGap(kind: GapKind): Promise<RecordGapResult> {
+  async recordGap({ kind, expectedCursor }: RecordGapArgs): Promise<RecordGapResult> {
+    if (this.cursor !== expectedCursor) return { recorded: false, newGap: false, superseded: true };
     this.status = "needs_resync";
     this.statuses.push("needs_resync");
     this.needsResync = true;
-    if (this.gaps.some((g) => g.kind === kind && g.resolvedAt === null)) return { recorded: true, newGap: false };
-    this.gaps.push({ id: this.gaps.length + 1, kind, detectedAt: this.now(), expiredCursor: this.cursor, resolvedAt: null, resolution: null });
-    return { recorded: true, newGap: true };
+    if (this.gaps.some((g) => g.kind === kind && g.resolvedAt === null)) return { recorded: true, newGap: false, superseded: false };
+    this.gaps.push({ id: this.gaps.length + 1, kind, detectedAt: this.now(), expiredCursor: expectedCursor, resolvedAt: null, resolution: null });
+    return { recorded: true, newGap: true, superseded: false };
   }
   async resolveGaps(): Promise<number> {
     let n = 0;

@@ -110,7 +110,7 @@ used.
 | status | meaning | action |
 | --- | --- | --- |
 | `ok` / `partial` | drained / more pages next run | none |
-| `cas_conflict` | another invocation advanced the cursor | none; expected when runs overlap |
+| `cas_conflict` | another invocation advanced the cursor. Also a stale overlapping run that got 410 for a position another run had already passed: the gap record is a compare-and-set on the cursor that got the 410, so such a run records no gap and changes nothing | none; expected when runs overlap |
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |

@@ -11,7 +11,7 @@ const FUNCS = [
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
   "idr_reconcile_counts(text,date,date)",
-  "idr_record_sync_gap(text,text)",
+  "idr_record_sync_gap(text,text,text)",
   "idr_resolve_sync_gaps(text)",
 ];
 /** Trigger functions cannot be called directly; only their ACL is checked. */
@@ -110,7 +110,7 @@ describe("row level security", () => {
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
       "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
       "idr_reconcile_counts(text,date,date)": ["select public.idr_reconcile_counts($1, '2026-11-01', '2026-11-02')", [INSTALLATION]],
-      "idr_record_sync_gap(text,text)": ["select public.idr_record_sync_gap($1, 'cursor_expired')", [INSTALLATION]],
+      "idr_record_sync_gap(text,text,text)": ["select public.idr_record_sync_gap($1, 'cursor_expired', null)", [INSTALLATION]],
       "idr_resolve_sync_gaps(text)": ["select public.idr_resolve_sync_gaps($1)", [INSTALLATION]],
     };
     for (const f of FUNCS) {

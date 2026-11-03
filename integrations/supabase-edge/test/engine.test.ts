@@ -243,7 +243,7 @@ describe("terminal statuses never advance the cursor", () => {
     mock.requests = [];
     const r = await runSync(testConfig(mock), testDeps(store));
     expect(r.status).toBe("needs_resync");
-    expect(r.gap).toEqual({ recorded: true, newGap: true });
+    expect(r.gap).toEqual({ recorded: true, newGap: true, superseded: false });
     expect(await storedCursor(pool)).toBe("c2");
     expect((await counts(pool)).observations).toBe(2);
     const st = await pool.query("select status, needs_resync from public.idr_sync_state");
@@ -324,12 +324,13 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     for (let i = 0; i < 3; i++) {
       const r = await runSync(testConfig(mock), testDeps(store));
       expect(r.status).toBe("needs_resync");
-      expect(r.gap).toEqual({ recorded: true, newGap: i === 0 });
+      expect(r.gap).toEqual({ recorded: true, newGap: i === 0, superseded: false });
     }
     // A retry of the record itself (e.g. after a crash before the response arrived).
-    expect(await store.recordGap("cursor_expired")).toEqual({ recorded: true, newGap: false });
+    const again = { kind: "cursor_expired" as const, expectedCursor: "c2" };
+    expect(await store.recordGap(again)).toEqual({ recorded: true, newGap: false, superseded: false });
     // Concurrent records serialise on the state row and the partial unique index.
-    await Promise.all([store.recordGap("cursor_expired"), store.recordGap("cursor_expired"), store.recordGap("cursor_expired")]);
+    await Promise.all([store.recordGap(again), store.recordGap(again), store.recordGap(again)]);
     expect(await gapRows(pool)).toHaveLength(1);
   });
 
@@ -397,11 +398,39 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     expect(await gapRows(pool)).toHaveLength(1);
   });
 
+  it("PG R2-7: a stale overlapping run that gets 410 for an older cursor records nothing, ends cas_conflict and leaves the healthy state untouched", async () => {
+    mock.items = [1, 2, 3, 4, 5, 6].map((i) => obs(i, 3, D));
+    expect((await runSync(testConfig(mock, { maxPages: 1 }), testDeps(store))).status).toBe("partial");
+    expect(await storedCursor(pool)).toBe("c2");
+    // Another run drains: everything is delivered and the stored cursor is c6.
+    expect((await runSync(testConfig(mock), testDeps(store))).status).toBe("ok");
+    expect(await storedCursor(pool)).toBe("c6");
+    const healthy = (await pool.query("select cursor, status, needs_resync, last_run_at from public.idr_sync_state")).rows[0];
+    mock.retentionFloor = 3; // retention passes c2, which only the stale run still holds
+    const stale: Store = {
+      getState: async () => ({ ...(await store.getState()), cursor: "c2" }), // read before the other run advanced
+      applyPage: (a) => store.applyPage(a),
+      recordStatus: (a) => store.recordStatus(a),
+      localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => store.resetCursor(c),
+      recordGap: (a) => store.recordGap(a),
+      resolveGaps: () => store.resolveGaps(),
+    };
+    mock.requests = [];
+    const r = await runSync(testConfig(mock), testDeps(stale));
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2"]); // it did get the 410
+    expect(r).toMatchObject({ status: "cas_conflict", gap: null });
+    expect(await gapRows(pool)).toHaveLength(0);
+    expect((await pool.query("select cursor, status, needs_resync, last_run_at from public.idr_sync_state")).rows[0]).toEqual(healthy);
+    expect((await runSync(testConfig(mock), testDeps(store))).status).toBe("ok");
+  });
+
   it("in-memory store: the same lifecycle (record once, survive the resync, resolve after the drain)", async () => {
     const mem = new MemoryStore();
     await setupStalled(mem);
     for (let i = 0; i < 2; i++) expect((await runSync(testConfig(mock), testDeps(mem))).status).toBe("needs_resync");
     expect(mem.gaps).toHaveLength(1);
+    expect(await mem.recordGap({ kind: "cursor_expired", expectedCursor: "c0" })).toEqual({ recorded: false, newGap: false, superseded: true });
     expect(mem.gaps[0]).toMatchObject({ kind: "cursor_expired", expiredCursor: "c2", resolvedAt: null });
     expect(mem.needsResync).toBe(true);
     mem.beginResync();
@@ -498,7 +527,7 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
     const r = await runSync(cfg(), testDeps(store));
 
     expect(r.status).toBe("needs_resync");
-    expect(r.gap).toEqual({ recorded: true, newGap: true });
+    expect(r.gap).toEqual({ recorded: true, newGap: true, superseded: false });
     expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2"]);
     expect(await storedCursor(pool)).toBe("c2");
     expect(await counts(pool)).toEqual(before);

@@ -379,11 +379,17 @@ end;
 $$;
 
 -- Called by the engine on 410 cursor_expired (and on every run that finds
--- needs_resync already set). In ONE transaction: marks needs_resync and the
--- status, and records the gap unless an open gap of this kind already exists
--- (the partial unique index makes that race-free). The bounds come from the
--- stored state, not from the caller. Returns {recorded, new, gap_id}.
-create or replace function public.idr_record_sync_gap(p_installation_id text, p_kind text)
+-- needs_resync already set). Compare-and-set like every other cursor change:
+-- p_expected_cursor is the cursor that got the 410 (the one the run holds).
+-- If the stored cursor no longer equals it, another run has moved on (it
+-- applied pages past that position, so nothing was missed there): the call
+-- writes nothing and returns {"superseded": true}. Otherwise, in ONE
+-- transaction, it marks needs_resync and the status and records the gap
+-- unless an open gap of this kind already exists (the partial unique index
+-- makes that race-free). expired_cursor is the cursor that got the 410; the
+-- other bounds come from the stored state. Returns {recorded, new, gap_id}.
+drop function if exists public.idr_record_sync_gap(text, text);
+create or replace function public.idr_record_sync_gap(p_installation_id text, p_kind text, p_expected_cursor text)
 returns jsonb
 language plpgsql
 set search_path = ''
@@ -400,20 +406,23 @@ begin
     on conflict (installation_id) do nothing;
   select s.cursor, s.last_applied_at into v_cursor, v_last_applied
     from public.idr_sync_state s where s.installation_id = p_installation_id for update;
+  if v_cursor is distinct from p_expected_cursor then
+    return jsonb_build_object('recorded', false, 'new', false, 'superseded', true, 'gap_id', null);
+  end if;
   update public.idr_sync_state
      set status = 'needs_resync', needs_resync = true, last_run_at = now(), updated_at = now()
    where installation_id = p_installation_id;
   insert into public.idr_sync_gaps (installation_id, kind, expired_cursor, last_applied_at, last_observed_at)
-    values (p_installation_id, p_kind, v_cursor, v_last_applied,
+    values (p_installation_id, p_kind, p_expected_cursor, v_last_applied,
             (select max(o.observed_at) from public.idr_observations o where o.installation_id = p_installation_id))
     on conflict (installation_id, kind) where resolved_at is null do nothing
     returning id into v_id;
   if v_id is not null then
-    return jsonb_build_object('recorded', true, 'new', true, 'gap_id', v_id);
+    return jsonb_build_object('recorded', true, 'new', true, 'superseded', false, 'gap_id', v_id);
   end if;
   select g.id into v_id from public.idr_sync_gaps g
    where g.installation_id = p_installation_id and g.kind = p_kind and g.resolved_at is null;
-  return jsonb_build_object('recorded', v_id is not null, 'new', false, 'gap_id', v_id);
+  return jsonb_build_object('recorded', v_id is not null, 'new', false, 'superseded', false, 'gap_id', v_id);
 end;
 $$;
 
@@ -465,7 +474,7 @@ revoke all on function public.idr_record_sync_status(text, text, boolean) from p
 revoke all on function public.idr_begin_resync(text) from public, anon, authenticated;
 revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
 revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated;
-revoke all on function public.idr_record_sync_gap(text, text) from public, anon, authenticated;
+revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated;
 revoke all on function public.idr_resolve_sync_gaps(text) from public, anon, authenticated;
 revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
 grant execute on function public.idr_get_sync_state(text) to service_role;
@@ -474,7 +483,7 @@ grant execute on function public.idr_record_sync_status(text, text, boolean) to 
 grant execute on function public.idr_begin_resync(text) to service_role;
 grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
-grant execute on function public.idr_record_sync_gap(text, text) to service_role;
+grant execute on function public.idr_record_sync_gap(text, text, text) to service_role;
 grant execute on function public.idr_resolve_sync_gaps(text) to service_role;
 -- A trigger function cannot be called directly; the grant only mirrors the others.
 grant execute on function public.idr_sync_gaps_guard() to service_role;

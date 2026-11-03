@@ -59,16 +59,24 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   }
 
   /**
-   * needs_resync: record the gap durably (idempotent while open). If that
-   * fails, still mark needs_resync and report gap.recorded=false; the next run
-   * finds needs_resync set and retries the record.
+   * needs_resync: record the gap durably (idempotent while open), as a
+   * compare-and-set on `expectedCursor`, the cursor that got the 410. If the
+   * stored cursor has moved on, an overlapping run already applied pages past
+   * it: nothing is written and this run ends cas_conflict (no false gap, no
+   * halt). If the record fails, still mark needs_resync and report
+   * gap.recorded=false; the next run finds needs_resync set and retries.
    */
-  async function finishGap(): Promise<SyncResult> {
+  async function finishGap(expectedCursor: string | null): Promise<SyncResult> {
     result.status = "needs_resync";
     try {
-      result.gap = await deps.store.recordGap("cursor_expired");
+      const g = await deps.store.recordGap({ kind: "cursor_expired", expectedCursor });
+      if (g.superseded) {
+        result.status = "cas_conflict";
+        return result; // the stale run touches nothing
+      }
+      result.gap = g;
     } catch {
-      result.gap = { recorded: false, newGap: false };
+      result.gap = { recorded: false, newGap: false, superseded: false };
       try {
         await deps.store.recordStatus({ status: "needs_resync", needsResync: true });
       } catch {
@@ -155,7 +163,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   }
   // A pending resync is an operator decision; never fetch, advance or skip.
   // Re-recording is idempotent and covers a gap whose record failed earlier.
-  if (state.needsResync) return finishGap();
+  if (state.needsResync) return finishGap(state.cursor);
 
   let cursor = state.cursor;
   let drained = false;
@@ -186,7 +194,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         continue;
       }
       if (fetched.status === "cursor_rejected") return finish("contract_error");
-      if (fetched.status === "needs_resync") return finishGap();
+      if (fetched.status === "needs_resync") return finishGap(cursor);
       return finish(fetched.status);
     }
     const page: FeedPage | null = parseFeedPage(fetched.body, cfg.installationId);

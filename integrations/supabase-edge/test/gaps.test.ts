@@ -24,7 +24,14 @@ beforeEach(async () => {
 });
 
 const svc = <T extends pg.QueryResultRow>(sql: string, args: unknown[] = []) => asRole(pool, "service_role", (c) => c.query<T>(sql, args));
-const recordGap = async () => (await svc<{ r: { recorded: boolean; new: boolean; gap_id: number } }>("select public.idr_record_sync_gap($1, 'cursor_expired') as r", [INSTALLATION])).rows[0]!.r;
+/** Records against the cursor currently stored (what a run that just got 410 holds). */
+const recordGap = async () =>
+  (
+    await svc<{ r: { recorded: boolean; new: boolean; superseded: boolean; gap_id: number } }>(
+      "select public.idr_record_sync_gap($1, 'cursor_expired', (select s.cursor from public.idr_sync_state s where s.installation_id = $1)) as r",
+      [INSTALLATION],
+    )
+  ).rows[0]!.r;
 const resolveGaps = async () => (await svc<{ r: { resolved: number } }>("select public.idr_resolve_sync_gaps($1) as r", [INSTALLATION])).rows[0]!.r.resolved;
 const beginResync = () => svc("select public.idr_begin_resync($1)", [INSTALLATION]);
 const READER = { role: "authenticated", app_metadata: { idr_reader: true } };
@@ -47,14 +54,28 @@ describe("recording", () => {
 
   it("repeated records while the gap is open return the same row; a gap with no prior state still records", async () => {
     const first = await recordGap();
-    for (let i = 0; i < 3; i++) expect(await recordGap()).toEqual({ recorded: true, new: false, gap_id: first.gap_id });
+    for (let i = 0; i < 3; i++) expect(await recordGap()).toEqual({ recorded: true, new: false, superseded: false, gap_id: first.gap_id });
     expect(await gapRows(pool)).toHaveLength(1);
     expect((await gapRows(pool))[0]).toMatchObject({ expired_cursor: null, last_applied_at: null, last_observed_at: null });
   });
 
+  it("R2-7: a record for a cursor other than the stored one is superseded and writes nothing", async () => {
+    await svc("select public.idr_apply_feed_page($1, null, 'c6', '[]'::jsonb)", [INSTALLATION]);
+    const before = (await pool.query("select cursor, status, needs_resync, updated_at from public.idr_sync_state")).rows[0];
+    for (const stale of ["c2", null]) {
+      const r = (await svc<{ r: unknown }>("select public.idr_record_sync_gap($1, 'cursor_expired', $2) as r", [INSTALLATION, stale])).rows[0]!.r;
+      expect(r, String(stale)).toEqual({ recorded: false, new: false, superseded: true, gap_id: null });
+    }
+    expect((await pool.query("select cursor, status, needs_resync, updated_at from public.idr_sync_state")).rows[0]).toEqual(before);
+    expect(await gapRows(pool)).toHaveLength(0);
+    // The matching cursor records, and the row carries exactly that cursor.
+    expect(await recordGap()).toMatchObject({ recorded: true, new: true, superseded: false });
+    expect((await gapRows(pool))[0]!.expired_cursor).toBe("c6");
+  });
+
   it("rejects unknown kinds and empty installation ids", async () => {
-    await expect(svc("select public.idr_record_sync_gap($1, 'other')", [INSTALLATION])).rejects.toThrow(/invalid_arguments/);
-    await expect(svc("select public.idr_record_sync_gap('', 'cursor_expired')")).rejects.toThrow(/invalid_arguments/);
+    await expect(svc("select public.idr_record_sync_gap($1, 'other', null)", [INSTALLATION])).rejects.toThrow(/invalid_arguments/);
+    await expect(svc("select public.idr_record_sync_gap('', 'cursor_expired', null)")).rejects.toThrow(/invalid_arguments/);
     await expect(svc("insert into public.idr_sync_gaps (installation_id, kind) values ($1, 'other')", [INSTALLATION])).rejects.toThrow(/check constraint/);
   });
 });
@@ -135,7 +156,7 @@ describe("row level security", () => {
       "insert into public.idr_sync_gaps (installation_id, kind) values ('x', 'cursor_expired')",
       `update public.idr_sync_gaps set resolved_at = now(), resolution = 'full_resync' where id = ${g.gap_id}`,
       "delete from public.idr_sync_gaps",
-      "select public.idr_record_sync_gap('x', 'cursor_expired')",
+      "select public.idr_record_sync_gap('x', 'cursor_expired', null)",
       "select public.idr_resolve_sync_gaps('x')",
     ]) {
       for (const role of ["anon", "authenticated"]) {

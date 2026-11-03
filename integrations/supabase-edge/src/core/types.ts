@@ -71,11 +71,23 @@ export interface RecordStatusArgs {
 /** The only gap kind: the resolver answered 410 cursor_expired. */
 export type GapKind = "cursor_expired";
 
+export interface RecordGapArgs {
+  kind: GapKind;
+  /** The cursor that got the 410 (compare-and-set against the stored one). */
+  expectedCursor: string | null;
+}
+
 export interface RecordGapResult {
   /** A durable gap record exists for this incident (inserted now or already open). */
   recorded: boolean;
   /** This call inserted it (false: an open gap of this kind already existed). */
   newGap: boolean;
+  /**
+   * The stored cursor no longer equals expectedCursor: another run applied
+   * pages past that position, so nothing was missed there. Nothing was
+   * written; the run ends cas_conflict.
+   */
+  superseded: boolean;
 }
 
 export interface LocalCounts {
@@ -101,12 +113,14 @@ export interface Store {
    */
   resetCursor(expectedCursor: string): Promise<boolean>;
   /**
-   * A potential synchronisation continuity gap (410 cursor_expired). In ONE
+   * A potential synchronisation continuity gap (410 cursor_expired).
+   * Compare-and-set on the cursor that got the 410: if the stored cursor has
+   * moved on, write nothing and report superseded. Otherwise, in ONE
    * transaction: mark needs_resync (status needs_resync) and append a durable
    * gap record, unless an unresolved gap of this kind is already open (never a
    * duplicate). The record is never deleted; a later resync does not erase it.
    */
-  recordGap(kind: GapKind): Promise<RecordGapResult>;
+  recordGap(args: RecordGapArgs): Promise<RecordGapResult>;
   /**
    * After a run that drained the resolver's buffer: mark open gaps detected
    * before the latest resync request as resolved (rebuilt from the retained

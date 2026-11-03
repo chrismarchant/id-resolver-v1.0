@@ -1,4 +1,4 @@
-import type { ApplyPageArgs, ApplyPageResult, GapKind, LocalCounts, RecordGapResult, RecordStatusArgs, Store, SyncState } from "./types.ts";
+import type { ApplyPageArgs, ApplyPageResult, LocalCounts, RecordGapArgs, RecordGapResult, RecordStatusArgs, Store, SyncState } from "./types.ts";
 
 export class StoreError extends Error {
   constructor(readonly code: string) {
@@ -92,10 +92,12 @@ export class PostgrestStore implements Store {
     });
   }
 
-  async recordGap(kind: GapKind): Promise<RecordGapResult> {
-    const r = obj(await this.rpc("idr_record_sync_gap", { p_installation_id: this.o.installationId, p_kind: kind }));
-    if (typeof r["recorded"] !== "boolean" || typeof r["new"] !== "boolean") throw new StoreError("bad_rpc_response");
-    return { recorded: r["recorded"], newGap: r["new"] };
+  async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
+    const r = obj(
+      await this.rpc("idr_record_sync_gap", { p_installation_id: this.o.installationId, p_kind: a.kind, p_expected_cursor: a.expectedCursor }),
+    );
+    if (typeof r["recorded"] !== "boolean" || typeof r["new"] !== "boolean" || typeof r["superseded"] !== "boolean") throw new StoreError("bad_rpc_response");
+    return { recorded: r["recorded"], newGap: r["new"], superseded: r["superseded"] };
   }
 
   async resolveGaps(): Promise<number> {
