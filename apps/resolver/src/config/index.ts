@@ -6,6 +6,7 @@
  */
 import { z } from "zod";
 import { IDENTIFIER_PATTERN } from "../contracts/api.js";
+import { EVENT_CONSENT_MODES } from "../contracts/event.js";
 
 const intInRange = (min: number, max: number, def: number) =>
   z.coerce.number().int().min(min).max(max).default(def);
@@ -99,6 +100,12 @@ export const ConfigSchema = z.object({
     .regex(/^[0-9]{1,3}$/, "must be whole days 1-365")
     .transform(Number)
     .pipe(z.number().int().min(1, "must be at least 1 day").max(365, "must be at most 365 days")),
+
+  // Browser events (contract event.v1, CHR-64; owner decision D4)
+  /** POST /v1/events exists only when true; otherwise it answers 404 like any unknown route. Default off. */
+  EVENTS_ENABLED: boolFromString(false),
+  /** `required` (default): an event with consent `not_required` is refused with 403 consent_required. `not_required` accepts both values. */
+  EVENT_CONSENT_MODE: z.enum(EVENT_CONSENT_MODES).default("required"),
 
   // Qualification policy
   QUALIFIED_USAGE_TYPES: csv(["COM", "ORG", "GOV", "EDU", "MIL", "LIB"]),

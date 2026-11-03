@@ -1,0 +1,180 @@
+{
+  "sinkMode": "ok",
+  "target": "node",
+  "node": "v22.23.4",
+  "lifecycle": [
+    {
+      "mode": "none",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 6,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "env": "process.env.IDR_ENV_PROBE=present",
+        "ua": "Node.js/22",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "unawaited",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 5,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 313,
+      "diag": {
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "awaited",
+      "status": 200,
+      "ttfb_ms": 311,
+      "total_ms": 311,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": -6,
+      "diag": {
+        "result": "sink:200",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "cfworkers",
+      "status": 200,
+      "ttfb_ms": 4,
+      "total_ms": 4,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "waitUntil": "cloudflare:workers threw Only URLs with a scheme in: file, data, and node are supported by the default ESM loader. Received protocol 'cloudflare:'",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "request",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 6,
+      "pageRendered": true,
+      "sink_received": true,
+      "sink_arrival_after_response_complete_ms": 298,
+      "diag": {
+        "request": "waitUntil=function runtime.cf.ctx.waitUntil=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    },
+    {
+      "mode": "event",
+      "status": 200,
+      "ttfb_ms": 5,
+      "total_ms": 6,
+      "pageRendered": true,
+      "sink_received": false,
+      "sink_arrival_after_response_complete_ms": null,
+      "diag": {
+        "event": "ev=false keys= wu=undefined",
+        "nextResultType": "object",
+        "nextResultKeys": "request|pathname|handlerType|context|response",
+        "responseIsResponse": "true"
+      }
+    }
+  ],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 14,
+    "pageRendered": true,
+    "sinkGotEntrance": true,
+    "sinkUrl": "/v1/entrances",
+    "sinkHasBearer": true,
+    "payload": {
+      "contract": "entrance.v1",
+      "website_id": "probe-site",
+      "ip": "<redacted-in-log>",
+      "entrance_id": "bvqqTM5eaXMbFI1WQaoa6w",
+      "occurred_at": "2026-11-03T20:13:21Z",
+      "page_key": "/landing/page",
+      "acquisition": "email",
+      "eligibility": "tsa-1"
+    },
+    "hookResults": [
+      "{\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":6}"
+    ]
+  },
+  "collectorRoute": {
+    "accepted": {
+      "status": 204,
+      "ttfb_ms": 6,
+      "body": "",
+      "setCookie": null,
+      "cacheControl": "no-store"
+    },
+    "replayStatus": 409,
+    "crossSiteStatus": 403,
+    "queryPathStatus": 400,
+    "sinkEvents": 1,
+    "sinkUrl": "/v1/events",
+    "sinkHasBearer": true,
+    "forwardedKeys": [
+      "consent",
+      "contract",
+      "event_id",
+      "name",
+      "occurred_at",
+      "page_key",
+      "type",
+      "website_id"
+    ],
+    "forwarded": {
+      "contract": "event.v1",
+      "website_id": "probe-site",
+      "event_id": "FiMVa6bfT2oM9WtcEkKBV6",
+      "occurred_at": "2026-11-03T20:13:22Z",
+      "type": "conversion_intent",
+      "name": "cta_click",
+      "page_key": "/orders/:n",
+      "consent": "not_required"
+    },
+    "forwardedContainsAnyHeaderValue": false,
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:replay\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":5}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:origin\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":0}",
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":1}"
+    ]
+  },
+  "collectorBrowser": {
+    "chrome": true,
+    "sinkEvents": 1,
+    "forwarded": [
+      {
+        "contract": "event.v1",
+        "website_id": "probe-site",
+        "event_id": "5hemiZ7BF9ZiVLBhlZv9tW",
+        "occurred_at": "2026-11-03T20:13:24Z",
+        "type": "page_view",
+        "name": "page_view",
+        "page_key": "/landing/browser-check",
+        "consent": "not_required"
+      }
+    ],
+    "hookResults": [
+      "{\"route\":\"collector\",\"outcome\":\"skipped\",\"reason\":\"collector:path\",\"mode\":\"none\",\"attempts\":0,\"durationMs\":1}",
+      "{\"route\":\"collector\",\"outcome\":\"delivered\",\"reason\":\"ok\",\"mode\":\"wait_until\",\"attempts\":1,\"httpStatus\":200,\"resolverStatus\":\"ineligible\",\"recorded\":false,\"durationMs\":6}"
+    ]
+  }
+}

@@ -15,6 +15,11 @@ forks or spawns anything (asserted by `test/unit/runner.test.ts`).
 POST /v1/entrances ─▶ auth ─▶ strict schema ─▶ website_id ─▶ ip syntax ─▶ occurred_at ±300 s
                    ─▶ runner (semaphore, deadline) ─▶ pipeline (cache, kill switch, cap, provider, commit, observation)
                    ◀─ { version, status, source, recorded }   (never company data, D2)
+
+POST /v1/events (only when EVENTS_ENABLED=true; see "Browser events")
+                   ─▶ auth ─▶ strict schema + vocabulary ─▶ website_id ─▶ occurred_at ±300 s ─▶ consent policy
+                   ─▶ one INSERT into browser_events (never the runner, cache, company tables or provider, D4)
+                   ◀─ { version, recorded }
 ```
 
 Entry point: `node dist/main.js` (Dockerfile `CMD`; `npm start`; `npm run dev`
@@ -67,16 +72,18 @@ name variables, never values. See `.env.example` for every variable.
   one is set. Pruning is not erasure and produces no tombstones; companies
   and per-company scope statistics are never pruned.
 * **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
-  rows (IP fingerprints past their TTL) and observations older than the
-  retention window. It runs once at startup (after the server listens, not
-  blocking it) and then every `CACHE_PRUNE_INTERVAL_S` (default 600 s); runs
-  never overlap. A run drains: it repeats batches of `CACHE_PRUNE_BATCH` rows
-  (one statement each) until a batch comes back short, within
-  `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may use half of
-  it, observation retention gets the rest). Each run logs
-  `maintenance_run{cache_rows, observation_rows, backlog, duration_ms}`; a run
-  that stops with rows still due (budget spent, shutdown or a database error)
-  also logs the warning `maintenance_backlog{reason, category}`. Alert on
+  rows (IP fingerprints past their TTL), and observations and browser events
+  older than the retention window. It runs once at startup (after the server
+  listens, not blocking it) and then every `CACHE_PRUNE_INTERVAL_S` (default
+  600 s); runs never overlap. A run drains: it repeats batches of
+  `CACHE_PRUNE_BATCH` rows (one statement each) until a batch comes back
+  short, within `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may
+  use half of it, browser events then up to a quarter, observation retention
+  gets the rest). Each run logs `maintenance_run{cache_rows,
+  observation_rows, event_rows, backlog, duration_ms}`; a run that stops with
+  rows still due (budget spent, shutdown or a database error) also logs the
+  warning `maintenance_backlog{reason, category}`, where `category` names the
+  kinds left due (`cache`, `observations`, `events`, joined with `_and_`). Alert on
   repeated `maintenance_backlog`: the buffer is then growing faster than it
   is pruned; raise the batch size or the budget. On shutdown a running drain
   stops after its current batch.
@@ -87,6 +94,58 @@ name variables, never values. See `.env.example` for every variable.
 * Removed variables are refused rather than silently ignored:
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
+
+## Browser events (CHR-64)
+
+Contract `event.v1` (`docs/contracts/event.v1.md`), owner decision D4:
+browser events are **never** associated with companies.
+
+* **Off by default.** `POST /v1/events` exists only when
+  `EVENTS_ENABLED=true` (default `false`). Otherwise it is an unknown route:
+  `404 not_found` with the website credential, `401` without, the same answer
+  as any other unknown path, whatever the body. `EVENTS_ENABLED=true` with no
+  event store refuses to build the server.
+* **Requests.** The website credential only (the reporting credential gets
+  `401`), checked before the body is parsed. Strict schema: any field beyond
+  `contract, website_id, event_id, occurred_at, type, name, page_key,
+  consent` is `400`, so no IP, user agent, referrer, cookie, session,
+  visitor or company field can be accepted. `type`/`name` must be a pair of
+  the vocabulary embedded in `src/contracts/event.ts` (the only copy; a test
+  keeps it equal to `docs/contracts/event-vocabulary.v1.json`). `page_key`
+  follows the entrance rule, `occurred_at` must be within 300 s of resolver
+  time, `website_id` must match (`403 forbidden`).
+* **Consent.** `EVENT_CONSENT_MODE=required` (default) refuses
+  `consent: not_required` with `403 consent_required`; `not_required` accepts
+  both values and stores what was asserted.
+* **Storage and idempotency.** One `INSERT ... ON CONFLICT DO NOTHING` into
+  `browser_events` (migration 0008): `200 {version, recorded: true}` for a new
+  `event_id`, `recorded: false` for a repeat (the first write wins). The table
+  has no company, address, fingerprint or observation column, no foreign key
+  and no trigger, and `origin` is always `browser`. Events are not part of
+  `reporting-feed.v1`.
+* **Isolation (D4).** The route and the event repository read and write
+  `browser_events` only; they never reach the runner, the fingerprint cache,
+  the company or activity tables or the provider, and import none of them.
+  `test/integration/events-isolation.test.ts` proves it with a statement spy
+  over the shared pool, a database role limited to `browser_events`, and an
+  import and code scan.
+* **Limits.** The same body limit. A separate `events` rate-limit bucket,
+  bounded by `RATE_LIMIT_PER_MINUTE` like the reporting bucket: event volume
+  follows public page activity and must never exhaust the bucket entrance
+  resolution depends on. At most 4 inserts in flight (`503 overloaded` beyond
+  that); when enabled the pool grows by the same 4 connections, so event
+  writes never take one the resolution jobs are sized for. A database failure
+  answers `503 not_ready` (retrying the same `event_id` is safe).
+* **Retention.** Rows older than `OBSERVATION_RETENTION_DAYS`, by the
+  resolver's `received_at`, are deleted by the maintenance run (above) and by
+  `npm run ops:prune`, also while events are disabled. This never moves the
+  feed's retention watermark or writes a tombstone.
+* **Logging.** Only `request_completed{route, http_status, recorded,
+  duration_ms}` and `request_rejected{route, error_code, http_status,
+  reason}`; never the `event_id`, `page_key`, type, name, body or headers.
+  `config_loaded` reports `events_enabled` and `event_consent_mode`.
+* **Not covered by the smoke run** (`src/ops/smoke.ts`), which checks
+  entrances and the feed only.
 
 ## Migrations
 

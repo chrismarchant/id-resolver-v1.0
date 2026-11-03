@@ -1,8 +1,9 @@
 /**
  * `npm run ops:prune` deletes expired cache rows in bounded batches until none
- * remain, then observations older than the (required, bounded)
- * OBSERVATION_RETENTION_DAYS window. Companies and per-company scope stats are
- * never deleted here; see RUNTIME.md (retention is a bounded sync buffer, D3).
+ * remain, then observations and browser events (event.v1) older than the
+ * (required, bounded) OBSERVATION_RETENTION_DAYS window. Companies and
+ * per-company scope stats are never deleted here; see RUNTIME.md (retention
+ * is a bounded sync buffer, D3).
  */
 import { pathToFileURL } from "node:url";
 import { createDb } from "../db/index.js";
@@ -29,7 +30,14 @@ async function main(): Promise<void> {
         if (n === 0) break;
         observations += n;
       }
-      console.log(JSON.stringify({ pruned: total, batches, observations_pruned: observations, retention_days: retentionDays }));
+      // Browser events (event.v1) share the observation window.
+      let events = 0;
+      for (;;) {
+        const n = await db.events.pruneBefore(cutoff, cfg.CACHE_PRUNE_BATCH);
+        if (n === 0) break;
+        events += n;
+      }
+      console.log(JSON.stringify({ pruned: total, batches, observations_pruned: observations, events_pruned: events, retention_days: retentionDays }));
     } finally {
       await db.close();
     }

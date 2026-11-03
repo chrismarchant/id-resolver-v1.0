@@ -39,7 +39,7 @@ describe("migrations", () => {
        WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`,
     );
     const tables = new Set(cols.rows.map((r) => r.table_name));
-    for (const t of ["companies", "ip_resolution_cache", "usage_periods", "deployment_controls", "schema_migrations", "company_observations", "company_scope_stats", "company_observation_refs"]) {
+    for (const t of ["companies", "ip_resolution_cache", "usage_periods", "deployment_controls", "schema_migrations", "company_observations", "company_scope_stats", "company_observation_refs", "browser_events"]) {
       expect(tables.has(t)).toBe(true);
     }
     for (const r of cols.rows) {
@@ -48,6 +48,90 @@ describe("migrations", () => {
       if (r.column_name === "ip_fingerprint") continue;
       expect(r.column_name).not.toMatch(/(^|_)(ip|ip_address|asn|isp|geo|latitude|longitude|city|country)(_|$)/);
     }
+  });
+
+  it("0008 browser_events (event.v1, D4): exactly the contract's columns, no company/address/fingerprint/observation reference, no foreign key or trigger, and constraints that refuse anything else", async () => {
+    const cols = await pool.query<{ column_name: string; data_type: string; is_nullable: string; column_default: string | null }>(
+      "SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'browser_events' ORDER BY ordinal_position",
+    );
+    expect(cols.rows.map((c) => c.column_name)).toEqual([
+      "id",
+      "installation_id",
+      "website_id",
+      "event_id",
+      "type",
+      "name",
+      "page_key",
+      "consent",
+      "origin",
+      "occurred_at",
+      "received_at",
+    ]);
+    for (const c of cols.rows) {
+      expect(c.is_nullable, c.column_name).toBe("NO");
+      expect(["inet", "cidr", "macaddr", "bytea"], c.column_name).not.toContain(c.data_type);
+      expect(c.column_name).not.toMatch(/company|(^|_)ip(_|$)|address|fingerprint|observation|session|visitor|user_agent|referrer|cookie/);
+    }
+    expect(cols.rows.find((c) => c.column_name === "origin")!.column_default).toBe("'browser'::text");
+    // No foreign key from or to browser_events: nothing can join it to company data through the schema.
+    const fks = await pool.query(
+      `SELECT conname FROM pg_constraint
+       WHERE contype = 'f' AND (conrelid = 'public.browser_events'::regclass OR confrelid = 'public.browser_events'::regclass)`,
+    );
+    expect(fks.rows).toEqual([]);
+    // No trigger: inserts and retention deletes touch this table only (never the feed watermark or tombstones).
+    expect((await pool.query("SELECT tgname FROM pg_trigger WHERE tgrelid = 'public.browser_events'::regclass")).rows).toEqual([]);
+    const idx = await pool.query<{ def: string }>("SELECT pg_get_indexdef(indexrelid) AS def FROM pg_index WHERE indrelid = 'public.browser_events'::regclass");
+    const defs = idx.rows.map((r) => r.def);
+    expect(defs.some((d) => d.includes("browser_events_retention_idx") && d.includes("(received_at, id)"))).toBe(true);
+    expect(defs.some((d) => d.includes("UNIQUE") && d.includes("(installation_id, website_id, event_id)"))).toBe(true);
+
+    const insert = (over: Record<string, string> = {}) => {
+      const row = {
+        installation_id: "inst",
+        website_id: "site",
+        event_id: "evt-migration-000000001",
+        type: "page_view",
+        name: "page_view",
+        page_key: "/pricing",
+        consent: "granted",
+        ...over,
+      };
+      const keys = Object.keys(row);
+      return pool.query(
+        `INSERT INTO browser_events (${keys.join(", ")}, occurred_at) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")}, now()) RETURNING origin, received_at`,
+        Object.values(row),
+      );
+    };
+    const ok = await insert();
+    expect(ok.rows[0].origin).toBe("browser");
+    expect(ok.rows[0].received_at).toBeInstanceOf(Date);
+    // Idempotency key per (installation, website).
+    await expect(insert()).rejects.toMatchObject({ code: "23505" });
+    await insert({ website_id: "other-site" });
+    const bad: Array<Record<string, string>> = [
+      { origin: "server" },
+      { consent: "yes" },
+      { consent: "denied" },
+      { event_id: "short" },
+      { event_id: "x".repeat(65) },
+      { event_id: "has space 000000000" },
+      { type: "Page View" },
+      { name: "https://example.com/" },
+      { name: "x".repeat(33) },
+      { page_key: "/a?b=1" },
+      { page_key: "/a#frag" },
+      { page_key: "/a b" },
+      { page_key: "pricing" },
+      { page_key: `/${"p".repeat(256)}` },
+      { installation_id: "Bad Id" },
+      { website_id: "" },
+    ];
+    for (const [i, over] of bad.entries()) {
+      await expect(insert({ event_id: `evt-migration-bad-${String(i).padStart(4, "0")}`, ...over }), JSON.stringify(over)).rejects.toMatchObject({ code: "23514" });
+    }
+    expect(await insert({ event_id: "evt-migration-000000002", page_key: `/${"p".repeat(255)}`, consent: "not_required" })).toMatchObject({ rowCount: 1 });
+    await pool.query("DELETE FROM browser_events");
   });
 
   it("two concurrent applyMigrations calls on a fresh database do not fail", async () => {
@@ -161,7 +245,7 @@ describe("privacy guard: no IP-bearing schema", () => {
 
       // Upgrade: 0003 then 0004 apply (then the additive V1 0005, which leaves existing rows' values unchanged).
       const upgrade = await applyMigrations(p);
-      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql"]);
+      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql", "0008_browser_events.sql"]);
       const identities = await p.query<{ website_id: string; company_id: string; first_observation_ref: string | null }>(
         "SELECT website_id, company_id, first_observation_ref FROM company_scope_stats ORDER BY website_id, company_id",
       );

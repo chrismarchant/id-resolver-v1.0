@@ -52,9 +52,14 @@ export const JOB_STUCK_AFTER_MS = 30_000;
  * one background write that outlived its budget, plus readiness and
  * reporting. Equal to the V0.1 worst case (two connections per child plus the
  * supervisor's four), so the connection footprint does not grow.
+ *
+ * `eventWriteSlots` (event.v1, only when EVENTS_ENABLED=true) adds one
+ * connection per browser-event insert that may be in flight
+ * (EVENT_WRITES_MAX_IN_FLIGHT), so event writes never take a connection the
+ * resolution jobs are sized for.
  */
-export function poolSizeFor(maxConcurrentJobs: number): number {
-  return maxConcurrentJobs * 2 + 4;
+export function poolSizeFor(maxConcurrentJobs: number, eventWriteSlots = 0): number {
+  return maxConcurrentJobs * 2 + 4 + eventWriteSlots;
 }
 
 export type JobExecutor = (deps: PipelineDeps, config: PipelineConfig, job: ResolutionJob) => Promise<ResolutionOutcome>;

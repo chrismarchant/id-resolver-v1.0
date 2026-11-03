@@ -14,6 +14,9 @@ browser-to-company matching anywhere (D4).
 
 Contract: `docs/contracts/entrance.v1.md` (frozen). Lifecycle evidence: `verification/RESULTS.md`.
 
+Optional: `createCollectorRoute` is the first-party route for the browser collector (`event.v1`). See
+"Browser events: `createCollectorRoute`" below.
+
 ## Install
 
 The package is not published yet. Until it is, install the packed tarball (`npm pack -w @salescrusader/idr-tanstack`
@@ -206,7 +209,7 @@ Called once per handled request with a non-identifying object, never with an IP,
 
 `reason`: `ok`; `timeout`, `network`, `http_4xx`, `http_429`, `http_5xx`, `http_other` (dropped); `overload` (dropped);
 `no_background_context`, `config_invalid`, `eligibility:<rule>` (for example `eligibility:bot_or_monitor`),
-`ip:<reason>` (for example `ip:ip_non_public`, `ip:header_missing`) (skipped). A thrown or rejected hook is ignored.
+`ip:<reason>` (for example `ip:ip_non_public`, `ip:header_missing`), `collector:<check>` (the collector route, see below) (skipped). A thrown or rejected hook is ignored.
 
 ```ts
 onDeliveryResult: (r) => { if (r.outcome !== "skipped") console.log("idr", r.outcome, r.reason, r.attempts); }
@@ -239,6 +242,120 @@ ops usage tooling) or your `onDeliveryResult` log: expect `delivered` with `reso
 **Fail-open.** In a preview deployment set `IDR_RESOLVER_URL` to an unreachable `https://resolver.invalid` (and, in a
 second pass, a wrong token). Pages must render exactly as before with unchanged timing, and the hook must show
 `dropped/network` (or `dropped/http_4xx`). Nothing else changes. Restore the real values afterwards.
+
+## Browser events: `createCollectorRoute` (optional)
+
+The optional browser collector (`@salescrusader/idr-collector`) sends a closed set of page events to a
+**first-party route on your own site**. `createCollectorRoute` is that route. It checks each event and forwards it
+to the resolver's `POST /v1/events` (contract `event.v1`, `docs/contracts/event.v1.md`) with the server-held token,
+on the same non-blocking path as the entrance middleware. Browser events are stored with `origin=browser` and are
+never joined to companies (owner decision D4).
+
+The resolver serves `/v1/events` only when `EVENTS_ENABLED=true`; otherwise it answers 404, and the hook shows
+`dropped/http_4xx`.
+
+### TanStack Start server route
+
+```ts
+// src/routes/idr.e.ts  ->  POST /idr/e   (use the same path as the collector's `endpoint`)
+import { createFileRoute } from "@tanstack/react-router";
+import { createCollectorRoute } from "@salescrusader/idr-tanstack";
+
+export const Route = createFileRoute("/idr/e")({
+  server: {
+    handlers: {
+      // Call createCollectorRoute inline here, inside `server.handlers`, so the client build strips it with the rest
+      // of the server code. A function: read at the first request, when Workers bindings exist.
+      POST: createCollectorRoute(() => ({
+        resolverUrl: process.env.IDR_RESOLVER_URL ?? "",
+        token: process.env.IDR_RESOLVER_TOKEN ?? "",
+        websiteId: process.env.IDR_WEBSITE_ID ?? "",
+        allow: ["page_view", "scroll_50", "scroll_90", "engaged_30s", "cta_click", "form_start", "form_submit"],
+        consent: "required", // match the resolver's EVENT_CONSENT_MODE
+      })),
+    },
+  },
+});
+```
+
+Keep the call **inside `server.handlers`**, as above. A route file is also part of the client build, and the
+TanStack compiler strips `server.handlers` from it. The bundle-safety test builds the probe app with exactly this
+pattern and checks that neither the route code nor the token reaches client assets.
+
+* A module-level constant used only by `server.handlers` was also stripped in the verified TanStack Start 1.168
+  build.
+* A reference from any client code would ship the route to the browser. There it throws at creation, because a
+  `window` exists.
+
+It uses the same server-only variables as the middleware, and the same resolver options: `resolverUrl`, `token`,
+`websiteId`, `timeoutMs`, `retry`, `retryDelayMs`, `maxInFlight`, `onUnsupportedBackground`, `blockingBudgetMs`,
+`pageKeyMapper`, `pageKeyDefaultMapper`, `allowInsecureHttp` and `onDeliveryResult`. One shared object can
+therefore be spread into both. The route has **no trust policy** and ignores one if given: it never reads a
+client IP.
+
+| option | default | meaning |
+|---|---|---|
+| `allow` | required | the site allowlist, a subset of `event-vocabulary.v1` (an unknown name throws) |
+| `consent` | `"required"` | `required`: only `consent: "granted"` is accepted. `not_required`: `granted` and `not_required` are accepted and forwarded as given. `off`: every event is refused. Use the resolver's `EVENT_CONSENT_MODE` |
+| `hasConsent(request)` | none | `required` mode only: your server-side consent check, for example reading your consent platform's cookie. `false`, a throw or a rejection refuses the event |
+| `origins` | origin of the request URL | accepted `Origin` values. Set this when a proxy in front of the app changes the scheme or host of `request.url` |
+| `maxClockSkewMs` | 120000 (5000 to 240000) | accepted distance of `occurred_at` from server time, in either direction |
+| `replayCacheSize` | 10000 (100 to 100000) | accepted `event_id`s remembered per route instance |
+| `rateLimit` | `{ events: 600, windowMs: 60000 }` | accepted events per window, per route instance. It is **not** keyed by IP or by any other client property |
+
+### What the route checks, in order
+
+| # | check | refusal |
+|---|---|---|
+| 1 | method is `POST` | `405` (`Allow: POST`) |
+| 2 | `Origin` is one of the site origins (missing, `null` or foreign: refused); `Sec-Fetch-Site`, when present, is `same-origin` | `403` |
+| 3 | content type is `application/json` or `text/plain` (the beacon's type) | `415` |
+| 4 | body at most 1 KiB: a larger `Content-Length` is refused without reading, and a streamed body is cancelled as soon as it passes 1 KiB | `413` |
+| 5 | strict schema: exactly `v`, `event_id`, `occurred_at`, `type`, `name`, `path`, `consent`. Unknown fields (an `ip`, a session id, text) are refused. `path` must be a path with no query string and no fragment | `400` (malformed JSON or invalid UTF-8 too) |
+| 6 | `type` and `name` in the vocabulary (`400`); `name` in your `allow` list (`403`) | `400` / `403` |
+| 7 | consent policy: the mode, `Sec-GPC: 1`, then `hasConsent` | `403` |
+| 8 | `occurred_at` within `maxClockSkewMs` of server time | `400` |
+| 9 | `event_id` not already accepted (replay cache, kept for twice the skew window; the resolver also stores one row per `event_id`) | `409` |
+| 10 | per-instance rate budget | `429` |
+
+An accepted event is answered `204` immediately, and then forwarded in the background. Every answer is bare: no
+body, no `Set-Cookie`, `Cache-Control: no-store`. A refusal is reported to `onDeliveryResult` as
+`skipped/collector:<check>`, where `<check>` is one of `origin`, `sec_fetch_site`, `content_type`, `too_large`,
+`malformed`, `schema`, `path`, `vocabulary`, `not_allowed`, `consent_off`, `gpc`, `consent`, `occurred_at`,
+`replay` or `rate`.
+
+### What it forwards, and what it never reads
+
+The forwarded body is exactly the `event.v1` resolver body, built from the validated fields only:
+
+```json
+{ "contract": "event.v1", "website_id": "<websiteId>", "event_id": "...", "occurred_at": "2026-11-03T10:00:00Z",
+  "type": "conversion_intent", "name": "cta_click", "page_key": "/pricing", "consent": "granted" }
+```
+
+* `page_key` comes from the browser's `path`, mapped with **the same composed mapper as the middleware**: your
+  `pageKeyMapper`, then the default mapper. The browser's value is never forwarded as is.
+* `occurred_at` is re-serialised as whole-second UTC.
+* The forwarded request carries only `Authorization: Bearer <token>`, `Content-Type` and `Accept`.
+* The route reads only the `Origin`, `Sec-Fetch-Site`, `Content-Type`, `Content-Length` and `Sec-GPC` request
+  headers. It never reads or forwards `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, the user
+  agent, cookies, the referrer or any other header. Your own `hasConsent` hook may read your consent cookie; its
+  result is used only to decide.
+
+### Delivery
+
+Delivery uses the same machinery and lifecycle as the entrance middleware (see "Latency and failure behaviour"):
+
+* `waitUntil` where available, with one retry for a transient failure; the same `event_id` makes the retry
+  idempotent.
+* Detached on long-lived runtimes.
+* On an edge isolate without `waitUntil`, the event is dropped (`skipped/no_background_context`). With
+  `onUnsupportedBackground: "await"`, the `204` is instead held for at most `blockingBudgetMs`.
+* A resolver error, timeout or outage never changes the browser's `204`. The outcome (`delivered`, or
+  `dropped/http_4xx|http_5xx|http_429|timeout|network|overload`) goes to `onDeliveryResult`.
+
+With an options function, a configuration error found at the first request disables the route: every POST gets
+`204` and is dropped, and `skipped/config_invalid` is reported once. An invalid options object throws at creation.
 
 ## Lower-level primitives
 

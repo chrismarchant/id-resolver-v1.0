@@ -61,13 +61,25 @@ describe("maintenance run (CHR-66 F1)", () => {
     );
   }
 
-  const count = async (table: "ip_resolution_cache" | "company_observations") =>
+  /** `old` browser events received before the retention window and `fresh` ones inside it (event.v1). */
+  async function seedEvents(old: number, fresh: number): Promise<void> {
+    await db.pool.query(
+      `INSERT INTO browser_events (installation_id, website_id, event_id, type, name, page_key, consent, occurred_at, received_at)
+       SELECT $1::text, $2::text, 'maint_evt_' || lpad(g::text, 16, '0'), 'page_view', 'page_view', '/maintenance', 'granted', t, t
+       FROM (SELECT g, CASE WHEN g <= $3::int THEN now() - interval '40 days' - make_interval(secs => g) ELSE now() - make_interval(secs => g) END AS t
+             FROM generate_series(1, $3::int + $4::int) g) s`,
+      [FEED_SCOPE.installationId, FEED_SCOPE.websiteId, old, fresh],
+    );
+  }
+
+  const count = async (table: "ip_resolution_cache" | "company_observations" | "browser_events") =>
     (await db.pool.query<{ n: number }>(`SELECT count(*)::int AS n FROM ${table}`)).rows[0]!.n;
 
   function maintenance(over: Partial<MaintenanceOptions> = {}) {
     return createMaintenance({
       pruneExpiredCache: (limit) => db.cache.pruneExpired(limit),
       retention,
+      pruneEventsBefore: (cutoff, limit) => db.events.pruneBefore(cutoff, limit),
       logger,
       batch: BATCH,
       retentionDays: RETENTION_DAYS,
@@ -151,5 +163,80 @@ describe("maintenance run (CHR-66 F1)", () => {
     expect(run).toMatchObject({ observationRows: 1, backlog: false });
     const left = await db.pool.query<{ observation_ref: string }>("SELECT observation_ref FROM company_observations");
     expect(left.rows).toEqual([{ observation_ref: "window-ref-inside-00" }]);
+  });
+
+  describe("browser events (event.v1, CHR-64)", () => {
+    const feedState = async () => ({
+      watermark: await retention.watermark(FEED_SCOPE),
+      watermarkRows: (await db.pool.query("SELECT installation_id, website_id, pruned_through_txid::text, pruned_through_id, updated_at FROM feed_retention_watermarks ORDER BY 1, 2")).rows,
+      tombstones: (await db.pool.query("SELECT id, company_id, erased_at FROM feed_tombstones ORDER BY id")).rows,
+      observations: (await db.pool.query("SELECT id::text, txid::text FROM company_observations ORDER BY id")).rows,
+    });
+
+    it("one run deletes every event past retention in bounded batches, keeps the rest, and logs event_rows and event_prune", async () => {
+      await seedEvents(47, 6);
+      const run = await maintenance().runOnce();
+      expect(run).toMatchObject({ eventRows: 47, cacheRows: 0, observationRows: 0, backlog: false, reason: null });
+      expect(await count("browser_events")).toBe(6);
+      expect(events("maintenance_run")).toEqual([expect.objectContaining({ level: "info", event_rows: 47, backlog: false, outcome: "completed" })]);
+      // 47 rows in batches of 10: five statements, each bounded.
+      expect(events("event_prune")).toEqual([expect.objectContaining({ rows: 47, count: 5 })]);
+      expect(events("maintenance_backlog")).toEqual([]);
+    });
+
+    it("pruning events leaves the feed exactly as it was: same retention watermark, tombstones and observations", async () => {
+      // A feed with a watermark already in place (observations pruned earlier) and live observations.
+      await seedObservations(4, 3);
+      expect((await maintenance().runOnce())!.observationRows).toBe(4);
+      const before = await feedState();
+      expect(before.watermark).not.toBeNull();
+      expect(before.observations.length).toBe(3);
+      await seedEvents(35, 2);
+      const run = await maintenance().runOnce();
+      expect(run).toMatchObject({ eventRows: 35, observationRows: 0, backlog: false });
+      expect(await feedState()).toEqual(before);
+      expect(await count("browser_events")).toBe(2);
+    });
+
+    it("pruning events never creates a watermark where none existed", async () => {
+      await seedEvents(12, 1);
+      expect((await maintenance().runOnce())!.eventRows).toBe(12);
+      expect(await retention.watermark(FEED_SCOPE)).toBeNull();
+      expect((await db.pool.query("SELECT 1 FROM feed_retention_watermarks")).rowCount).toBe(0);
+      expect((await db.pool.query("SELECT 1 FROM feed_tombstones")).rowCount).toBe(0);
+    });
+
+    it("retention follows the resolver's received_at, never the caller's occurred_at", async () => {
+      const day = 86_400_000;
+      const nowMs = Date.now();
+      await db.pool.query(
+        `INSERT INTO browser_events (installation_id, website_id, event_id, type, name, page_key, consent, occurred_at, received_at)
+         VALUES ($1, $2, 'evt_received_old_000', 'page_view', 'page_view', '/a', 'granted', $3, $4),
+                ($1, $2, 'evt_occurred_old_000', 'page_view', 'page_view', '/a', 'granted', $4, $3)`,
+        [FEED_SCOPE.installationId, FEED_SCOPE.websiteId, new Date(nowMs - 60_000), new Date(nowMs - (RETENTION_DAYS + 1) * day)],
+      );
+      expect((await maintenance({ now: () => nowMs }).runOnce())!.eventRows).toBe(1);
+      expect((await db.pool.query<{ event_id: string }>("SELECT event_id FROM browser_events")).rows).toEqual([{ event_id: "evt_occurred_old_000" }]);
+    });
+
+    it("an exhausted budget stops the event drain between batches and reports the backlog; later runs finish it", async () => {
+      await seedEvents(300, 4);
+      let t = Date.now();
+      const m = maintenance({ budgetMs: 2_000, now: () => (t += 100) });
+      const first = await m.runOnce();
+      expect(first).toMatchObject({ backlog: true, reason: "budget_exhausted" });
+      // Up to a quarter of the budget: several batches, not all of them.
+      expect(first!.eventRows).toBeGreaterThan(BATCH);
+      expect(first!.eventRows).toBeLessThan(300);
+      expect(events("maintenance_backlog")).toEqual([expect.objectContaining({ level: "warn", reason: "budget_exhausted", category: "events" })]);
+      let runs = 1;
+      let last = first;
+      while (last!.backlog && runs < 40) {
+        last = await m.runOnce();
+        runs += 1;
+      }
+      expect(last).toMatchObject({ backlog: false });
+      expect(await count("browser_events")).toBe(4);
+    });
   });
 });
