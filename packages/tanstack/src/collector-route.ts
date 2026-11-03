@@ -24,9 +24,14 @@ export interface CollectorRouteOptions extends ResolverDeliveryOptions {
   consent?: CollectorConsentMode;
   /**
    * Server-side consent check in `required` mode, for example reading your consent platform's cookie. The browser's
-   * claim alone is then not enough: `false`, a throw or a rejection refuses the event (403).
+   * claim alone is then not enough: `false`, a throw or a rejection refuses the event (403), and so does a hook that
+   * has not settled within `consentTimeoutMs` (fail closed).
    */
   hasConsent?: (request: Request) => boolean | Promise<boolean>;
+  /** How long `hasConsent` may take before the event is refused as without consent (403). 10..10000, default 1000. */
+  consentTimeoutMs?: number;
+  /** How long reading the request body may take before the request is refused (408) and the body cancelled. 100..60000, default 5000. */
+  bodyTimeoutMs?: number;
   /**
    * Accepted `Origin` values (`scheme://host[:port]`). Default: the origin of the request URL. Set it when a proxy
    * in front of the app changes the scheme or host of the request URL.
@@ -47,6 +52,8 @@ interface ResolvedCollector extends ResolvedDelivery {
   allow: ReadonlySet<string>;
   consent: CollectorConsentMode;
   hasConsent: ((request: Request) => boolean | Promise<boolean>) | undefined;
+  consentTimeoutMs: number;
+  bodyTimeoutMs: number;
   origins: readonly string[] | undefined;
   maxClockSkewMs: number;
   replayCacheSize: number;
@@ -91,6 +98,8 @@ function resolveCollector(options: CollectorRouteOptions): ResolvedCollector {
     allow: new Set(options.allow),
     consent,
     hasConsent: options.hasConsent,
+    consentTimeoutMs: intIn("consentTimeoutMs", options.consentTimeoutMs, 10, 10_000, 1_000),
+    bodyTimeoutMs: intIn("bodyTimeoutMs", options.bodyTimeoutMs, 100, 60_000, 5_000),
     origins,
     maxClockSkewMs: intIn("maxClockSkewMs", options.maxClockSkewMs, 5_000, 240_000, 120_000),
     replayCacheSize: intIn("replayCacheSize", options.replayCacheSize, 100, 100_000, 10_000),
@@ -163,9 +172,22 @@ function bare(status: number): Response {
 }
 
 const TOO_LARGE = Symbol("too_large");
+const TIMED_OUT = Symbol("timed_out");
 
-/** Reads at most COLLECTOR_MAX_BODY_BYTES; stops and cancels the stream as soon as it is exceeded. */
-async function readLimited(request: Request): Promise<string | null | typeof TOO_LARGE> {
+/** A promise that resolves TIMED_OUT after `ms`, and the function that clears its timer (always call it). */
+function expiry(ms: number): { expired: Promise<typeof TIMED_OUT>; clear: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  return { expired, clear: () => clearTimeout(timer) };
+}
+
+/**
+ * Reads at most COLLECTOR_MAX_BODY_BYTES within `timeoutMs` (CHR-66 G4-I3: a slow-dripping body cannot hold the
+ * request open). Stops and cancels the stream as soon as either limit is passed.
+ */
+async function readLimited(request: Request, timeoutMs: number): Promise<string | null | typeof TOO_LARGE | typeof TIMED_OUT> {
   const declared = request.headers.get("content-length");
   if (declared !== null) {
     if (!/^\d{1,12}$/.test(declared.trim())) return null;
@@ -175,9 +197,15 @@ async function readLimited(request: Request): Promise<string | null | typeof TOO
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
+  const deadline = expiry(timeoutMs);
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const next = await Promise.race([reader.read(), deadline.expired]);
+      if (next === TIMED_OUT) {
+        void reader.cancel().catch(() => {});
+        return TIMED_OUT;
+      }
+      const { done, value } = next;
       if (done) break;
       if (!ArrayBuffer.isView(value)) {
         void reader.cancel().catch(() => {});
@@ -192,6 +220,8 @@ async function readLimited(request: Request): Promise<string | null | typeof TOO
     }
   } catch {
     return null;
+  } finally {
+    deadline.clear();
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
@@ -232,11 +262,20 @@ function parseEvent(raw: unknown): BrowserEvent | "schema" | "path" {
   return { event_id, occurred_at, type, name, path, consent };
 }
 
-async function askConsent(hook: (request: Request) => boolean | Promise<boolean>, request: Request): Promise<boolean> {
+/**
+ * The site's consent hook, bounded by `timeoutMs` (CHR-66 G4-I3). Only a `true` that arrives in time is consent:
+ * `false`, any other value, a throw, a rejection and a hook still pending at the deadline all refuse (fail closed).
+ * The deadline cannot interrupt a hook that blocks synchronously.
+ */
+async function askConsent(hook: (request: Request) => boolean | Promise<boolean>, request: Request, timeoutMs: number): Promise<boolean | typeof TIMED_OUT> {
+  const deadline = expiry(timeoutMs);
   try {
-    return (await hook(request)) === true;
+    const answer = await Promise.race([Promise.resolve().then(() => hook(request)), deadline.expired]);
+    return answer === TIMED_OUT ? TIMED_OUT : answer === true;
   } catch {
     return false;
+  } finally {
+    deadline.clear();
   }
 }
 
@@ -246,9 +285,10 @@ async function askConsent(hook: (request: Request) => boolean | Promise<boolean>
  *   createFileRoute("/idr/e")({ server: { handlers: { POST: createCollectorRoute(() => options) } } })
  *
  * Checks, in this order: method POST; `Origin` is a site origin and `Sec-Fetch-Site` (when present) is
- * `same-origin`; content type; body at most 1 KiB, read with a hard limit; strict schema; vocabulary and site
- * allowlist; consent policy (mode, `Sec-GPC: 1`, `hasConsent`); the `occurred_at` window; the `event_id` replay
- * cache; the per-instance rate budget. An accepted event is answered `204` at once and forwarded to
+ * `same-origin`; content type; body at most 1 KiB, read with a hard limit and within `bodyTimeoutMs` (else 408);
+ * strict schema; vocabulary and site allowlist; consent policy (mode, `Sec-GPC: 1`, `hasConsent` within
+ * `consentTimeoutMs`, else 403); the `occurred_at` window; the `event_id` replay cache; the per-instance rate
+ * budget. An accepted event is answered `204` at once and forwarded to
  * `<resolverUrl>/v1/events` on the shared non-blocking path (`waitUntil`, detached, or drop); its outcome goes
  * to `onDeliveryResult`. A refused one gets a bare `4xx`. Responses have no body, no cookie and
  * `Cache-Control: no-store`.
@@ -311,7 +351,8 @@ export function createCollectorRoute(options: CollectorRouteOptions | (() => Col
     const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
     if (contentType !== "application/json" && contentType !== "text/plain") return reject(415, "content_type");
     // 4. Size, with a hard limit.
-    const text = await readLimited(request);
+    const text = await readLimited(request, c.bodyTimeoutMs);
+    if (text === TIMED_OUT) return reject(408, "body_timeout");
     if (text === TOO_LARGE) return reject(413, "too_large");
     if (text === null) return reject(400, "malformed");
     let raw: unknown;
@@ -331,7 +372,11 @@ export function createCollectorRoute(options: CollectorRouteOptions | (() => Col
     if (request.headers.get("sec-gpc") === "1") return reject(403, "gpc");
     if (c.consent === "required") {
       if (event.consent !== "granted") return reject(403, "consent");
-      if (c.hasConsent && !(await askConsent(c.hasConsent, request))) return reject(403, "consent");
+      if (c.hasConsent) {
+        const consent = await askConsent(c.hasConsent, request, c.consentTimeoutMs);
+        if (consent === TIMED_OUT) return reject(403, "consent_timeout");
+        if (!consent) return reject(403, "consent");
+      }
     }
     // 8. occurred_at window.
     const at = Date.parse(event.occurred_at);

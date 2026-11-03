@@ -124,6 +124,11 @@ it was compared byte for byte with the repository, and the run passed again.
    its trigger stops the owner as well. This is consistent with "only
    service_role writes". The unit tests, which run on plain Postgres, cannot
    see these defaults.
+   *Follow-up after this run (CHR-66 G4-L4, Gate 5):* the script now revokes
+   every privilege of `anon`, `authenticated`, `service_role` and `PUBLIC`
+   on each `idr_*` object before granting exactly what it needs, and the unit
+   tests emulate Supabase's default privileges. This stack was not re-run
+   against that change.
 4. **The CLI publishes ports on all interfaces** unless the docker network
    has `host_binding_ipv4=127.0.0.1`. That includes the database on 54322
    with the local default password. The harness creates such a network;

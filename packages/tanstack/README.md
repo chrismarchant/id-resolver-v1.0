@@ -254,6 +254,12 @@ never joined to companies (owner decision D4).
 The resolver serves `/v1/events` only when `EVENTS_ENABLED=true`; otherwise it answers 404, and the hook shows
 `dropped/http_4xx`.
 
+**Browser events are forgeable telemetry** (`event.v1.md`, clarification CHR-66 G4-I1; no wire change). The
+`Origin` and `Sec-Fetch-Site` checks below stop browsers on other sites, not scripts: anyone can post plausible
+allowlisted events through this route, within its rate budget, the vocabulary, your allowlist and the consent policy.
+That is inherent to D4 (there is no visitor identity to authenticate). Never use browser events for security or
+billing decisions.
+
 ### TanStack Start server route
 
 ```ts
@@ -297,7 +303,9 @@ client IP.
 |---|---|---|
 | `allow` | required | the site allowlist, a subset of `event-vocabulary.v1` (an unknown name throws) |
 | `consent` | `"required"` | `required`: only `consent: "granted"` is accepted. `not_required`: `granted` and `not_required` are accepted and forwarded as given. `off`: every event is refused. Use the resolver's `EVENT_CONSENT_MODE` |
-| `hasConsent(request)` | none | `required` mode only: your server-side consent check, for example reading your consent platform's cookie. `false`, a throw or a rejection refuses the event |
+| `hasConsent(request)` | none | `required` mode only: your server-side consent check, for example reading your consent platform's cookie. `false`, a throw or a rejection refuses the event, and so does a hook that has not settled within `consentTimeoutMs` (fail closed: treated as no consent, `403`) |
+| `consentTimeoutMs` | 1000 (10 to 10000) | how long `hasConsent` may take. The route stops waiting and refuses; it cannot stop a hook that blocks synchronously, so keep the hook fast (a cookie read, not a network call) |
+| `bodyTimeoutMs` | 5000 (100 to 60000) | how long reading the request body may take. A slower body is refused with `408` and the stream is cancelled, so a slow-dripping client cannot hold the request open |
 | `origins` | origin of the request URL | accepted `Origin` values. Set this when a proxy in front of the app changes the scheme or host of `request.url` |
 | `maxClockSkewMs` | 120000 (5000 to 240000) | accepted distance of `occurred_at` from server time, in either direction |
 | `replayCacheSize` | 10000 (100 to 100000) | accepted `event_id`s remembered per route instance |
@@ -310,10 +318,10 @@ client IP.
 | 1 | method is `POST` | `405` (`Allow: POST`) |
 | 2 | `Origin` is one of the site origins (missing, `null` or foreign: refused); `Sec-Fetch-Site`, when present, is `same-origin` | `403` |
 | 3 | content type is `application/json` or `text/plain` (the beacon's type) | `415` |
-| 4 | body at most 1 KiB: a larger `Content-Length` is refused without reading, and a streamed body is cancelled as soon as it passes 1 KiB | `413` |
+| 4 | body at most 1 KiB: a larger `Content-Length` is refused without reading, and a streamed body is cancelled as soon as it passes 1 KiB; the whole body must arrive within `bodyTimeoutMs`, or the stream is cancelled | `413` / `408` |
 | 5 | strict schema: exactly `v`, `event_id`, `occurred_at`, `type`, `name`, `path`, `consent`. Unknown fields (an `ip`, a session id, text) are refused. `path` must be a path with no query string and no fragment | `400` (malformed JSON or invalid UTF-8 too) |
 | 6 | `type` and `name` in the vocabulary (`400`); `name` in your `allow` list (`403`) | `400` / `403` |
-| 7 | consent policy: the mode, `Sec-GPC: 1`, then `hasConsent` | `403` |
+| 7 | consent policy: the mode, `Sec-GPC: 1`, then `hasConsent`, which must answer `true` within `consentTimeoutMs` | `403` |
 | 8 | `occurred_at` within `maxClockSkewMs` of server time | `400` |
 | 9 | `event_id` not already accepted (replay cache, kept for twice the skew window; the resolver also stores one row per `event_id`) | `409` |
 | 10 | per-instance rate budget | `429` |
@@ -321,8 +329,8 @@ client IP.
 An accepted event is answered `204` immediately, and then forwarded in the background. Every answer is bare: no
 body, no `Set-Cookie`, `Cache-Control: no-store`. A refusal is reported to `onDeliveryResult` as
 `skipped/collector:<check>`, where `<check>` is one of `origin`, `sec_fetch_site`, `content_type`, `too_large`,
-`malformed`, `schema`, `path`, `vocabulary`, `not_allowed`, `consent_off`, `gpc`, `consent`, `occurred_at`,
-`replay` or `rate`.
+`body_timeout`, `malformed`, `schema`, `path`, `vocabulary`, `not_allowed`, `consent_off`, `gpc`, `consent`,
+`consent_timeout`, `occurred_at`, `replay` or `rate`.
 
 ### What it forwards, and what it never reads
 

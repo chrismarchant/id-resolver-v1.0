@@ -108,11 +108,11 @@ describe("crash and atomicity", () => {
   });
 
   it("a stale expected cursor changes nothing (CAS)", async () => {
-    const a = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(1, 3, D)] as never });
+    const a = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(1, 3, D)] as never, drained: false });
     expect(a.applied).toBe(true);
-    const stale = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(2, 3, D)] as never });
+    const stale = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(2, 3, D)] as never, drained: false });
     expect(stale.applied).toBe(false);
-    const wrong = await store.applyPage({ expectedCursor: "c9", expectedResetFrom: null, nextCursor: "c10", items: [obs(3, 3, D)] as never });
+    const wrong = await store.applyPage({ expectedCursor: "c9", expectedResetFrom: null, nextCursor: "c10", items: [obs(3, 3, D)] as never, drained: false });
     expect(wrong.applied).toBe(false);
     expect((await counts(pool)).observations).toBe(1);
     expect(await storedCursor(pool)).toBe("c1");
@@ -342,6 +342,9 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     // The replay needs several runs: not drained yet -> still open.
     const part = await runSync(testConfig(mock, { maxPages: 1 }), testDeps(store));
     expect(part).toMatchObject({ status: "partial", gapsResolved: 0 });
+    expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
+    // R2-8: that replay has not drained, so a resolve called anyway (by service_role directly) resolves nothing.
+    expect(await store.resolveGaps((await storedCursor(pool))!)).toBe(0);
     expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
     const done = await runSync(testConfig(mock), testDeps(store));
     expect(done).toMatchObject({ status: "ok", gapsResolved: 1 });

@@ -235,6 +235,64 @@ describe("createMaintenance", () => {
     expect(logger.entries.find((e) => e["event"] === "maintenance_backlog")).toMatchObject({ level: "warn", reason: "database_error", category: "events" });
   });
 
+  describe("G4-L1: an overrunning cache batch never lets events take the observations' last quarter", () => {
+    const B = 20_000;
+    const BATCH_MS = 100;
+    /** Unlimited due rows; each batch takes `ms(call)` of virtual time and records when it started. */
+    function timedTable(clock: { t: number }, ms: (call: number) => number) {
+      const t = {
+        calls: 0,
+        starts: [] as number[],
+        step: async (limit: number) => {
+          await Promise.resolve();
+          t.starts.push(clock.t);
+          clock.t += ms(t.calls);
+          t.calls += 1;
+          return limit;
+        },
+      };
+      return t;
+    }
+    async function run(firstCacheBatchMs: number) {
+      const clock = { t: 0 };
+      const cache = timedTable(clock, (i) => (i === 0 ? firstCacheBatchMs : BATCH_MS));
+      const events = timedTable(clock, () => BATCH_MS);
+      const observations = timedTable(clock, () => BATCH_MS);
+      const logger = createMemoryLogger();
+      const result = await createMaintenance(
+        options({ logger, pruneExpiredCache: cache.step, pruneEventsBefore: (_c, limit) => events.step(limit), retention: { pruneAllBefore: (_c, o) => drainBatches(observations.step, o) }, budgetMs: B, now: () => clock.t }),
+      ).runOnce();
+      return { result, cache, events, observations, logger };
+    }
+
+    it("on time: cache half, events a quarter, observations a quarter (unchanged)", async () => {
+      const { cache, events, observations } = await run(BATCH_MS);
+      expect([cache.calls, events.calls, observations.calls]).toEqual([100, 50, 50]);
+    });
+
+    it("the reviewer's S3: the cache batch returns at 0.75 B; events get nothing, observations keep their full quarter (before the fix: events 25 %, observations 0)", async () => {
+      const { result, events, observations } = await run(0.75 * B);
+      expect(events.calls).toBe(0);
+      expect(observations.calls * BATCH_MS).toBe(B / 4);
+      expect(result).toMatchObject({ backlog: true, reason: "budget_exhausted" });
+    });
+
+    it("the reviewer's S4: the cache batch returns at 0.70 B; events stop at 0.75 B, observations keep their full quarter (before the fix: observations 5 %)", async () => {
+      const { events, observations } = await run(0.7 * B);
+      expect(events.calls).toBe(10);
+      expect(Math.max(...events.starts)).toBeLessThan(0.75 * B);
+      expect(observations.calls * BATCH_MS).toBe(B / 4);
+    });
+
+    it("documented limit: a single cache batch that itself overruns past 0.75 B leaves observations only what remains; the backlog is logged and the next run continues", async () => {
+      const { result, events, observations, logger } = await run(0.9 * B);
+      expect(events.calls).toBe(0);
+      expect(observations.calls * BATCH_MS).toBe(0.1 * B);
+      expect(result).toMatchObject({ backlog: true, reason: "budget_exhausted" });
+      expect(logger.entries.find((e) => e["event"] === "maintenance_backlog")).toMatchObject({ category: "cache_and_observations_and_events" });
+    });
+  });
+
   it("names every combination of kinds left with a backlog", async () => {
     const throwing = async (): Promise<number> => {
       throw new Error("injected failure");

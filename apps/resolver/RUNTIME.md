@@ -70,7 +70,10 @@ name variables, never values. See `.env.example` for every variable.
   and the pruned observations are not recoverable from the resolver. Shorter is better for privacy; longer is safer for sync. The owner
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
-  and per-company scope statistics are never pruned.
+  and per-company scope statistics are never pruned. How to choose the value,
+  what pruning does and does not remove, and erasure:
+  [docs/RETENTION.md](../../docs/RETENTION.md) (operational justification,
+  not legal advice, pending owner/legal confirmation).
 * **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
   rows (IP fingerprints past their TTL), and observations and browser events
   older than the retention window. It runs once at startup (after the server
@@ -78,8 +81,12 @@ name variables, never values. See `.env.example` for every variable.
   600 s); runs never overlap. A run drains: it repeats batches of
   `CACHE_PRUNE_BATCH` rows (one statement each) until a batch comes back
   short, within `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may
-  use half of it, browser events then up to a quarter, observation retention
-  gets the rest). Each run logs `maintenance_run{cache_rows,
+  use half of it, browser events then up to a quarter but never past three
+  quarters of it, observation retention gets the rest, at least the last
+  quarter). A deadline stops a phase from starting another batch; a single
+  batch already running can overrun it. Only one that runs past three
+  quarters of the budget eats into the observations' quarter, and the run
+  then reports the backlog. Each run logs `maintenance_run{cache_rows,
   observation_rows, event_rows, backlog, duration_ms}`; a run that stops with
   rows still due (budget spent, shutdown or a database error) also logs the
   warning `maintenance_backlog{reason, category}`, where `category` names the
