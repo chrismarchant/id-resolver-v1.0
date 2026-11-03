@@ -225,6 +225,9 @@ describe("R2-6: begin_resync never clears needs_resync without a gap on record",
     expect((await svc<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
     const st = (await svc<{ s: { schema_version: number } }>("select public.idr_get_sync_state($1) as s", [INSTALLATION])).rows[0]!.s;
     expect(st.schema_version).toBe(PROJECTION_SCHEMA_VERSION);
+    // The operator documentation names the same version.
+    const setup = readFileSync(new URL("../SETUP.md", import.meta.url), "utf8");
+    expect(setup).toContain(`(\`idr_schema_version()\`, ${PROJECTION_SCHEMA_VERSION} for this release)`);
   });
 });
 
