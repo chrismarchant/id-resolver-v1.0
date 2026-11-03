@@ -79,6 +79,11 @@ export class PostgrestStore implements Store {
     return { applied: true, observations: int(r["observations"]), tombstones: int(r["tombstones"]) };
   }
 
+  async resetCursor(expectedCursor: string): Promise<boolean> {
+    const r = obj(await this.rpc("idr_reset_cursor", { p_installation_id: this.o.installationId, p_expected_cursor: expectedCursor }));
+    return r["applied"] === true;
+  }
+
   async recordStatus(a: RecordStatusArgs): Promise<void> {
     await this.rpc("idr_record_sync_status", {
       p_installation_id: this.o.installationId,

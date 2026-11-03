@@ -61,10 +61,17 @@ create table if not exists public.idr_sync_state (
   status          text not null default 'never_run'
     check (status in ('never_run','resync_requested','ok','partial','needs_resync','auth_failed',
                       'rate_limited','upstream_error','cas_conflict','contract_error','store_error',
-                      'reconcile_mismatch')),
+                      'reconcile_mismatch','cursor_rejected')),
   needs_resync    boolean not null default false,
   updated_at      timestamptz not null default now()
 );
+
+-- Re-runs on an existing installation: widen the status check (idempotent).
+alter table public.idr_sync_state drop constraint if exists idr_sync_state_status_check;
+alter table public.idr_sync_state add constraint idr_sync_state_status_check
+  check (status in ('never_run','resync_requested','ok','partial','needs_resync','auth_failed',
+                    'rate_limited','upstream_error','cas_conflict','contract_error','store_error',
+                    'reconcile_mismatch','cursor_rejected'));
 
 comment on table public.idr_companies is
   'Companies resolved by the ID Resolver. INTERPRETATION: a company appearing here means at least one website entrance was attributed to it; it does not identify a person.';
@@ -243,6 +250,30 @@ begin
 end;
 $$;
 
+-- Automatic recovery when the resolver rejects a stored cursor (400, e.g. its
+-- cursor MAC key rotated). Compare-and-set so concurrent runs stay safe; the
+-- projection is kept and the replay from the buffer start is idempotent. This
+-- is NOT for cursor_expired (410): that means data was missed and still needs
+-- the operator action idr_begin_resync().
+create or replace function public.idr_reset_cursor(p_installation_id text, p_expected_cursor text)
+returns jsonb
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_rows int;
+begin
+  update public.idr_sync_state
+     set cursor = null, updated_at = now()
+   where installation_id = p_installation_id
+     and cursor is not distinct from p_expected_cursor
+     and p_expected_cursor is not null
+     and not needs_resync;
+  get diagnostics v_rows = row_count;
+  return jsonb_build_object('applied', v_rows = 1);
+end;
+$$;
+
 -- Operator action after cursor_expired: restart from the start of the
 -- resolver's retained buffer. The projection is kept (the client owns
 -- commercial-history retention); replays are idempotent.
@@ -279,9 +310,11 @@ revoke all on function public.idr_get_sync_state(text) from public, anon, authen
 revoke all on function public.idr_apply_feed_page(text, text, text, jsonb) from public, anon, authenticated;
 revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated;
 revoke all on function public.idr_begin_resync(text) from public, anon, authenticated;
+revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
 revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
 grant execute on function public.idr_begin_resync(text) to service_role;
+grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;

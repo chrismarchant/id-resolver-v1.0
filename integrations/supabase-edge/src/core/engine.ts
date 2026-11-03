@@ -48,7 +48,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     return result;
   }
 
-  async function getJson(pathAndQuery: string, allow410: boolean): Promise<Fetched> {
+  async function getJson(pathAndQuery: string, allow410: boolean, carriedCursor = false): Promise<Fetched> {
     const url = `${cfg.baseUrl.replace(/\/+$/, "")}${pathAndQuery}`;
     let attempt = 0;
     for (;;) {
@@ -96,6 +96,9 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         }
         return { kind: "stop", status: "contract_error" };
       }
+      // 400 to a request that carried a cursor: the resolver no longer accepts it
+      // (its cursor key rotated). Recoverable by restarting from the buffer start.
+      if (status === 400 && carriedCursor) return { kind: "stop", status: "cursor_rejected" };
       if (status !== null && status !== 429 && status < 500) return { kind: "stop", status: "contract_error" };
 
       // 429 / 5xx / network failure: bounded retry within the budget.
@@ -123,12 +126,33 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
   let cursor = state.cursor;
   let drained = false;
+  let cursorReset = false;
   while (result.pages < cfg.maxPages) {
     if (deps.now() >= deadline) break;
     const q = `limit=${cfg.pageLimit}${cursor === null ? "" : `&after=${encodeURIComponent(cursor)}`}`;
-    const fetched = await getJson(`/v1/reporting/observations?${q}`, true);
+    const fetched = await getJson(`/v1/reporting/observations?${q}`, true, cursor !== null);
     if (fetched.kind === "stop") {
       if (fetched.status === "partial") break;
+      if (fetched.status === "cursor_rejected" && cursor !== null && !cursorReset) {
+        // Reset through the same compare-and-set as every other cursor change,
+        // once per run, then replay from the start of the buffer (idempotent).
+        let reset = false;
+        try {
+          reset = await deps.store.resetCursor(cursor);
+        } catch {
+          return finish("store_error");
+        }
+        if (!reset) return finish("cas_conflict");
+        cursorReset = true;
+        cursor = null;
+        try {
+          await deps.store.recordStatus({ status: "cursor_rejected", needsResync: null });
+        } catch {
+          // best effort
+        }
+        continue;
+      }
+      if (fetched.status === "cursor_rejected") return finish("contract_error");
       return finish(fetched.status, fetched.status === "needs_resync" ? true : null);
     }
     const page: FeedPage | null = parseFeedPage(fetched.body, cfg.installationId);
@@ -153,13 +177,14 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     }
   }
 
-  if (!drained) return finish("partial");
+  if (!drained) return finish(cursorReset ? "cursor_rejected" : "partial");
 
   if (cfg.reconcileDays > 0) {
     result.reconcile = await reconcile();
     if (result.reconcile.checked && result.reconcile.matched === false) return finish("reconcile_mismatch");
   }
-  return finish("ok");
+  // A run that recovered from a rejected cursor reports it (the projection is complete).
+  return finish(cursorReset ? "cursor_rejected" : "ok");
 
   async function reconcile(): Promise<ReconcileOutcome> {
     const w = reconcileWindow(deps.now(), cfg.reconcileDays);

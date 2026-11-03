@@ -9,6 +9,7 @@ const FUNCS = [
   "idr_apply_feed_page(text,text,text,jsonb)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
+  "idr_reset_cursor(text,text)",
   "idr_reconcile_counts(text,date,date)",
 ];
 
@@ -99,6 +100,7 @@ describe("row level security", () => {
       "idr_apply_feed_page(text,text,text,jsonb)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
+      "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
       "idr_reconcile_counts(text,date,date)": ["select public.idr_reconcile_counts($1, '2026-11-01', '2026-11-02')", [INSTALLATION]],
     };
     for (const f of FUNCS) {

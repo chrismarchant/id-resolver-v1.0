@@ -96,6 +96,13 @@ export class PgStore implements Store {
     return { applied: v.applied, observations: v.observations ?? 0, tombstones: v.tombstones ?? 0 };
   }
 
+  async resetCursor(expectedCursor: string): Promise<boolean> {
+    const r = await asRole(this.pool, "service_role", (c) =>
+      c.query<{ r: { applied: boolean } }>("select public.idr_reset_cursor($1,$2) as r", [this.installationId, expectedCursor]),
+    );
+    return r.rows[0]!.r.applied;
+  }
+
   async recordStatus(a: RecordStatusArgs): Promise<void> {
     await asRole(this.pool, "service_role", (c) =>
       c.query("select public.idr_record_sync_status($1,$2,$3)", [this.installationId, a.status, a.needsResync]),
