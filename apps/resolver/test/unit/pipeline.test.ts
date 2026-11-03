@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { runJob, LEASE_COMMIT_BUDGET_MS, type PipelineDeps } from "../../src/child/pipeline.js";
+import { runJob, LEASE_COMMIT_BUDGET_MS, type PipelineDeps } from "../../src/resolution/pipeline.js";
 import type { CacheKey, UsageScope } from "../../src/contracts/db.js";
 import { usagePeriodKey } from "../../src/contracts/db.js";
-import { IPC_PROTOCOL_VERSION, type ChildJobMessage, type ChildRuntimeConfig } from "../../src/contracts/ipc.js";
+import type { PipelineConfig, ResolutionJob } from "../../src/contracts/runtime.js";
 import type { ProviderAdapter, ProviderOutcome } from "../../src/contracts/provider.js";
 import { canonicaliseIp } from "../../src/ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../../src/ip/fingerprint.js";
@@ -13,13 +13,12 @@ import { createFakeRepositories } from "../helpers/fakes.js";
 const SECRET = "0123456789abcdef".repeat(4);
 const IP = "203.0.113.10";
 
-function makeConfig(overrides: { policy?: Partial<ChildRuntimeConfig["policy"]>; provider?: Partial<ChildRuntimeConfig["provider"]> } = {}): ChildRuntimeConfig {
+function makeConfig(overrides: { policy?: Partial<PipelineConfig["policy"]>; provider?: Partial<PipelineConfig["provider"]> } = {}): PipelineConfig {
   return {
     installation_id: "inst-test",
     website_id: "site-test",
     key_version: 1,
     ip_hmac_secret: SECRET,
-    database_url: "postgres://unused@localhost/unused",
     provider: { mode: "mock", base_url: "https://provider.invalid", api_key: "k", auth_header: "x-api-key", timeout_ms: 1_000, ...overrides.provider },
     policy: {
       ttl_qualified_ms: 7 * 86_400_000,
@@ -39,14 +38,11 @@ function makeConfig(overrides: { policy?: Partial<ChildRuntimeConfig["policy"]>;
       allow_documentation_ranges: true,
       ...overrides.policy,
     },
-    log_level: "debug",
   };
 }
 
 const REF = "obsref-0123456789abcdef";
-const job = (ip = IP, deadlineInMs = 4_000, observationRef = REF): ChildJobMessage => ({
-  v: IPC_PROTOCOL_VERSION,
-  type: "job",
+const job = (ip = IP, deadlineInMs = 4_000, observationRef = REF): ResolutionJob => ({
   job_id: "job-1",
   ip,
   deadline_at_ms: Date.now() + deadlineInMs,
@@ -61,7 +57,7 @@ const resolved = (domain: string, usageType: string | null, organisationName: st
   creditsReported: 100,
 });
 
-function keyFor(config: ChildRuntimeConfig, ip = IP): CacheKey {
+function keyFor(config: PipelineConfig, ip = IP): CacheKey {
   const c = canonicaliseIp(ip);
   if (!c.ok) throw new Error("bad test ip");
   return {
@@ -443,7 +439,7 @@ describe("runJob: failures and hygiene", () => {
     expect(t.logger.entries.length).toBeGreaterThan(0);
     for (const s of [IP, "2001:db8::99", "example.com", SECRET, "injected failure"]) expect(all).not.toContain(s);
     const events = new Set(t.logger.entries.map((e) => e["event"]));
-    expect(events).toContain("child_job_finished");
+    expect(events).toContain("job_finished");
     expect(events).toContain("provider_outcome");
   });
 });
@@ -638,5 +634,92 @@ describe("runJob: company activity", () => {
     expect(text).not.toContain("example.com");
     expect(text).not.toContain(IP);
     expect(text).not.toContain(ref(1));
+  });
+});
+
+describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
+  const withSignal = (j: ResolutionJob, signal: AbortSignal): ResolutionJob => ({ ...j, signal });
+  const ref = (n: number) => `obsref-${String(n).padStart(16, "0")}`;
+
+  it("an already-aborted job stops before the cache is touched and before any provider call", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+    const o = await runJob(t.deps, t.config, withSignal(job(), AbortSignal.abort()));
+    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(t.repos.cache.calls.reserve).toBe(0);
+    expect(t.mock.calls).toBe(0);
+    expect((await t.snapshot()).provider_attempts).toBe(0);
+  });
+
+  it("an abort during the provider call cancels it promptly; the dispatched call is committed as uncertain and nothing is recorded", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM"), delayMs: 2_000 } });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const started = Date.now();
+    const o = await runJob(t.deps, t.config, withSignal(job(IP, 4_000, ref(1)), controller.signal));
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(o).toMatchObject({ status: "uncertain", source: "provider", reason: "provider_timeout" });
+    expect(t.mock.calls).toBe(1);
+    // The paid attempt is never repeated for this address: the fenced commit still lands.
+    expect(t.repos.cache.inspect(keyFor(t.config))!.status).toBe("uncertain");
+    expect(t.repos.activity.observations).toHaveLength(0);
+  });
+
+  it("an abort after the provider answered keeps the fenced commit but never starts the activity write", async () => {
+    const t = setup();
+    const controller = new AbortController();
+    const provider: ProviderAdapter = {
+      name: "aborting",
+      lookup: async () => {
+        controller.abort(); // the deadline passes while the answer is in flight
+        return resolved("example.com", "COM");
+      },
+    };
+    const o = await runJob({ ...t.deps, provider }, t.config, withSignal(job(IP, 4_000, ref(2)), controller.signal));
+    expect(o).toMatchObject({ status: "qualified", source: "provider", activity: { recorded: false, previously_seen: null, observation_ref: ref(2) } });
+    expect(t.repos.cache.inspect(keyFor(t.config))!.status).toBe("qualified");
+    expect(t.repos.activity.calls.recordObservation).toBe(0);
+    expect(t.logger.entries.some((e) => e["event"] === "activity_write_failed" && e["reason"] === "deadline_exceeded")).toBe(true);
+  });
+
+  it("an abort during the kill-switch check stops before the usage reservation and frees the lease", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+    const controller = new AbortController();
+    const isEnabled = t.repos.controls.isEnrichmentEnabled.bind(t.repos.controls);
+    t.repos.controls.isEnrichmentEnabled = async (id: string) => {
+      controller.abort();
+      return isEnabled(id);
+    };
+    const o = await runJob(t.deps, t.config, withSignal(job(), controller.signal));
+    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect((await t.snapshot()).provider_attempts).toBe(0);
+    expect(t.mock.calls).toBe(0);
+    expect(t.repos.cache.calls.release).toBe(1);
+    expect(t.repos.cache.inspect(keyFor(t.config))!.token).toBeNull();
+  });
+
+  it("an abort while waiting on another worker's lookup stops polling at once", async () => {
+    const t = setup();
+    const config = makeConfig({ policy: { pending_wait_ms: 3_000, pending_poll_ms: 20 } });
+    await t.repos.cache.reserve(keyFor(config), { leaseMs: 10_000 });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const started = Date.now();
+    const o = await runJob(t.deps, config, withSignal(job(), controller.signal));
+    expect(o).toEqual({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" });
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  it("an activity write that outlives the deadline is handed to the runner as a tracked background write", async () => {
+    const t = setup();
+    const key = keyFor(t.config);
+    t.repos.cache.seed(key, { status: "qualified", company: { domain: "example.com", organisationName: "Example Ltd", qualificationCategory: "COM" }, checkedAt: new Date(), ttlMs: 60_000 });
+    const record = t.repos.activity.recordObservation.bind(t.repos.activity);
+    t.repos.activity.recordObservation = (input) => new Promise((r) => setTimeout(() => r(record(input)), 600));
+    const deferred: Promise<void>[] = [];
+    const o = await runJob({ ...t.deps, onDeferred: (op) => deferred.push(op) }, t.config, job(IP, 500, ref(3)));
+    expect(o).toMatchObject({ status: "qualified", activity: { recorded: false } });
+    expect(deferred).toHaveLength(1);
+    await Promise.all(deferred);
+    expect(t.repos.activity.observations).toHaveLength(1);
   });
 });

@@ -1,11 +1,13 @@
 /**
- * Black-box verification of the real supervisor process: spawned exactly as
- * in deployment (same entry module), with ALL stdout/stderr captured so child
- * process logs are scanned too. Covers deployment health, graceful shutdown,
- * child reaping and the privacy invariants from the outside.
+ * Black-box verification of the real service process: spawned exactly as in
+ * deployment (same entry module, src/main.ts), with ALL stdout/stderr
+ * captured. Covers deployment health, the single-process model (no child
+ * processes, ever), bounded concurrency, graceful shutdown with drain, and the
+ * privacy invariants from the outside.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { resolve } from "node:path";
 import { startMockEnrichServer, SPECIAL_IPS, type MockServerHandle } from "../../src/provider/mock-server.js";
@@ -20,20 +22,20 @@ const QUALIFIED_IP = "203.0.113.10";
 const TEST_IPS = [QUALIFIED_IP, "203.0.113.11", "203.0.113.13", "2001:db8::10", SPECIAL_IPS.slow, SPECIAL_IPS.serverError, "198.51.100.77"];
 
 /**
- * Live resolver children of the supervisor process. Under tsx the loader may
- * keep a transient esbuild helper as a child too, so only forked resolver
- * children (argv contains the child module path) are counted.
+ * Child processes of the service process. Under tsx the loader may keep a
+ * transient esbuild helper as a child (the container runs compiled
+ * JavaScript and has none), so that helper is the only process excluded.
  */
-function childProcessCount(parentPid: number): number {
+function childProcesses(parentPid: number): string[] {
   try {
     const out = execSync(`ps -o args= --ppid ${parentPid} || true`, { encoding: "utf8" });
-    return out.split("\n").filter((l) => l.includes("child/main")).length;
+    return out.split("\n").filter((l) => l.trim().length > 0 && !/esbuild/.test(l));
   } catch {
-    return 0;
+    return [];
   }
 }
 
-describe("black-box supervisor process", () => {
+describe("black-box service process", () => {
   let proc: ChildProcess;
   let mock: MockServerHandle;
   let db: Db;
@@ -73,13 +75,12 @@ describe("black-box supervisor process", () => {
       ENRICH_TIMEOUT_MS: "700",
       REQUEST_DEADLINE_MS: "1500",
       LEASE_MS: "1200",
-      CHILD_HARD_KILL_GRACE_MS: "300",
-      MAX_CONCURRENT_CHILDREN: "4",
+      MAX_CONCURRENT_JOBS: "4",
       SHUTDOWN_GRACE_MS: "2000",
       PERIOD_CALL_CAP: "100",
       ALLOW_DOCUMENTATION_RANGES: "true",
     };
-    proc = spawn(process.execPath, ["--import", "tsx", resolve("src/supervisor/main.ts")], { env, stdio: ["ignore", "pipe", "pipe"], cwd: resolve(".") });
+    proc = spawn(process.execPath, ["--import", "tsx", resolve("src/main.ts")], { env, stdio: ["ignore", "pipe", "pipe"], cwd: resolve(".") });
     proc.stdout!.on("data", (d: Buffer) => (output += d.toString()));
     proc.stderr!.on("data", (d: Buffer) => (output += d.toString()));
     proc.on("exit", (code, signal) => {
@@ -138,7 +139,7 @@ describe("black-box supervisor process", () => {
     expect(mock.hits(QUALIFIED_IP)).toBe(before);
   });
 
-  it("resolves through a real child, then from cache", async () => {
+  it("resolves in-process, then from cache", async () => {
     const a = await post({ website_id: "site-test", ip: QUALIFIED_IP, request_id: "bb-1" });
     expect(a.status).toBe(200);
     expect(a.json["status"]).toBe("qualified");
@@ -157,22 +158,29 @@ describe("black-box supervisor process", () => {
     expect(r.json["status"]).toBe("uncertain");
   });
 
-  it("handles a burst, keeps children bounded and reaps every child", async () => {
+  it("handles a burst in one process: bounded concurrency, 503 overloaded beyond it, never a child process", async () => {
     const ips = Array.from({ length: 12 }, (_, i) => `198.51.100.${10 + i}`);
-    const results = await Promise.all(ips.map((ip) => post({ website_id: "site-test", ip })));
+    const pending = Promise.all(ips.map((ip) => post({ website_id: "site-test", ip })));
+    // Sampled while the burst is in flight: the service never forks.
+    const during = childProcesses(proc.pid!);
+    const results = await pending;
+    expect(during).toEqual([]);
     for (const r of results) expect([200, 503]).toContain(r.status);
+    for (const r of results.filter((x) => x.status === 503)) expect(r.json).toEqual({ version: "1", error: "overloaded" });
     expect(results.filter((r) => r.status === 200).length).toBeGreaterThan(0);
-    // Children must be gone within a bounded window after the last response.
-    const t0 = Date.now();
-    while (childProcessCount(proc.pid!) > 0 && Date.now() - t0 < 2_000) await new Promise((r) => setTimeout(r, 50));
-    const listing = execSync(`ps -o pid,stat,etimes,args --ppid ${proc.pid} || true`, { encoding: "utf8" });
-    expect(childProcessCount(proc.pid!), listing).toBe(0);
-    const spawnLines = output.split("\n").filter((l) => l.includes('"child_spawned"'));
-    const maxActive = Math.max(...spawnLines.map((l) => Number(/"active_children":(\d+)/.exec(l)?.[1] ?? 0)));
+    expect(childProcesses(proc.pid!)).toEqual([]);
+    const startLines = output.split("\n").filter((l) => l.includes('"job_started"'));
+    expect(startLines.length).toBeGreaterThan(0);
+    const maxActive = Math.max(...startLines.map((l) => Number(/"active_jobs":(\d+)/.exec(l)?.[1] ?? 0)));
     expect(maxActive).toBeLessThanOrEqual(4);
   });
 
-  it("shuts down gracefully on SIGTERM with no children left", async () => {
+  it("carries no IP or secret in its command line", () => {
+    const cmdline = readFileSync(`/proc/${proc.pid}/cmdline`, "utf8");
+    for (const needle of [QUALIFIED_IP, TEST_AUTH_TOKEN, TEST_HMAC_SECRET, "sk_test_placeholder_key", getTestDatabaseUrl()]) expect(cmdline).not.toContain(needle);
+  });
+
+  it("shuts down gracefully on SIGTERM, draining the in-flight job", async () => {
     const inflight = post({ website_id: "site-test", ip: "198.51.100.77" });
     await new Promise((r) => setTimeout(r, 30));
     proc.kill("SIGTERM");
@@ -183,12 +191,14 @@ describe("black-box supervisor process", () => {
     expect(exitSignal).toBeNull();
     expect(output).toContain("server_stopping");
     expect(output).toContain("server_stopped");
-    expect(childProcessCount(proc.pid!)).toBe(0);
+    const stopped = output.split("\n").find((l) => l.includes('"server_stopped"'))!;
+    expect(stopped).toContain('"active_jobs":0');
+    expect(stopped).toContain('"ready":true');
     if (r) expect([200, 503]).toContain(r.status);
     await expect(fetch(`${BASE}/healthz`)).rejects.toThrow();
   });
 
-  it("captured supervisor and child output, database and responses contain no IP, secret or provider-only field", async () => {
+  it("captured process output, database and responses contain no IP, secret or provider-only field", async () => {
     const needles = [
       ...TEST_IPS.flatMap(ipVariants),
       ...Array.from({ length: 12 }, (_, i) => `198.51.100.${10 + i}`),
@@ -201,7 +211,8 @@ describe("black-box supervisor process", () => {
       ...FORBIDDEN_PROVIDER_FIELDS,
     ];
     expect(output.length).toBeGreaterThan(500);
-    expect(output).toContain('"component":"child"');
+    expect(output).toContain('"component":"resolver"');
+    expect(output).toContain('"event":"job_finished"');
     expect(findLeaks(output, needles)).toEqual([]);
     expect(findLeaks(await dumpDatabaseText(db.pool), needles)).toEqual([]);
     expect(output).not.toMatch(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);

@@ -10,8 +10,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/supervisor/main.js",
-    "dev": "tsx src/supervisor/main.ts",
+    "start": "node dist/main.js",
+    "dev": "tsx src/main.ts",
     "migrate": "tsx src/db/migrate.ts",
     "ops:usage": "tsx src/ops/usage.ts",
     "ops:kill-switch": "tsx src/ops/kill-switch.ts",

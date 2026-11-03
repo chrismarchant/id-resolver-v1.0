@@ -12,6 +12,7 @@
  * default "require").
  */
 import { readdir, readFile } from "node:fs/promises";
+import type { QueryConfig, QueryResultRow } from "pg";
 import { pathToFileURL } from "node:url";
 import type { Logger } from "../log/index.js";
 import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from "./pool.js";
@@ -19,6 +20,8 @@ import { createPool, DbError, guarded, toDbError, type Pool, type SslMode } from
 /** Arbitrary constant namespace for the migration advisory lock. */
 const MIGRATION_LOCK_KEY = "7262021001";
 const MIGRATION_STATEMENT_TIMEOUT = "120s";
+/** Client-side bound for migration statements; above the session's 120 s statement_timeout, overriding the pool's short default. */
+const MIGRATION_QUERY_TIMEOUT_MS = 125_000;
 
 export interface MigrateOptions {
   /** Directory containing *.sql files. Defaults to the repository's migrations/. */
@@ -46,14 +49,17 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
 
   return guarded(logger, async () => {
     const client = await pool.connect();
+    // Every statement on this connection gets the migration bound instead of the pool's short client-side timeout.
+    const query = <R extends QueryResultRow = QueryResultRow>(text: string, values?: unknown[]) =>
+      client.query<R>({ text, ...(values ? { values } : {}), query_timeout: MIGRATION_QUERY_TIMEOUT_MS } as QueryConfig);
     try {
-      await client.query(`SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT}'`);
-      await client.query("SELECT pg_advisory_lock($1::bigint)", [MIGRATION_LOCK_KEY]);
+      await query(`SET statement_timeout = '${MIGRATION_STATEMENT_TIMEOUT}'`);
+      await query("SELECT pg_advisory_lock($1::bigint)", [MIGRATION_LOCK_KEY]);
       try {
-        await client.query(
+        await query(
           "CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
         );
-        const done = await client.query<{ name: string }>("SELECT name FROM schema_migrations");
+        const done = await query<{ name: string }>("SELECT name FROM schema_migrations");
         const doneSet = new Set(done.rows.map((r) => r.name));
         const applied: string[] = [];
         const alreadyApplied: string[] = [];
@@ -63,19 +69,19 @@ export async function applyMigrations(pool: Pool, logger?: Logger, options: Migr
             continue;
           }
           try {
-            await client.query("BEGIN");
-            await client.query(sqlByName.get(name) as string);
-            await client.query("INSERT INTO schema_migrations (name, applied_at) VALUES ($1, now())", [name]);
-            await client.query("COMMIT");
+            await query("BEGIN");
+            await query(sqlByName.get(name) as string);
+            await query("INSERT INTO schema_migrations (name, applied_at) VALUES ($1, now())", [name]);
+            await query("COMMIT");
           } catch (err) {
-            await client.query("ROLLBACK").catch(() => undefined);
+            await query("ROLLBACK").catch(() => undefined);
             throw new MigrationError(name, toDbError(err).code);
           }
           applied.push(name);
         }
         return { applied, alreadyApplied };
       } finally {
-        await client.query("SELECT pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]).catch(() => undefined);
+        await query("SELECT pg_advisory_unlock($1::bigint)", [MIGRATION_LOCK_KEY]).catch(() => undefined);
       }
     } finally {
       // Always destroy this connection: it carries a non-default

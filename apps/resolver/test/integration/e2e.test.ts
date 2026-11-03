@@ -1,23 +1,23 @@
 /**
- * Vertical slice: HTTP API -> forked child -> mock Enrich server -> PostgreSQL.
- * Everything is real except the provider, which is the in-repo mock server.
+ * Vertical slice: HTTP API -> in-process runner -> pipeline -> mock Enrich
+ * server -> PostgreSQL. Everything is real except the provider, which is the
+ * in-repo mock server.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { buildChildRuntimeConfig, createChildManager } from "../../src/supervisor/child-manager.js";
+import { buildPipelineConfig, createRunner } from "../../src/runtime/runner.js";
+import { createProvider } from "../../src/provider/index.js";
+import type { Config } from "../../src/config/index.js";
 import { startMockEnrichServer, SPECIAL_IPS, type MockServerHandle } from "../../src/provider/mock-server.js";
 import { createTestDb, resetTestDb } from "../helpers/db.js";
 import { testConfig, TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
-import { compiledChildModulePath } from "../helpers/child.js";
 import { dumpDatabaseText, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
 import type { Db } from "../../src/db/index.js";
-import type { ChildManager } from "../../src/contracts/child-manager.js";
+import type { Runner } from "../../src/contracts/runtime.js";
 import { usagePeriodKey } from "../../src/contracts/db.js";
 
-// Real children run as the compiled artefact (see test/helpers/global-setup.ts).
-const CHILD = compiledChildModulePath();
 const QUALIFIED_IP = "203.0.113.10";
 const EXCLUDED_IP = "203.0.113.11";
 const NO_DOMAIN_IP = "203.0.113.13";
@@ -37,7 +37,7 @@ describe("end-to-end vertical slice", () => {
   let db: Db;
   let mock: MockServerHandle;
   let app: FastifyInstance;
-  let manager: ChildManager;
+  let manager: Runner;
   let logger: ReturnType<typeof createMemoryLogger>;
   // The mock server and logger live for the whole file; tests reason about deltas.
   const baseline = new Map<string, number>();
@@ -52,13 +52,24 @@ describe("end-to-end vertical slice", () => {
     return { status: r.statusCode, body: r.json() as Record<string, unknown>, raw: r.body };
   }
 
+  /** The runner exactly as src/main.ts builds it, over the shared test pool. */
+  function runnerFor(config: Config): Runner {
+    const pipeline = buildPipelineConfig(config);
+    return createRunner({
+      config: pipeline,
+      deps: { cache: db.cache, usage: db.usage, controls: db.controls, companies: db.companies, activity: db.activity, provider: createProvider(pipeline.provider) },
+      logger,
+      capacity: config.MAX_CONCURRENT_JOBS,
+    });
+  }
+
   beforeAll(async () => {
-    db = await createTestDb({ max: 4 });
+    db = await createTestDb({ max: 12 });
     mock = await startMockEnrichServer({ slowMs: 5_000 });
     logger = createMemoryLogger();
     const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "50" });
-    manager = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    app = await buildServer({ config, logger, childManager: manager, ping: () => db.ping() });
+    manager = runnerFor(config);
+    app = await buildServer({ config, logger, runner: manager, ping: () => db.ping() });
     await app.ready();
   });
 
@@ -75,7 +86,7 @@ describe("end-to-end vertical slice", () => {
     await db.close();
   });
 
-  it("resolves a qualified company through a real child and persists only sanitised data", async () => {
+  it("resolves a qualified company in-process and persists only sanitised data", async () => {
     const first = await resolve(QUALIFIED_IP, "e2e-1");
     expect(first.status).toBe(200);
     expect(first.body).toMatchObject({
@@ -166,8 +177,8 @@ describe("end-to-end vertical slice", () => {
   it("persists the uncertain outcome even when the request deadline, not the provider timeout, is the binding limit", async () => {
     // Deadline 1300 ms with a 1 s provider timeout: the deadline-derived budget (deadline minus the 550 ms commit reserve) governs.
     const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", REQUEST_DEADLINE_MS: "1300", ENRICH_TIMEOUT_MS: "1000", LEASE_MS: "3000", SHUTDOWN_GRACE_MS: "2000" });
-    const m3 = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    const app3 = await buildServer({ config, logger, childManager: m3, ping: () => db.ping() });
+    const m3 = runnerFor(config);
+    const app3 = await buildServer({ config, logger, runner: m3, ping: () => db.ping() });
     const r1 = await app3.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: SPECIAL_IPS.slow } });
     expect(r1.json().status).toBe("uncertain");
     const rows = await db.pool.query<{ status: string }>("SELECT status FROM ip_resolution_cache");
@@ -204,9 +215,9 @@ describe("end-to-end vertical slice", () => {
   });
 
   it("honours the call cap under concurrency and keeps serving the cache", async () => {
-    const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "2", MAX_CONCURRENT_CHILDREN: "6" });
-    const m2 = createChildManager({ config, logger, childRuntimeConfig: buildChildRuntimeConfig(config), childModulePath: CHILD });
-    const app2 = await buildServer({ config, logger, childManager: m2, ping: () => db.ping() });
+    const config = testConfig({ PROVIDER_MODE: "live", ENRICH_API_BASE_URL: mock.url, ENRICH_API_KEY: "sk_test_placeholder_key", PERIOD_CALL_CAP: "2", MAX_CONCURRENT_JOBS: "6" });
+    const m2 = runnerFor(config);
+    const app2 = await buildServer({ config, logger, runner: m2, ping: () => db.ping() });
     const ips = ["203.0.113.10", "203.0.113.11", "203.0.113.12", "203.0.113.13", "203.0.113.14"];
     const results = await Promise.all(ips.map((ip) => app2.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip } })));
     const statuses = results.map((r) => r.json().status as string);
@@ -237,14 +248,15 @@ describe("end-to-end vertical slice", () => {
     await db.controls.setEnrichmentEnabled("inst-test", true, "e2e");
   });
 
-  it("children terminate and are reaped; concurrency stays bounded", async () => {
-    await Promise.all(Array.from({ length: 6 }, (_, i) => resolve(`203.0.113.${20 + i}`)));
+  it("jobs settle and free their slots; concurrency stays bounded; excess load gets 503 overloaded", async () => {
+    const results = await Promise.all(Array.from({ length: 6 }, (_, i) => app.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: `203.0.113.${20 + i}` } })));
+    for (const r of results) expect([200, 503]).toContain(r.statusCode);
+    for (const r of results.filter((x) => x.statusCode === 503)) expect(r.json()).toEqual({ version: "1", error: "overloaded" });
     await new Promise((r) => setTimeout(r, 200));
     expect(manager.activeCount()).toBe(0);
-    const spawned = logs().filter((e) => e["event"] === "child_spawned").map((e) => e["active_children"] as number);
-    expect(Math.max(...spawned)).toBeLessThanOrEqual(4);
-    const exits = logs().filter((e) => e["event"] === "child_exit").length;
-    expect(exits).toBeGreaterThan(0);
+    const started = logs().filter((e) => e["event"] === "job_started").map((e) => e["active_jobs"] as number);
+    expect(started.length).toBeGreaterThan(0);
+    expect(Math.max(...started)).toBeLessThanOrEqual(4);
   });
 
   it("leaks no test IP, secret or provider-only field into logs, database or responses", async () => {
@@ -268,7 +280,7 @@ describe("end-to-end vertical slice", () => {
     const dbText = await dumpDatabaseText(db.pool);
     expect(findLeaks(dbText, needles)).toEqual([]);
     expect(findLeaks(responses.join("\n"), needles)).toEqual([]);
-    expect(logText).toContain("child_result");
+    expect(logText).toContain("job_finished");
     // Fingerprints never appear in responses or logs.
     const fps = await db.pool.query<{ hex: string }>("SELECT encode(ip_fingerprint, 'hex') AS hex FROM ip_resolution_cache");
     for (const { hex } of fps.rows) {
@@ -357,7 +369,7 @@ describe("end-to-end vertical slice", () => {
       expect((await db.pool.query("SELECT count(*)::int AS n FROM companies")).rows[0].n).toBe(1);
     });
 
-    it("delayed usage accounting in a real child cannot consume the activity or response budget (Warp P2-3)", async () => {
+    it("delayed usage accounting in the runner cannot consume the activity or response budget (Warp P2-3)", async () => {
       const first = await resolveRef(QUALIFIED_IP, REF(1)); // provider path: creates the usage row and the cache row
       expect(first.body["status"]).toBe("qualified");
       const locker = await db.pool.connect();
@@ -371,13 +383,13 @@ describe("end-to-end vertical slice", () => {
         expect(r.body).toMatchObject({ status: "qualified", source: "cache", previously_seen_company: true, activity_recorded: true, observation_ref: REF(2) });
         expect(hits(QUALIFIED_IP)).toBe(1);
         expect((await observationRows()).rows).toHaveLength(2);
-        // The child's own `db_error{usage_counter_timeout}` lines go to its stdout (unit `pipeline` asserts them);
-        // what this test establishes is the real child's timing, result and exit under a blocked counter.
+        // In-process, the pipeline's own log lines are visible here too.
+        expect(logs().some((e) => e["event"] === "db_error" && e["category"] === "usage_counter_timeout")).toBe(true);
       } finally {
         await locker.query("ROLLBACK").catch(() => undefined);
         locker.release();
       }
-      // The child finishes (tracked deferred accounting, bounded close) and is reaped.
+      // The job settles and frees its slot; the delayed counters are tracked as background writes.
       const until = Date.now() + 4_000;
       while (manager.activeCount() > 0 && Date.now() < until) await new Promise((res) => setTimeout(res, 50));
       expect(manager.activeCount()).toBe(0);

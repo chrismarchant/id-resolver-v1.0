@@ -54,10 +54,12 @@ export const ConfigSchema = z.object({
   ENRICH_AUTH_HEADER: z.enum(["x-api-key", "authorization-bearer"]).default("x-api-key"),
   ENRICH_TIMEOUT_MS: intInRange(200, 10_000, 2_500),
 
-  // Request handling
+  // Request handling (single-process runtime, CHR-70)
   REQUEST_DEADLINE_MS: intInRange(300, 15_000, 4_000),
-  CHILD_HARD_KILL_GRACE_MS: intInRange(100, 10_000, 1_000),
-  MAX_CONCURRENT_CHILDREN: intInRange(1, 64, 8),
+  /** Resolution jobs executing at once in this process; one more is refused with 503 overloaded. */
+  MAX_CONCURRENT_JOBS: intInRange(1, 64, 8),
+  /** The event-loop watchdog kills the process when the loop has been blocked longer than this. */
+  EVENT_LOOP_BLOCK_EXIT_MS: intInRange(1_000, 60_000, 10_000),
   RATE_LIMIT_PER_MINUTE: intInRange(1, 100_000, 600),
   AUTH_FAILURE_LIMIT_PER_MINUTE: intInRange(1, 100_000, 60),
   BODY_LIMIT_BYTES: intInRange(128, 8_192, 1_024),
@@ -96,6 +98,9 @@ export const ConfigSchema = z.object({
 
 export type Config = z.infer<typeof ConfigSchema>;
 
+/** Minimum shutdown time beyond one request deadline, so in-flight jobs can settle before the process exits. */
+export const SHUTDOWN_DRAIN_MARGIN_MS = 500;
+
 export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL"] as const;
 
 export class ConfigError extends Error {
@@ -125,8 +130,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.REPORTING_AUTH_TOKEN !== undefined && cfg.REPORTING_AUTH_TOKEN === cfg.RESOLVER_AUTH_TOKEN) {
     throw new ConfigError("invalid configuration: REPORTING_AUTH_TOKEN must differ from RESOLVER_AUTH_TOKEN");
   }
-  if (cfg.SHUTDOWN_GRACE_MS < cfg.REQUEST_DEADLINE_MS + cfg.CHILD_HARD_KILL_GRACE_MS) {
-    throw new ConfigError("invalid configuration: SHUTDOWN_GRACE_MS must be at least REQUEST_DEADLINE_MS + CHILD_HARD_KILL_GRACE_MS");
+  if (cfg.SHUTDOWN_GRACE_MS < cfg.REQUEST_DEADLINE_MS + SHUTDOWN_DRAIN_MARGIN_MS) {
+    throw new ConfigError(`invalid configuration: SHUTDOWN_GRACE_MS must be at least REQUEST_DEADLINE_MS + ${SHUTDOWN_DRAIN_MARGIN_MS}`);
   }
   return cfg;
 }

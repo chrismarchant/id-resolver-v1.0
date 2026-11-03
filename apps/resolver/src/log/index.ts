@@ -13,14 +13,14 @@ export const LOG_EVENTS = [
   "config_loaded",
   "request_rejected",
   "request_completed",
-  "child_spawned",
-  "child_result",
-  "child_timeout",
-  "child_exit",
-  "child_killed",
-  "child_error",
-  "child_job_started",
-  "child_job_finished",
+  "job_started",
+  "job_finished",
+  "job_timeout",
+  "job_settled",
+  "job_stuck",
+  "job_error",
+  "process_fatal",
+  "event_loop_blocked",
   "provider_call",
   "provider_outcome",
   "cache_lookup",
@@ -47,10 +47,8 @@ export const LOG_FIELDS = [
   "http_status",
   "error_code",
   "duration_ms",
-  "pid",
-  "exit_code",
   "signal",
-  "active_children",
+  "active_jobs",
   "outcome",
   "category",
   "rows",
@@ -105,7 +103,7 @@ function sanitiseFields(fields: LogFields | undefined): Record<string, string | 
 
 export function createLogger(opts: { level: string; component: string; destination?: pino.DestinationStream }): Logger {
   const destination = opts.destination ?? pino.destination({ fd: 1, sync: false });
-  // A closed stdout (EPIPE) must never crash the supervisor or a child.
+  // A closed stdout (EPIPE) must never crash the service.
   (destination as unknown as { on?: (ev: string, fn: () => void) => void }).on?.("error", () => {});
   const base = pino(
     {

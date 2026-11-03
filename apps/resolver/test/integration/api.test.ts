@@ -2,22 +2,21 @@ import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { ChildManagerOverloadedError, type ChildJobRequest, type ChildManager } from "../../src/contracts/child-manager.js";
-import type { ChildOutcome } from "../../src/contracts/ipc.js";
+import { RunnerOverloadedError, type JobRequest, type ResolutionOutcome, type Runner } from "../../src/contracts/runtime.js";
 import { testConfig, TEST_AUTH_TOKEN } from "../helpers/env.js";
 
 const TEST_IP = "203.0.113.77";
 
-function fakeManager(opts: { capacity?: number; outcome?: (job: ChildJobRequest) => Promise<ChildOutcome> } = {}) {
-  const jobs: ChildJobRequest[] = [];
+function fakeRunner(opts: { capacity?: number; outcome?: (job: JobRequest) => Promise<ResolutionOutcome> } = {}) {
+  const jobs: JobRequest[] = [];
   let active = 0;
   const capacity = opts.capacity ?? 4;
-  const manager: ChildManager & { jobs: ChildJobRequest[] } = {
+  const runner: Runner & { jobs: JobRequest[] } = {
     jobs,
     activeCount: () => active,
     capacity: () => capacity,
     async run(job) {
-      if (active >= capacity) throw new ChildManagerOverloadedError();
+      if (active >= capacity) throw new RunnerOverloadedError();
       active += 1;
       jobs.push(job);
       try {
@@ -33,26 +32,28 @@ function fakeManager(opts: { capacity?: number; outcome?: (job: ChildJobRequest)
               },
               source: "provider",
               reason: "provider_resolved",
-            } satisfies ChildOutcome));
+            } satisfies ResolutionOutcome));
       } finally {
         active -= 1;
       }
     },
-    async shutdown() {},
+    async shutdown() {
+      return { drained: true, activeJobs: 0, pendingWrites: 0 };
+    },
   };
-  return manager;
+  return runner;
 }
 
-describe("supervisor API", () => {
+describe("resolver API", () => {
   let app: FastifyInstance;
   let logger: ReturnType<typeof createMemoryLogger>;
-  let manager: ReturnType<typeof fakeManager>;
+  let manager: ReturnType<typeof fakeRunner>;
   let pingOk = true;
 
   beforeAll(async () => {
     logger = createMemoryLogger();
-    manager = fakeManager();
-    app = await buildServer({ config: testConfig(), logger, childManager: manager, ping: async () => pingOk });
+    manager = fakeRunner();
+    app = await buildServer({ config: testConfig(), logger, runner: manager, ping: async () => pingOk });
     await app.ready();
   });
   afterAll(async () => {
@@ -140,7 +141,6 @@ describe("supervisor API", () => {
     expect(r.headers["x-content-type-options"]).toBe("nosniff");
     const job = manager.jobs.at(-1)!;
     expect(job.ip).toBe(TEST_IP);
-    expect(job.requestId).toBe("abc-123");
     expect(job.deadlineAtMs).toBeGreaterThan(Date.now() - 10);
   });
 
@@ -152,30 +152,35 @@ describe("supervisor API", () => {
   });
 
   it("maps overload to 503 and still allows default rendering", async () => {
-    const slow = fakeManager({ capacity: 1, outcome: () => new Promise((resolve) => setTimeout(() => resolve({ status: "no_match", company: null, source: "provider" }), 150)) });
-    const app2 = await buildServer({ config: testConfig(), logger, childManager: slow, ping: async () => true });
+    const slow = fakeRunner({ capacity: 1, outcome: () => new Promise((resolve) => setTimeout(() => resolve({ status: "no_match", company: null, source: "provider" }), 150)) });
+    const app2 = await buildServer({ config: testConfig(), logger, runner: slow, ping: async () => true });
     const p1 = app2.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
     await new Promise((r) => setTimeout(r, 20));
     const r2 = await app2.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
     expect(r2.statusCode).toBe(503);
-    expect(r2.json().error).toBe("overloaded");
+    expect(r2.json()).toEqual({ version: "1", error: "overloaded" });
+    // Readiness reflects capacity: not ready while every job slot is taken.
+    const busy = await app2.inject({ method: "GET", url: "/readyz" });
+    expect(busy.statusCode).toBe(503);
+    expect(busy.json()).toEqual({ ok: false });
     const r1 = await p1;
     expect(r1.statusCode).toBe(200);
     expect(r1.json().status).toBe("no_match");
+    expect((await app2.inject({ method: "GET", url: "/readyz" })).statusCode).toBe(200);
     await app2.close();
   });
 
-  it("strips unexpected fields from a child outcome", async () => {
-    const leaky = fakeManager({
+  it("strips unexpected fields from a runner outcome", async () => {
+    const leaky = fakeRunner({
       outcome: async () =>
         ({
           status: "qualified",
           company: { domain: "example.org", organisation_name: null, qualification: { category: "ORG", source: "provider_usage_type" }, resolved_at: "2026-01-01T00:00:00.000Z", ipRange: "203.0.113.0/24" },
           source: "provider",
           fingerprint: "deadbeef",
-        }) as unknown as ChildOutcome,
+        }) as unknown as ResolutionOutcome,
     });
-    const app3 = await buildServer({ config: testConfig(), logger, childManager: leaky, ping: async () => true });
+    const app3 = await buildServer({ config: testConfig(), logger, runner: leaky, ping: async () => true });
     const r = await app3.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
     expect(r.statusCode).toBe(200);
     expect(r.body).not.toContain("ipRange");
@@ -184,21 +189,23 @@ describe("supervisor API", () => {
     await app3.close();
   });
 
-  it("returns default-safe outcome when the child never answers within the hard stop", async () => {
-    const hang = fakeManager({ outcome: () => new Promise(() => {}) });
-    const cfg = testConfig({ REQUEST_DEADLINE_MS: "400", ENRICH_TIMEOUT_MS: "200", LEASE_MS: "600", CHILD_HARD_KILL_GRACE_MS: "100" });
-    const app4 = await buildServer({ config: cfg, logger, childManager: hang, ping: async () => true });
+  it("server-side deadline race: answers unavailable at the deadline even if the runner never does", async () => {
+    const hang = fakeRunner({ outcome: () => new Promise(() => {}) });
+    const cfg = testConfig({ REQUEST_DEADLINE_MS: "400", ENRICH_TIMEOUT_MS: "200", LEASE_MS: "600" });
+    const app4 = await buildServer({ config: cfg, logger, runner: hang, ping: async () => true });
     const started = Date.now();
     const r = await app4.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
+    const elapsed = Date.now() - started;
     expect(r.statusCode).toBe(200);
     expect(r.json().status).toBe("unavailable");
-    expect(Date.now() - started).toBeLessThan(2000);
+    expect(elapsed).toBeGreaterThanOrEqual(380);
+    expect(elapsed).toBeLessThan(400 + 250);
     await app4.close();
   });
 
   it("applies the deployment rate limit", async () => {
     const cfg = testConfig({ RATE_LIMIT_PER_MINUTE: "3" });
-    const app5 = await buildServer({ config: cfg, logger, childManager: fakeManager(), ping: async () => true });
+    const app5 = await buildServer({ config: cfg, logger, runner: fakeRunner(), ping: async () => true });
     const codes: number[] = [];
     for (let i = 0; i < 5; i += 1) {
       const r = await app5.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } });
@@ -241,7 +248,7 @@ describe("supervisor API", () => {
 
   it("keeps health probes out of the deployment bucket and throttles repeated 401s per peer", async () => {
     const cfg = testConfig({ RATE_LIMIT_PER_MINUTE: "2", AUTH_FAILURE_LIMIT_PER_MINUTE: "3" });
-    const app6 = await buildServer({ config: cfg, logger, childManager: fakeManager(), ping: async () => true });
+    const app6 = await buildServer({ config: cfg, logger, runner: fakeRunner(), ping: async () => true });
     for (let i = 0; i < 10; i += 1) {
       expect((await app6.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
       expect((await app6.inject({ method: "GET", url: "/readyz" })).statusCode).toBe(200);
@@ -271,7 +278,7 @@ describe("supervisor API", () => {
   });
 
   it("answers requests that arrive during shutdown with the contract error and headers", async () => {
-    const app7 = await buildServer({ config: testConfig(), logger, childManager: fakeManager(), ping: async () => true });
+    const app7 = await buildServer({ config: testConfig(), logger, runner: fakeRunner(), ping: async () => true });
     await app7.ready();
     const closing = app7.close();
     const r = await app7.inject({ method: "POST", url: "/v1/resolve", headers: auth, payload: { website_id: "site-test", ip: TEST_IP } }).catch(() => null);

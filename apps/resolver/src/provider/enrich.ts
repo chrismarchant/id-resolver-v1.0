@@ -8,7 +8,7 @@
  */
 import { z } from "zod";
 import type { ProviderAdapter, ProviderErrorCategory, ProviderOutcome } from "../contracts/provider.js";
-import { canonicaliseDomain, canonicaliseOrganisationName, canonicaliseUsageType } from "../child/qualify.js";
+import { canonicaliseDomain, canonicaliseOrganisationName, canonicaliseUsageType } from "../resolution/qualify.js";
 
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;

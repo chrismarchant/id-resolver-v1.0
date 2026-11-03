@@ -1,7 +1,8 @@
 /**
- * Supervisor HTTP layer. Authenticates, validates and bounds every request
- * before any paid processing, then hands exactly one job to the child
- * manager. Nothing here computes fingerprints or touches the provider.
+ * HTTP layer. Authenticates, validates and bounds every request before any
+ * paid processing, then hands exactly one job to the in-process runner
+ * (src/runtime/runner.ts). Nothing here computes fingerprints or touches the
+ * provider.
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import rateLimit from "@fastify/rate-limit";
@@ -9,9 +10,8 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { Config } from "../config/index.js";
 import type { Logger } from "../log/index.js";
 import { API_VERSION, RESOLUTION_STATUSES, type ErrorCode, type ErrorResponse, type ResolveResponse } from "../contracts/api.js";
-import { ChildManagerOverloadedError, ChildManagerStoppedError, type ChildManager } from "../contracts/child-manager.js";
 import type { ReportingRepository } from "../contracts/db.js";
-import type { ChildOutcome } from "../contracts/ipc.js";
+import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
 import { registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
@@ -20,7 +20,7 @@ import { ResolveBodySchema } from "./schema.js";
 export interface ServerDeps {
   config: Config;
   logger: Logger;
-  childManager: ChildManager;
+  runner: Runner;
   /** Readiness probe for dependencies (database). */
   ping: () => Promise<boolean>;
   /** Read-only reporting repository; reporting routes are registered only when both this and REPORTING_AUTH_TOKEN are present. */
@@ -54,7 +54,7 @@ function sendError(reply: FastifyReply, error: ErrorCode, requestId?: string): F
 }
 
 /** Defensive: only pass through fields the contract allows. */
-function toResponse(outcome: ChildOutcome, requestId: string | undefined): ResolveResponse {
+function toResponse(outcome: ResolutionOutcome, requestId: string | undefined): ResolveResponse {
   const status = (RESOLUTION_STATUSES as readonly string[]).includes(outcome.status) ? outcome.status : "unavailable";
   let company: ResolveResponse["company"] = null;
   if (status === "qualified" && outcome.company && typeof outcome.company.domain === "string") {
@@ -84,8 +84,30 @@ function toResponse(outcome: ChildOutcome, requestId: string | undefined): Resol
   };
 }
 
+/**
+ * Server-side deadline race. The runner already answers by the deadline; this
+ * is the independent backstop at the HTTP layer, so a runner defect can never
+ * hold a response past the deadline.
+ */
+function answerByDeadline(run: Promise<ResolutionOutcome>, remainingMs: number): Promise<ResolutionOutcome> {
+  return new Promise<ResolutionOutcome>((resolve, reject) => {
+    const t = setTimeout(() => resolve({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" }), Math.max(0, remainingMs));
+    t.unref();
+    run.then(
+      (o) => {
+        clearTimeout(t);
+        resolve(o);
+      },
+      (e: unknown) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
 export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
-  const { config, logger, childManager } = deps;
+  const { config, logger, runner } = deps;
   const now = deps.now ?? (() => Date.now());
   const checkCredential = createCredentialChecker(config.RESOLVER_AUTH_TOKEN);
   // The reporting credential is separate and read-only; without it the reporting routes refuse everything.
@@ -101,7 +123,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     caseSensitive: true,
     forceCloseConnections: "idle",
     connectionTimeout: 10_000,
-    requestTimeout: config.REQUEST_DEADLINE_MS + config.CHILD_HARD_KILL_GRACE_MS + 2_000,
+    requestTimeout: config.REQUEST_DEADLINE_MS + 2_000,
     // Requests that arrive while closing get the contract's generic error, not Fastify's default body.
     return503OnClosing: false,
     genReqId: () => randomUUID(),
@@ -162,7 +184,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     } catch {
       dbOk = false;
     }
-    const ready = dbOk && childManager.activeCount() < childManager.capacity();
+    // Not ready while every job slot is taken: a load balancer should prefer another instance.
+    const ready = dbOk && runner.activeCount() < runner.capacity();
     logger.debug("readiness", { ready });
     return reply.code(ready ? 200 : 503).send({ ok: ready });
   });
@@ -211,7 +234,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       return sendError(reply, "forbidden", requestId);
     }
 
-    // Syntax check only; eligibility and canonical form are decided in the child.
+    // Syntax check only; eligibility and canonical form are decided by the pipeline.
     const ipCheck = canonicaliseIp(body.ip);
     if (!ipCheck.ok) {
       logger.warn("request_rejected", { route: "/v1/resolve", error_code: "invalid_request", http_status: 400, ...(requestId ? { request_id: requestId } : {}) });
@@ -222,24 +245,15 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // The observation reference is the caller's idempotency key; a generated
     // one makes every request a separate observation (documented behaviour).
     const observationRef = body.observation_ref ?? generateObservationRef();
-    let outcome: ChildOutcome;
+    let outcome: ResolutionOutcome;
     try {
-      const run = childManager.run({ ip: body.ip, ...(requestId ? { requestId } : {}), deadlineAtMs, observationRef });
-      const hardStop = deadlineAtMs - now() + config.CHILD_HARD_KILL_GRACE_MS + 500;
-      outcome = await Promise.race<ChildOutcome>([
-        run,
-        new Promise<ChildOutcome>((resolve) => {
-          const t = setTimeout(() => resolve({ status: "unavailable", company: null, source: "none", reason: "deadline_exceeded" }), hardStop);
-          t.unref();
-          run.then(() => clearTimeout(t), () => clearTimeout(t));
-        }),
-      ]);
+      outcome = await answerByDeadline(runner.run({ ip: body.ip, deadlineAtMs, observationRef }), deadlineAtMs - now());
     } catch (err) {
-      if (err instanceof ChildManagerOverloadedError) {
+      if (err instanceof RunnerOverloadedError) {
         logger.warn("request_rejected", { route: "/v1/resolve", error_code: "overloaded", http_status: 503 });
         return sendError(reply, "overloaded", requestId);
       }
-      if (err instanceof ChildManagerStoppedError) {
+      if (err instanceof RunnerStoppedError) {
         return sendError(reply, "not_ready", requestId);
       }
       logger.error("request_rejected", { route: "/v1/resolve", error_code: "internal", http_status: 500 });

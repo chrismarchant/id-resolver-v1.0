@@ -90,6 +90,7 @@ export function createActivityRepository(pool: Pool, logger?: Logger): ActivityR
       const scopeParams = [input.scope.installationId, input.scope.websiteId];
       return guarded(logger, async () => {
         const client = await pool.connect();
+        let failed = false;
         try {
           await client.query("BEGIN");
           try {
@@ -130,11 +131,14 @@ export function createActivityRepository(pool: Pool, logger?: Logger): ActivityR
             await client.query("COMMIT");
             return { kind: "recorded", observationId: Number(ins.rows[0]!.id), previouslySeen: accepted.previously_seen };
           } catch (err) {
+            failed = true;
             await client.query("ROLLBACK").catch(() => undefined);
             throw err;
           }
         } finally {
-          client.release();
+          // A failed transaction (including a client-side query timeout) may
+          // leave the connection mid-statement: discard it instead of reusing it.
+          client.release(failed);
         }
       });
     },

@@ -4,7 +4,7 @@
  * A domain is never assumed to be the visitor's employer: only an allowlisted
  * provider usage type qualifies it. Everything here is pure and synchronous.
  */
-import type { ChildOutcomeReason, ChildRuntimeConfig } from "../contracts/ipc.js";
+import type { OutcomeReason, PipelineConfig } from "../contracts/runtime.js";
 
 const MAX_DOMAIN_LENGTH = 253;
 const MAX_ORGANISATION_LENGTH = 200;
@@ -48,12 +48,12 @@ export function canonicaliseUsageType(raw: unknown): string | null {
 }
 
 export type Qualification =
-  | { kind: "qualified"; category: string; reason: Extract<ChildOutcomeReason, "provider_resolved"> }
-  | { kind: "excluded"; reason: Extract<ChildOutcomeReason, "provider_excluded_usage_type"> }
-  | { kind: "unknown"; reason: Extract<ChildOutcomeReason, "provider_denied_domain" | "provider_unknown_usage_type"> };
+  | { kind: "qualified"; category: string; reason: Extract<OutcomeReason, "provider_resolved"> }
+  | { kind: "excluded"; reason: Extract<OutcomeReason, "provider_excluded_usage_type"> }
+  | { kind: "unknown"; reason: Extract<OutcomeReason, "provider_denied_domain" | "provider_unknown_usage_type"> };
 
 export type QualificationPolicy = Pick<
-  ChildRuntimeConfig["policy"],
+  PipelineConfig["policy"],
   "qualified_usage_types" | "excluded_usage_types" | "denied_domains"
 >;
 

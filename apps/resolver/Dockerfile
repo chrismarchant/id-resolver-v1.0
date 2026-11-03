@@ -3,6 +3,8 @@
 # runtime stage has production dependencies only. No secrets are copied in;
 # .env files are excluded by .dockerignore. Migrations are NOT run on start:
 # railway.json runs them as a separate preDeployCommand.
+# Single-process runtime (CHR-70): one Node process serves the API and runs
+# every resolution job; NODE_OPTIONS caps its heap.
 
 # ---- Stage 1: build ---------------------------------------------------------
 FROM node:22-bookworm-slim AS build
@@ -33,4 +35,4 @@ WORKDIR /app/apps/resolver
 USER node
 EXPOSE 8080
 ENTRYPOINT ["/app/apps/resolver/scripts/entrypoint.sh"]
-CMD ["node", "dist/supervisor/main.js"]
+CMD ["node", "dist/main.js"]
