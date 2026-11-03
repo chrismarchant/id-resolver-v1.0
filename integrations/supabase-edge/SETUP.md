@@ -30,6 +30,25 @@ projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_a
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
 execution to `service_role` only.
 
+**Before upgrading an existing project**, check its sync state:
+
+```sql
+select installation_id, cursor, needs_resync, status, last_applied_at
+  from public.idr_sync_state;
+select count(*) as open_gaps from public.idr_sync_gaps where resolved_at is null; -- if the table exists
+```
+
+- `cursor is null and last_applied_at is not null` on an install of an earlier release (no
+  `reset_from_cursor` column yet) means a reset or a resync is in flight. The earlier SQL never
+  stored the old position, so this upgrade cannot re-check it, and a prune past it would go
+  unreported. Let the function run until a run drains (`status = ok` or `cursor_rejected`) before
+  upgrading; if that is not possible, treat it as a potential gap: after the upgrade, run
+  `select public.idr_begin_resync('<installation-id>');` once and record the incident.
+- A gap that was open before the upgrade (even one already resynced) stays open, and keeps
+  alerting, until a resync requested after the upgrade has drained: the earlier SQL did not record
+  the generation the rules below rely on. If `open_gaps` is not 0, run `idr_begin_resync` once
+  after the upgrade.
+
 ## 2. Set secrets
 
 Generate the shared scheduler secret (at least 32 random characters) and set the secrets:
