@@ -86,6 +86,23 @@ association.
   2026-12-01. Service settings are applied through the Railway API for now;
   `railway.json` documents the intended settings. Migrating to Railway
   Infrastructure as Code (`.railway/railway.ts`) is a follow-up.
+* **Retention and cache pruning** run once at startup and then every
+  interval, draining in bounded batches within `CACHE_PRUNE_BUDGET_MS`. A run
+  that cannot finish logs `maintenance_backlog` (alert on repeats).
+* **Database TLS (`DATABASE_SSL`).** `require` (the default) verifies the
+  server certificate against the system CA store. `no-verify` encrypts without
+  verifying the certificate. `disable` sends plaintext and must never be used
+  outside local tests.
+  * **Development (temporary):** `no-verify`. The connection runs over
+    Railway's private network (WireGuard-encrypted between services), and the
+    Railway PostgreSQL template presents a self-signed certificate.
+  * **Production (required before Gate 6):** a verified connection, plus a
+    private-network-only database with no public TCP proxy. Either pin the
+    instance's own certificate (a planned `verify-pinned` mode with
+    `DATABASE_CA_CERT`, plus a renewal runbook because the template
+    certificate expires), or use a PostgreSQL provider whose certificate
+    chains to a public CA and keep `require`. `no-verify` is not acceptable
+    in production.
 * **Paid enrichment is off unless** `PROVIDER_MODE=live` and
   `ENRICHMENT_ENABLED=true`.
 * **Spend controls:** an atomic period cap and a runtime kill switch

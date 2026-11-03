@@ -148,6 +148,21 @@ UTC days inside the retained window.
 * **Addition:** tombstones are never pruned by retention, so a consumer that
   resynchronises from the start still receives every erasure.
 
+### Immutability of served items (migration 0007)
+
+* The database rejects (SQLSTATE `23514`) any `UPDATE` of a served
+  observation column, any `UPDATE` or `DELETE` of a tombstone, a `TRUNCATE` of
+  either table (including through `TRUNCATE companies CASCADE`), and any
+  backward move, `DELETE` or `TRUNCATE` of a retention watermark. Items can
+  leave the feed only through retention (which advances the watermark) or an
+  erasure (which writes a tombstone).
+* Limit: these are triggers. A table owner or superuser can still disable
+  them, for example with `session_replication_role = replica`. They protect
+  against application defects and unprivileged changes, not against a
+  compromised owner credential. Running the service under a non-owner
+  database role, distinct from the migration role, is a production hardening
+  step tracked for Gate 6.
+
 ### Bounds and deployment assumptions
 
 * The horizon is **cluster-wide**: any open transaction that holds a
