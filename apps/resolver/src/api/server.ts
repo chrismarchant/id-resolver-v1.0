@@ -8,6 +8,10 @@
  * D2). The response is an acknowledgement `{version, status, source,
  * recorded}`: it never carries company identity, a company id, an IP, a
  * fingerprint or provider data.
+ *
+ * Optional website route: POST /v1/events (contract event.v1, owner decision
+ * D4), registered only when EVENTS_ENABLED=true (src/api/events.ts). It
+ * stores browser events in browser_events only and never reaches the runner.
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import rateLimit from "@fastify/rate-limit";
@@ -25,9 +29,11 @@ import {
   type ErrorResponse,
 } from "../contracts/api.js";
 import type { ReportingRepository } from "../contracts/db.js";
+import type { EventRepository } from "../contracts/event.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
+import { EVENTS_ROUTE, registerEventRoute } from "./events.js";
 import { createCachedProbe, READINESS_CACHE_MS } from "./readiness.js";
 import { deriveFeedCursorKey, registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
 import { EntranceBodySchema } from "./schema.js";
@@ -44,12 +50,15 @@ export interface ServerDeps {
   readinessCacheMs?: number;
   /** Read-only reporting repository; reporting routes are registered only when both this and REPORTING_AUTH_TOKEN are present. */
   reporting?: ReportingRepository;
+  /** Browser event store (event.v1). Required when EVENTS_ENABLED=true; POST /v1/events is registered only then. */
+  events?: EventRepository;
   now?: () => number;
 }
 
 const STATUS_BY_ERROR: Record<ErrorCode, number> = {
   unauthorized: 401,
   forbidden: 403,
+  consent_required: 403,
   invalid_request: 400,
   not_found: 404,
   payload_too_large: 413,
@@ -147,7 +156,15 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     max: config.RATE_LIMIT_PER_MINUTE,
     timeWindow: 60_000,
     // Reporting traffic has its own bucket so it can never starve the website's entrance calls.
-    keyGenerator: (req) => (isReportingRoute(req.routeOptions?.url) ? "reporting" : "deployment"),
+    // Browser events (event.v1) get their own bucket too, bounded by the same
+    // RATE_LIMIT_PER_MINUTE: their volume is driven by page activity that
+    // anyone can generate through the site's public collector route, so it
+    // must never exhaust the budget entrance resolution depends on.
+    keyGenerator: (req) => {
+      const matched = req.routeOptions?.url;
+      if (isReportingRoute(matched)) return "reporting";
+      return matched === EVENTS_ROUTE ? "events" : "deployment";
+    },
     addHeaders: { "x-ratelimit-limit": false, "x-ratelimit-remaining": false, "x-ratelimit-reset": false, "retry-after": true },
     addHeadersOnExceeding: { "x-ratelimit-limit": false, "x-ratelimit-remaining": false, "x-ratelimit-reset": false },
     // The plugin routes this object through the error handler; statusCode selects the mapping.
@@ -277,6 +294,22 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     });
     return reply.code(200).send(response);
   });
+
+  // event.v1 (CHR-64, owner decision D4): the route exists only when enabled.
+  // It accepts the website credential only (the onRequest hook above) and
+  // never reaches the runner, the cache, the company tables or the provider.
+  if (config.EVENTS_ENABLED) {
+    if (!deps.events) throw new Error("EVENTS_ENABLED=true requires an event store");
+    registerEventRoute(app, {
+      scope: { installationId: config.INSTALLATION_ID, websiteId: config.WEBSITE_ID },
+      consentMode: config.EVENT_CONSENT_MODE,
+      events: deps.events,
+      logger,
+      now,
+      sendError,
+      statusOf: (error) => STATUS_BY_ERROR[error],
+    });
+  }
 
   if (deps.reporting && config.REPORTING_AUTH_TOKEN) {
     registerReportingRoutes(app, {

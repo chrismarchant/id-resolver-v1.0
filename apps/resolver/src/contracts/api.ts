@@ -96,6 +96,7 @@ export interface EntranceResponse {
 export const ERROR_CODES = [
   "unauthorized", // 401 missing/invalid credential
   "forbidden", // 403 website_id does not match this installation
+  "consent_required", // 403 event.v1: consent `not_required` refused under EVENT_CONSENT_MODE=required
   "invalid_request", // 400 schema violation, malformed address, occurred_at out of bounds
   "not_found", // 404 unknown route or method (authenticated); reporting: company not observed in this scope
   "payload_too_large", // 413

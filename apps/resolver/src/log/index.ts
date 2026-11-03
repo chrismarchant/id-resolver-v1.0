@@ -70,6 +70,8 @@ export const LOG_FIELDS = [
   "cache_rows",
   "observation_rows",
   "backlog",
+  "events_enabled",
+  "event_consent_mode",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];
