@@ -13,7 +13,9 @@
  * Real PostgreSQL, the real server wiring (cursor key derived from
  * IP_HMAC_SECRET by server.ts), and, end to end, the reference Supabase Edge
  * engine (integrations/supabase-edge/src/core/engine.ts) talking HTTP to the
- * real resolver over loopback with an in-memory projection store.
+ * real resolver over loopback, projecting through the real projection SQL
+ * (integrations/supabase-edge/sql/0001_idr_projection.sql, applied next to
+ * the resolver's tables in the same test database, as CI already does).
  *
  * Synthetic data only: example.* domains, no IPs.
  */
@@ -42,18 +44,12 @@ import {
   resetFeedDb,
   type InsertedObservation,
 } from "../helpers/feed.js";
-// The reference consumer engine, imported from its own workspace so this suite
-// drives the exact code a client deploys (it has no runtime dependencies).
+// The reference consumer engine and its SQL projection store, imported from
+// their own workspace so this suite drives the exact code a client deploys.
 import { runSync } from "../../../../integrations/supabase-edge/src/core/engine.ts";
-import type {
-  ApplyPageArgs,
-  ApplyPageResult,
-  LocalCounts,
-  RecordStatusArgs,
-  Store,
-  SyncConfig,
-  SyncState,
-} from "../../../../integrations/supabase-edge/src/core/types.ts";
+import type { Store, SyncConfig } from "../../../../integrations/supabase-edge/src/core/types.ts";
+import { asRole, ensureProjection, gapRows, newPool, PgStore, truncateAll } from "../../../../integrations/supabase-edge/test/helpers/db.ts";
+import type pg from "pg";
 
 const DAY = 86_400_000;
 const EXPIRED = { version: "1", error: "cursor_expired" };
@@ -292,43 +288,6 @@ describe("reporting feed: cursor-key rotation vs the retention watermark (N1)", 
 
 // ---- end to end: the reference Edge engine against the real resolver ---------
 
-/** In-memory Store with the same compare-and-set semantics as the SQL projection. */
-class MemStore implements Store {
-  cursor: string | null = null;
-  needsResync = false;
-  readonly observations = new Map<string, unknown>();
-  readonly statuses: string[] = [];
-  resets = 0;
-  async getState(): Promise<SyncState> {
-    return { cursor: this.cursor, needsResync: this.needsResync };
-  }
-  async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
-    if (a.expectedCursor !== this.cursor) return { applied: false, observations: 0, tombstones: 0 };
-    let n = 0;
-    for (const it of a.items) {
-      if (it.type === "observation") {
-        this.observations.set(it.observation_id, it);
-        n += 1;
-      }
-    }
-    this.cursor = a.nextCursor;
-    return { applied: true, observations: n, tombstones: 0 };
-  }
-  async recordStatus(a: RecordStatusArgs): Promise<void> {
-    this.statuses.push(a.status);
-    if (a.needsResync !== null) this.needsResync = a.needsResync;
-  }
-  async localCounts(): Promise<LocalCounts> {
-    return { observations: this.observations.size, observedCompanies: 0 };
-  }
-  async resetCursor(expected: string): Promise<boolean> {
-    if (this.cursor !== expected || this.needsResync) return false;
-    this.cursor = null;
-    this.resets += 1;
-    return true;
-  }
-}
-
 describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", () => {
   let db: Db;
   let before: FastifyInstance;
@@ -336,6 +295,10 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
   let beforeUrl: string;
   let afterUrl: string;
   let retention: FeedRetention;
+  /** The projection (idr_* tables and functions) lives in the same database, called as service_role. */
+  let projection: pg.Pool;
+  let store: PgStore;
+  const INSTALLATION = FEED_SCOPE.installationId;
 
   beforeAll(async () => {
     db = await createTestDb({ max: 6 });
@@ -344,12 +307,18 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     beforeUrl = await before.listen({ host: "127.0.0.1", port: 0 });
     afterUrl = await after.listen({ host: "127.0.0.1", port: 0 });
     retention = createFeedRetention(db.pool);
+    projection = newPool();
+    await ensureProjection(projection);
+    store = new PgStore(projection, INSTALLATION);
   });
   beforeEach(async () => {
     await resetFeedDb(db);
+    await truncateAll(projection);
   });
   afterAll(async () => {
     await resetFeedDb(db);
+    await truncateAll(projection);
+    await projection.end();
     await before.close();
     await after.close();
     await db.close();
@@ -358,7 +327,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
   const cfg = (baseUrl: string, over: Partial<SyncConfig> = {}): SyncConfig => ({
     baseUrl,
     token: FEED_REPORTING_TOKEN,
-    installationId: FEED_SCOPE.installationId,
+    installationId: INSTALLATION,
     pageLimit: 2,
     maxPages: 50,
     budgetMs: 30_000,
@@ -369,7 +338,11 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     reconcileDays: 0,
     ...over,
   });
-  const deps = (store: Store) => ({ fetch, store, now: () => Date.now(), sleep: async () => undefined, random: () => 0.5 });
+  const deps = (s: Store) => ({ fetch, store: s, now: () => Date.now(), sleep: async () => undefined, random: () => 0.5 });
+  const projected = async () =>
+    (await projection.query<{ id: string }>("select observation_id::text as id from public.idr_observations where installation_id = $1 order by observation_id", [INSTALLATION])).rows.map((r) => r.id);
+  const syncState = async () =>
+    (await projection.query<{ cursor: string | null; status: string; needs_resync: boolean }>("select cursor, status, needs_resync from public.idr_sync_state where installation_id = $1", [INSTALLATION])).rows[0];
 
   const now = Date.now();
   async function seed(): Promise<{ old: InsertedObservation[]; fresh: InsertedObservation[]; company: number }> {
@@ -381,40 +354,66 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     return { old, fresh, company };
   }
 
-  it("retention pruned past a stalled consumer, then the key rotated: the engine ends in needs_resync, not cursor_rejected", async () => {
-    const { old } = await seed();
-    const store = new MemStore();
+  it("retention pruned past a stalled consumer, then the key rotated: needs_resync AND an idr_sync_gaps row, not cursor_rejected; the row survives the resync", async () => {
+    const { old, fresh } = await seed();
     // One page (obs 1, 2) from the pre-rotation resolver, then the consumer stalls.
     expect((await runSync(cfg(beforeUrl, { maxPages: 1 }), deps(store))).status).toBe("partial");
-    expect([...store.observations.keys()]).toEqual([old[0]!.id, old[1]!.id]);
-    const stalledAt = store.cursor;
+    expect(await projected()).toEqual([old[0]!.id, old[1]!.id]);
+    const stalledAt = (await syncState())!.cursor;
     // Retention (30 days) prunes obs 1-4: obs 3 and 4 were never delivered.
     expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 30), { batch: 100 })).deleted).toBe(4);
 
     // The resolver's IP_HMAC_SECRET is rotated; the engine now talks to it.
-    const r = await runSync(cfg(afterUrl), deps(store));
+    const resets: string[] = [];
+    const watching: Store = {
+      getState: () => store.getState(),
+      applyPage: (a) => store.applyPage(a),
+      recordStatus: (a) => store.recordStatus(a),
+      localCounts: (a, b) => store.localCounts(a, b),
+      resetCursor: (c) => {
+        resets.push(c);
+        return store.resetCursor(c);
+      },
+      recordGap: (k) => store.recordGap(k),
+      resolveGaps: () => store.resolveGaps(),
+    };
+    const r = await runSync(cfg(afterUrl), deps(watching));
     expect(r.status).toBe("needs_resync");
-    expect(store.needsResync).toBe(true);
-    expect(store.statuses).not.toContain("cursor_rejected");
-    expect(store.resets).toBe(0);
-    expect(store.cursor).toBe(stalledAt); // never reset, never advanced past the loss
-    expect([...store.observations.keys()]).toEqual([old[0]!.id, old[1]!.id]);
-    // And it stays that way until an operator resynchronises.
-    expect((await runSync(cfg(afterUrl), deps(store))).status).toBe("needs_resync");
+    expect(r.gap).toEqual({ recorded: true, newGap: true });
+    expect(resets).toEqual([]); // never reset, never cursor_rejected
+    expect(await syncState()).toEqual({ cursor: stalledAt, status: "needs_resync", needs_resync: true });
+    expect(await projected()).toEqual([old[0]!.id, old[1]!.id]);
+    const gaps = await gapRows(projection);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({ installation_id: INSTALLATION, kind: "cursor_expired", expired_cursor: stalledAt, resolved_at: null, resolution: null });
+
+    // It stays that way (one row) until an operator resynchronises.
+    expect((await runSync(cfg(afterUrl), deps(store))).gap).toEqual({ recorded: true, newGap: false });
+    expect(await gapRows(projection)).toHaveLength(1);
+
+    // Operator resync: the drained run marks the gap resolved; obs 3 and 4 stay missing; the row stays.
+    await asRole(projection, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    const resynced = await runSync(cfg(afterUrl), deps(store));
+    expect(resynced).toMatchObject({ status: "ok", gapsResolved: 1 });
+    expect(await projected()).toEqual([old[0]!.id, old[1]!.id, ...fresh.map((f) => f.id)]);
+    const [gap] = await gapRows(projection);
+    expect(gap).toMatchObject({ kind: "cursor_expired", resolution: "full_resync" });
+    expect(gap!.resolved_at).toBeInstanceOf(Date);
   });
 
-  it("control: a rotation while the consumer is at or after the watermark still resets once and replays the retained buffer (cursor_rejected)", async () => {
+  it("control: a rotation while the consumer is at or after the watermark still resets once and replays the retained buffer (cursor_rejected, no gap)", async () => {
     const { fresh, company } = await seed();
-    const store = new MemStore();
     expect((await runSync(cfg(beforeUrl), deps(store))).status).toBe("ok");
     expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 30), { batch: 100 })).deleted).toBe(4);
     const extra = await insertObservation(db.pool, { companyId: company });
 
     const r = await runSync(cfg(afterUrl), deps(store));
     expect(r.status).toBe("cursor_rejected");
-    expect(store.needsResync).toBe(false);
-    expect(store.resets).toBe(1);
-    for (const f of [...fresh, extra]) expect(store.observations.has(f.id)).toBe(true);
+    expect(r.gap).toBeNull();
+    expect((await syncState())!.needs_resync).toBe(false);
+    const ids = await projected();
+    for (const f of [...fresh, extra]) expect(ids).toContain(f.id);
+    expect(await gapRows(projection)).toHaveLength(0);
     expect((await runSync(cfg(afterUrl), deps(store))).status).toBe("ok");
   });
 });

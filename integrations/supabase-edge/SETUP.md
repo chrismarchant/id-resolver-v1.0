@@ -22,8 +22,9 @@ causation.
 ## 1. Apply the SQL
 
 Run `sql/0001_idr_projection.sql` against the project (SQL editor or `supabase db push`
-after copying it into `supabase/migrations/`). It is idempotent. It creates the
-projection tables, the `idr_daily_company_activity` view and the `idr_*` functions, enables
+after copying it into `supabase/migrations/`). It is idempotent (re-run it to upgrade an
+existing project: it adds `idr_sync_gaps` and `idr_sync_state.resync_requested_at`). It creates the
+projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
 execution to `service_role` only.
 
@@ -73,6 +74,7 @@ Follow `sql/schedule.example.sql`: store `idr_sync_url` and `idr_sync_secret` in
 1. Invoke once by hand: `curl -sS -X POST -H "x-idr-sync-secret: $IDR_SYNC_SECRET" https://<project-ref>.supabase.co/functions/v1/idr-sync`
    expect `{"status":"ok", ...}` (or `partial`; the next run continues). A wrong secret gives an empty 401.
 2. `select installation_id, cursor, status, needs_resync, last_run_at from public.idr_sync_state;`
+   and `select count(*) from public.idr_sync_gaps;` (expect 0 on a fresh project).
 3. `select * from public.idr_daily_company_activity order by day desc limit 10;`
 4. Optional: set `IDR_RECONCILE_DAYS=3`; status `reconcile_mismatch` means the projection
    disagrees with the resolver's `/v1/reporting/summary` for those days (see troubleshooting).
@@ -112,25 +114,49 @@ used.
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
-| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start | none: the replay is idempotent and the projection is complete. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync`, so data loss is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
+| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
-| `needs_resync` | resolver answered 410 `cursor_expired` | see below |
+| `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 
-### `needs_resync`
+### `needs_resync` and `idr_sync_gaps`
 
-The sync fell behind the resolver's bounded retention buffer, so some observations were
-pruned before they were pulled. The function stops, **does not advance or skip the cursor**
-and does not call the resolver again until an operator acts. Alert on this status.
+The resolver answered `410 cursor_expired`: the stored position lies behind the resolver's
+bounded retention buffer, so observations **may** have been pruned before they were pulled.
+Treat it as a **potential synchronisation continuity gap**, never as a recovery. In the same
+transaction as setting `needs_resync`, the function appends one row to `public.idr_sync_gaps`
+(`kind = 'cursor_expired'`, `detected_at`, the stored `expired_cursor`, `last_applied_at` = when
+the last page was applied, `last_observed_at` = the newest observation in the projection). While
+that gap is open, repeated runs do not add rows. The function then stops: it **does not advance
+or skip the cursor** and does not call the resolver again until an operator acts. Every such run
+responds `409` with `"gap_recorded": true` and logs `continuity gap: ...` (status and counts only).
+If recording ever failed, the response says `"gap_recorded": false` and the next run retries it.
 
-1. Find out why the sync stalled (disabled schedule, repeated `auth_failed`, outage) and fix it.
+1. Find out why the sync stalled (disabled schedule, repeated `auth_failed`, outage, a rotated
+   resolver `IP_HMAC_SECRET` while far behind) and fix it.
 2. Accept that observations pruned from the resolver buffer in the gap cannot be recovered
    from it. The existing projection is kept (the client owns commercial-history retention).
 3. Restart from the start of the retained buffer:
    `select public.idr_begin_resync('<installation-id>');` (run as `service_role`, e.g. in the SQL editor).
    Replays are idempotent, so overlap with data already stored is harmless.
-4. Run the function once and confirm `status = ok`. To avoid recurrence, schedule more frequently
-   or ask for a longer resolver retention buffer.
+4. Let the function run until a run drains the buffer (`status = ok`). That run sets
+   `resolved_at` and `resolution = 'full_resync'` on the open gap and reports `"gaps_resolved": 1`.
+   **`resolved_at` marks the rebuild from what the resolver still retains, NOT a recovery:**
+   observations pruned before the resync are permanently absent from the projection, and the
+   row stays as the permanent record of the gap (rows are never deleted; `resolved_at` is set
+   once). To avoid recurrence, schedule more frequently or ask for a longer resolver retention
+   buffer.
+
+### Monitoring
+
+- **Alert on any row in `idr_sync_gaps`** (each is an incident in which data may be missing),
+  e.g. `select count(*) from public.idr_sync_gaps where detected_at > now() - interval '1 day';`
+- **Alert, and keep alerting, while any gap is unresolved**:
+  `select id, detected_at, last_applied_at from public.idr_sync_gaps where resolved_at is null;`
+- Also alert on `status = 'needs_resync'` in `idr_sync_state`, on HTTP `409` from the function,
+  and on a run that reports `"gap_recorded": false`.
+- Readers with the `idr_reader` claim can see the gap log (same RLS as the other tables); only
+  `service_role` can write it, through `idr_record_sync_gap` and `idr_resolve_sync_gaps`.
 
 ### `reconcile_mismatch`
 

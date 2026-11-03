@@ -54,7 +54,19 @@ function summary(r: SyncResult): unknown {
     observations: r.observations,
     tombstones: r.tombstones,
     reconcile: r.reconcile === null ? null : { checked: r.reconcile.checked, matched: r.reconcile.matched },
+    // needs_resync: true once the continuity gap is durably in idr_sync_gaps.
+    gap_recorded: r.gap?.recorded === true,
+    gap_new: r.gap?.newGap === true,
+    gaps_resolved: r.gapsResolved,
   };
+}
+
+/** Status, counts and flags only: never cursors, ids, domains or other data. */
+function logLine(r: SyncResult): string {
+  const parts = [`sync ${r.status}`, `pages=${r.pages}`, `observations=${r.observations}`, `tombstones=${r.tombstones}`];
+  if (r.gap !== null) parts.push(`gap_recorded=${r.gap.recorded}`, `gap_new=${r.gap.newGap}`);
+  if (r.gapsResolved > 0) parts.push(`gaps_resolved=${r.gapsResolved}`);
+  return parts.join(" ");
 }
 
 /**
@@ -90,7 +102,14 @@ export async function handleSyncRequest(req: Request, deps: HandlerDeps): Promis
       sleep: deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
       random: deps.random ?? Math.random,
     });
-    deps.log?.(`sync ${result.status} pages=${result.pages}`);
+    deps.log?.(logLine(result));
+    if (result.status === "needs_resync") {
+      deps.log?.(
+        result.gap?.recorded === true
+          ? "continuity gap open (cursor_expired): recorded in idr_sync_gaps; operator action required (idr_begin_resync)"
+          : "continuity gap open (cursor_expired): RECORDING IT FAILED, retried next run; operator action required",
+      );
+    }
     return json(summary(result), HTTP_BY_STATUS[result.status]);
   } catch {
     deps.log?.("sync failed unexpectedly");

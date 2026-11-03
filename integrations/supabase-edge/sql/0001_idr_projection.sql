@@ -66,6 +66,10 @@ create table if not exists public.idr_sync_state (
   updated_at      timestamptz not null default now()
 );
 
+-- Set by idr_begin_resync(); idr_resolve_sync_gaps() closes only gaps detected
+-- before the latest resync request (re-runs: added if missing).
+alter table public.idr_sync_state add column if not exists resync_requested_at timestamptz null;
+
 -- Re-runs on an existing installation: widen the status check (idempotent).
 alter table public.idr_sync_state drop constraint if exists idr_sync_state_status_check;
 alter table public.idr_sync_state add constraint idr_sync_state_status_check
@@ -80,7 +84,79 @@ comment on table public.idr_observations is
 comment on table public.idr_tombstones is
   'Company erasures received from the resolver; the company and its observations are deleted from this projection.';
 comment on table public.idr_sync_state is
-  'Sync cursor and last run status per installation. needs_resync is set when the resolver reports cursor_expired and is cleared only by idr_begin_resync().';
+  'Sync cursor and last run status per installation. needs_resync is set when the resolver reports cursor_expired (a potential continuity gap, recorded in idr_sync_gaps) and is cleared only by idr_begin_resync().';
+
+-- Durable, append-only record of synchronisation continuity gaps. A 410
+-- cursor_expired from the resolver means the consumer's position lies behind
+-- the resolver's retention buffer: observations may have been pruned before
+-- they were pulled. needs_resync/status in idr_sync_state are overwritten by
+-- idr_begin_resync() and the next run; a row here never is. At most one OPEN
+-- (unresolved) gap per installation and kind, so repeated runs or a retry
+-- after a crash never add a duplicate. Rows are never deleted; resolved_at and
+-- resolution are set once, by idr_resolve_sync_gaps(), when the first run
+-- after a resync request has drained the resolver's whole retained buffer.
+-- resolved_at marks that REBUILD, not a recovery: observations pruned before
+-- the resync are permanently absent from this projection.
+create table if not exists public.idr_sync_gaps (
+  id               bigint generated always as identity primary key,
+  installation_id  text        not null,
+  kind             text        not null check (kind in ('cursor_expired')),
+  detected_at      timestamptz not null default now(),
+  -- The consumer's position when the gap was detected (the stale, opaque cursor):
+  -- the exact lower bound of the gap in the resolver's stream.
+  expired_cursor   text        null,
+  -- idr_sync_state.last_applied_at at detection: when the consumer last applied a page.
+  last_applied_at  timestamptz null,
+  -- Newest observed_at in this projection at detection (approximate data bound:
+  -- the stream is ordered by commit, not by observed_at).
+  last_observed_at timestamptz null,
+  resolved_at      timestamptz null,
+  resolution       text        null check (resolution is null or resolution in ('full_resync')),
+  constraint idr_sync_gaps_resolution_pair check ((resolved_at is null) = (resolution is null))
+);
+create unique index if not exists idr_sync_gaps_one_open_idx
+  on public.idr_sync_gaps (installation_id, kind) where resolved_at is null;
+
+comment on table public.idr_sync_gaps is
+  'Append-only record of potential synchronisation continuity gaps (resolver 410 cursor_expired). One row per incident, never deleted. resolved_at marks the rebuild from the retained buffer after idr_begin_resync(), NOT recovery: observations pruned before the resync are permanently missing. Alert on any row, and on any row with resolved_at is null.';
+
+-- Guard: no DELETE, no TRUNCATE; an UPDATE may only resolve an open gap, once,
+-- and change nothing else. Stops mistakes and the service_role path; a table
+-- owner or superuser can still disable triggers.
+create or replace function public.idr_sync_gaps_guard()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if tg_op in ('DELETE', 'TRUNCATE') then
+    raise exception 'idr_sync_gaps is append-only' using errcode = '23514';
+  end if;
+  if old.resolved_at is not null then
+    raise exception 'idr_sync_gaps: gap already resolved' using errcode = '23514';
+  end if;
+  if new.resolved_at is null or new.resolution is null
+     or new.id is distinct from old.id
+     or new.installation_id is distinct from old.installation_id
+     or new.kind is distinct from old.kind
+     or new.detected_at is distinct from old.detected_at
+     or new.expired_cursor is distinct from old.expired_cursor
+     or new.last_applied_at is distinct from old.last_applied_at
+     or new.last_observed_at is distinct from old.last_observed_at then
+    raise exception 'idr_sync_gaps: only an open gap may be resolved, once' using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists idr_sync_gaps_guard_row on public.idr_sync_gaps;
+create trigger idr_sync_gaps_guard_row
+  before update or delete on public.idr_sync_gaps
+  for each row execute function public.idr_sync_gaps_guard();
+drop trigger if exists idr_sync_gaps_guard_truncate on public.idr_sync_gaps;
+create trigger idr_sync_gaps_guard_truncate
+  before truncate on public.idr_sync_gaps
+  for each statement execute function public.idr_sync_gaps_guard();
 
 -- Daily activity per company, UTC days. security_invoker: the view runs with
 -- the caller's privileges and RLS, so it exposes nothing the caller could not
@@ -118,19 +194,23 @@ alter table public.idr_companies    enable row level security;
 alter table public.idr_observations enable row level security;
 alter table public.idr_tombstones   enable row level security;
 alter table public.idr_sync_state   enable row level security;
+alter table public.idr_sync_gaps    enable row level security;
 
 revoke all on table public.idr_companies, public.idr_observations, public.idr_tombstones,
-  public.idr_sync_state, public.idr_daily_company_activity from public, anon, authenticated;
+  public.idr_sync_state, public.idr_sync_gaps, public.idr_daily_company_activity from public, anon, authenticated;
 grant select on public.idr_companies, public.idr_observations, public.idr_tombstones,
-  public.idr_sync_state, public.idr_daily_company_activity to authenticated;
+  public.idr_sync_state, public.idr_sync_gaps, public.idr_daily_company_activity to authenticated;
 grant select, insert, update, delete on public.idr_companies, public.idr_observations,
   public.idr_tombstones, public.idr_sync_state to service_role;
+-- Append-only: no DELETE or TRUNCATE privilege for anyone but the owner (and the guard trigger).
+revoke all on table public.idr_sync_gaps from service_role;
+grant select, insert, update on public.idr_sync_gaps to service_role;
 grant select on public.idr_daily_company_activity to service_role;
 
 do $$
 declare t text;
 begin
-  foreach t in array array['idr_companies','idr_observations','idr_tombstones','idr_sync_state'] loop
+  foreach t in array array['idr_companies','idr_observations','idr_tombstones','idr_sync_state','idr_sync_gaps'] loop
     execute format('drop policy if exists %I on public.%I', t || '_authenticated_read', t);
     execute format($f$create policy %I on public.%I for select to authenticated using (coalesce((select auth.jwt()) -> 'app_metadata' ->> 'idr_reader', '') = 'true')$f$, t || '_authenticated_read', t);
     execute format('drop policy if exists %I on public.%I', t || '_service_all', t);
@@ -154,7 +234,10 @@ as $$
   select coalesce(
     (select jsonb_build_object('cursor', s.cursor, 'needs_resync', s.needs_resync)
        from public.idr_sync_state s where s.installation_id = p_installation_id),
-    jsonb_build_object('cursor', null, 'needs_resync', false));
+    jsonb_build_object('cursor', null, 'needs_resync', false))
+    || jsonb_build_object('gap_open', exists (
+         select 1 from public.idr_sync_gaps g
+          where g.installation_id = p_installation_id and g.resolved_at is null));
 $$;
 
 -- Applies one feed page atomically, only if the stored cursor equals
@@ -253,8 +336,9 @@ $$;
 -- Automatic recovery when the resolver rejects a stored cursor (400, e.g. its
 -- cursor MAC key rotated). Compare-and-set so concurrent runs stay safe; the
 -- projection is kept and the replay from the buffer start is idempotent. This
--- is NOT for cursor_expired (410): that means data was missed and still needs
--- the operator action idr_begin_resync().
+-- is NOT for cursor_expired (410): that is a potential continuity gap, recorded
+-- in idr_sync_gaps by idr_record_sync_gap(), and needs the operator action
+-- idr_begin_resync().
 create or replace function public.idr_reset_cursor(p_installation_id text, p_expected_cursor text)
 returns jsonb
 language plpgsql
@@ -276,18 +360,87 @@ $$;
 
 -- Operator action after cursor_expired: restart from the start of the
 -- resolver's retained buffer. The projection is kept (the client owns
--- commercial-history retention); replays are idempotent.
+-- commercial-history retention); replays are idempotent. This rebuilds from
+-- what the resolver still retains; it does NOT recover observations pruned
+-- before the resync. The gap row in idr_sync_gaps stays.
 create or replace function public.idr_begin_resync(p_installation_id text)
 returns jsonb
 language plpgsql
 set search_path = ''
 as $$
 begin
-  insert into public.idr_sync_state as s (installation_id, status, needs_resync, cursor)
-    values (p_installation_id, 'resync_requested', false, null)
+  insert into public.idr_sync_state as s (installation_id, status, needs_resync, cursor, resync_requested_at)
+    values (p_installation_id, 'resync_requested', false, null, now())
     on conflict (installation_id) do update
-      set cursor = null, needs_resync = false, status = 'resync_requested', updated_at = now();
+      set cursor = null, needs_resync = false, status = 'resync_requested',
+          resync_requested_at = now(), updated_at = now();
   return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Called by the engine on 410 cursor_expired (and on every run that finds
+-- needs_resync already set). In ONE transaction: marks needs_resync and the
+-- status, and records the gap unless an open gap of this kind already exists
+-- (the partial unique index makes that race-free). The bounds come from the
+-- stored state, not from the caller. Returns {recorded, new, gap_id}.
+create or replace function public.idr_record_sync_gap(p_installation_id text, p_kind text)
+returns jsonb
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_cursor text;
+  v_last_applied timestamptz;
+  v_id bigint;
+begin
+  if p_installation_id is null or p_installation_id = '' or p_kind is distinct from 'cursor_expired' then
+    raise exception 'invalid_arguments' using errcode = '22023';
+  end if;
+  insert into public.idr_sync_state (installation_id) values (p_installation_id)
+    on conflict (installation_id) do nothing;
+  select s.cursor, s.last_applied_at into v_cursor, v_last_applied
+    from public.idr_sync_state s where s.installation_id = p_installation_id for update;
+  update public.idr_sync_state
+     set status = 'needs_resync', needs_resync = true, last_run_at = now(), updated_at = now()
+   where installation_id = p_installation_id;
+  insert into public.idr_sync_gaps (installation_id, kind, expired_cursor, last_applied_at, last_observed_at)
+    values (p_installation_id, p_kind, v_cursor, v_last_applied,
+            (select max(o.observed_at) from public.idr_observations o where o.installation_id = p_installation_id))
+    on conflict (installation_id, kind) where resolved_at is null do nothing
+    returning id into v_id;
+  if v_id is not null then
+    return jsonb_build_object('recorded', true, 'new', true, 'gap_id', v_id);
+  end if;
+  select g.id into v_id from public.idr_sync_gaps g
+   where g.installation_id = p_installation_id and g.kind = p_kind and g.resolved_at is null;
+  return jsonb_build_object('recorded', v_id is not null, 'new', false, 'gap_id', v_id);
+end;
+$$;
+
+-- Called by the engine after a run that drained the resolver's buffer while a
+-- gap was open. Resolves only gaps detected before the latest resync request,
+-- and only while no new resync is pending: the drain then proves the
+-- projection was rebuilt from the start of the retained buffer. That is the
+-- meaning of resolved_at; the pruned observations stay missing.
+create or replace function public.idr_resolve_sync_gaps(p_installation_id text)
+returns jsonb
+language plpgsql
+set search_path = ''
+as $$
+declare
+  v_rows int;
+begin
+  update public.idr_sync_gaps g
+     set resolved_at = now(), resolution = 'full_resync'
+    from public.idr_sync_state s
+   where g.installation_id = p_installation_id
+     and g.resolved_at is null
+     and s.installation_id = p_installation_id
+     and not s.needs_resync
+     and s.resync_requested_at is not null
+     and g.detected_at <= s.resync_requested_at;
+  get diagnostics v_rows = row_count;
+  return jsonb_build_object('resolved', v_rows);
 end;
 $$;
 
@@ -312,9 +465,16 @@ revoke all on function public.idr_record_sync_status(text, text, boolean) from p
 revoke all on function public.idr_begin_resync(text) from public, anon, authenticated;
 revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
 revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated;
+revoke all on function public.idr_record_sync_gap(text, text) from public, anon, authenticated;
+revoke all on function public.idr_resolve_sync_gaps(text) from public, anon, authenticated;
+revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
 grant execute on function public.idr_begin_resync(text) to service_role;
 grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
+grant execute on function public.idr_record_sync_gap(text, text) to service_role;
+grant execute on function public.idr_resolve_sync_gaps(text) to service_role;
+-- A trigger function cannot be called directly; the grant only mirrors the others.
+grant execute on function public.idr_sync_gaps_guard() to service_role;
