@@ -1,8 +1,9 @@
 # ID Resolver V1 — architecture
 
-Status: Gate 2 (development baseline). Owner-approved reduction of the V0.1
-resolver (see [PROVENANCE.md](PROVENANCE.md)). Items marked *(in progress)* are
-not implemented yet.
+Status: Gate 2/3 (development). Owner-approved reduction of the V0.1 resolver
+(see [PROVENANCE.md](PROVENANCE.md)). Items marked *(implemented, pending
+review)* are built and tested but await the independent security review
+(CHR-66); items marked *(planned)* are not implemented yet.
 
 ## Deployment model
 
@@ -45,30 +46,30 @@ Browser ─document request─▶ CDN ─▶ TanStack Start site (Lovable; Nitro
 
 | | Decision |
 |---|---|
-| D1 | Replace fork-per-request child processes with a single-process runner, preserving deadline, concurrency, crash-containment and IP-hygiene controls, with independent review *(in progress, CHR-70)* |
-| D2 | Identification only: non-blocking `POST /v1/entrances`; status/ack response with no company data *(in progress)* |
+| D1 | Replace fork-per-request child processes with a single-process runner, preserving deadline, concurrency, crash-containment and IP-hygiene controls, with independent review *(implemented, pending review: CHR-70)* |
+| D2 | Identification only: non-blocking `POST /v1/entrances`; status/ack response with no company data *(implemented, pending review)* |
 | D3 | Observation retention in the resolver is a **configurable, bounded synchronisation buffer**. There is no fixed long default without a documented operational and privacy justification. The client Insights environment owns commercial-history retention. |
 | D4 | **No browser-to-company matching in V1**, not even flagged-off code. The optional collector records approved, consent-gated semantic events only. |
 | D5 | Server adapter and collector are published to public npm under an owner-controlled scope |
-| D6 | V0.1 migrations are squashed into one V1 baseline, with a schema-equivalence test *(in progress)* |
+| D6 | V0.1 migrations are squashed into one V1 baseline, with a schema-equivalence test *(planned: after the feed review)* |
 | D7 | Isolated Railway development project, mock provider only |
 | D8 | Public-repository hygiene verified by evidence (see [PUBLIC_REPO_SECURITY.md](PUBLIC_REPO_SECURITY.md)) |
 | D9 | The separate Signals Gateway work is out of scope |
 
 ## Interfaces
 
-**Website → resolver** *(in progress)*: `POST /v1/entrances`
+**Website → resolver** *(implemented, pending review)*: `POST /v1/entrances`
 `{contract:"entrance.v1", website_id, ip, entrance_id, occurred_at, page_key, acquisition, eligibility}`
 → `{version, status, source, recorded}`.
 
 * `page_key` is the normalised path only (no query string or fragment).
 * `acquisition` is a closed enum derived on the website server; raw referrer and UTM values are never sent.
 * `entrance_id` is the idempotency key.
-* The inherited V0.1 `POST /v1/resolve` remains until it is replaced.
+* The inherited V0.1 `POST /v1/resolve` has been removed (it returned company data to the website).
 
 **Insights → resolver** (read-only, separate credential):
 * existing: `GET /v1/reporting/companies`, `/companies/:id`, `/summary`
-* *(in progress, CHR-71)*: `GET /v1/reporting/observations?after=<cursor>`, a scope-wide feed with commit-safe ordering and company-erasure tombstones. Its correctness must be demonstrated under out-of-order commits, retries, duplicate delivery, pagination, tombstones and interruption recovery before it is relied on.
+* *(implemented, pending review: CHR-71)*: `GET /v1/reporting/observations?after=<cursor>`, a scope-wide feed with commit-safe ordering and company-erasure tombstones. Its proof suite (`apps/resolver/test/integration/feed-*.test.ts`) covers out-of-order commits, retries, duplicate delivery, pagination, tombstones, interruption recovery, long-running transactions, randomised concurrency and retention expiry.
 
 **Browser collector → website** *(Gate 4)*: first-party route on the website;
 consent-gated closed event vocabulary; no IP forwarded and no company
@@ -77,8 +78,14 @@ association.
 ## Operations
 
 * **Migrations never run on application start.** Railway runs
-  `node dist/db/migrate.js` as the `preDeployCommand` (advisory-locked,
-  forward-only); a failed migration fails the deployment.
+  `node dist/db/migrate.js` as the pre-deploy command (advisory-locked,
+  forward-only); a failed migration fails the deployment. The service also
+  **refuses to start while migrations are pending**.
+* **Railway configuration:** Railway Config as Code (`railway.json`) is
+  deprecated: new services cannot opt in, and it stops being read on
+  2026-12-01. Service settings are applied through the Railway API for now;
+  `railway.json` documents the intended settings. Migrating to Railway
+  Infrastructure as Code (`.railway/railway.ts`) is a follow-up.
 * **Paid enrichment is off unless** `PROVIDER_MODE=live` and
   `ENRICHMENT_ENABLED=true`.
 * **Spend controls:** an atomic period cap and a runtime kill switch

@@ -20,7 +20,7 @@ export async function createTestDb(opts: { max?: number } = {}): Promise<Db> {
 /** Truncates every application table (not schema_migrations). */
 export async function resetTestDb(db: Db): Promise<void> {
   await db.pool.query(
-    "TRUNCATE TABLE company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE",
+    "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE",
   );
 }
 

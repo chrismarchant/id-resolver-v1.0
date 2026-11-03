@@ -2,17 +2,16 @@
  * Reporting API (v1) over the real reporting repository and PostgreSQL:
  * credential separation, scope from configuration, cursor pagination, UTC
  * date bounds, bounded limits, 404 for companies outside the scope, and no
- * leakage of fingerprints, IPs or provider fields. The resolver route is
- * exercised with a fake child manager to check the new response fields and
- * the observation_ref pass-through.
+ * leakage of fingerprints, IPs or provider fields. The website route
+ * (POST /v1/entrances) is exercised only to prove credential separation; its
+ * contract is covered by test/integration/api.test.ts (V0.1's /v1/resolve
+ * activity-field assertions were ported there to entrance_id).
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { buildServer, generateObservationRef } from "../../src/api/server.js";
-import { OBSERVATION_REF_PATTERN } from "../../src/contracts/api.js";
-import { ChildManagerOverloadedError, type ChildJobRequest, type ChildManager } from "../../src/contracts/child-manager.js";
-import type { ChildOutcome } from "../../src/contracts/ipc.js";
+import { buildServer } from "../../src/api/server.js";
 import type { ObservationScope } from "../../src/contracts/db.js";
+import type { JobRequest, ResolutionOutcome, Runner } from "../../src/contracts/runtime.js";
 import type { Db } from "../../src/db/index.js";
 import { createMemoryLogger } from "../../src/log/index.js";
 import { createTestDb, resetTestDb, testKey } from "../helpers/db.js";
@@ -27,30 +26,22 @@ const at = (ms: number) => new Date(T0.getTime() + ms);
 const ref = (n: number | string) => `obsref-${String(n).padStart(16, "0")}`;
 const TEST_IP = "203.0.113.77";
 
-function qualifiedOutcome(activity?: ChildOutcome["activity"]): ChildOutcome {
-  return {
-    status: "qualified",
-    company: { domain: "example.com", organisation_name: "Example Ltd", qualification: { category: "COM", source: "provider_usage_type" }, resolved_at: "2026-10-26T00:00:00.000Z" },
-    source: "provider",
-    reason: "provider_resolved",
-    ...(activity ? { activity } : {}),
-  };
-}
-
-function fakeManager(outcome: (job: ChildJobRequest) => ChildOutcome) {
-  const jobs: ChildJobRequest[] = [];
-  const manager: ChildManager & { jobs: ChildJobRequest[] } = {
+/** Records jobs and answers no_match; reporting tests never need a real resolution. */
+function fakeRunner() {
+  const jobs: JobRequest[] = [];
+  const runner: Runner & { jobs: JobRequest[] } = {
     jobs,
     activeCount: () => 0,
     capacity: () => 4,
-    async run(job) {
-      if (jobs.length > 1_000) throw new ChildManagerOverloadedError();
+    async run(job): Promise<ResolutionOutcome> {
       jobs.push(job);
-      return outcome(job);
+      return { status: "no_match", source: "provider" };
     },
-    async shutdown() {},
+    async shutdown() {
+      return { drained: true, activeJobs: 0, pendingWrites: 0 };
+    },
   };
-  return manager;
+  return runner;
 }
 
 async function seedCompany(db: Db, label: string, domain: string, scope: ObservationScope, observations: { ref: string; at: Date; source?: "cache" | "provider" }[]): Promise<number> {
@@ -69,23 +60,20 @@ describe("reporting API", () => {
   let db: Db;
   let app: FastifyInstance;
   let logger: ReturnType<typeof createMemoryLogger>;
-  let manager: ReturnType<typeof fakeManager>;
-  let outcomeFor: (job: ChildJobRequest) => ChildOutcome = () => qualifiedOutcome();
+  let runner: ReturnType<typeof fakeRunner>;
   const reportingAuth = { authorization: `Bearer ${REPORTING_TOKEN}` };
-  const resolverAuth = { authorization: `Bearer ${TEST_AUTH_TOKEN}`, "content-type": "application/json" };
 
   beforeAll(async () => {
     db = await createTestDb({ max: 6 });
     logger = createMemoryLogger();
-    manager = fakeManager((job) => outcomeFor(job));
+    runner = fakeRunner();
     const config = testConfig({ REPORTING_AUTH_TOKEN: REPORTING_TOKEN });
-    app = await buildServer({ config, logger, childManager: manager, ping: () => db.ping(), reporting: db.reporting });
+    app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting });
     await app.ready();
   });
   beforeEach(async () => {
     await resetTestDb(db);
-    manager.jobs.length = 0;
-    outcomeFor = () => qualifiedOutcome();
+    runner.jobs.length = 0;
   });
   afterAll(async () => {
     await app.close();
@@ -104,14 +92,15 @@ describe("reporting API", () => {
       }
     });
 
-    it("rejects the reporting credential on /v1/resolve", async () => {
-      const r = await app.inject({ method: "POST", url: "/v1/resolve", headers: { authorization: `Bearer ${REPORTING_TOKEN}`, "content-type": "application/json" }, payload: { website_id: "site-test", ip: TEST_IP } });
+    it("rejects the reporting credential on /v1/entrances", async () => {
+      const payload = { contract: "entrance.v1", website_id: "site-test", ip: TEST_IP, entrance_id: ref("cred"), occurred_at: new Date().toISOString(), page_key: "/", acquisition: "direct", eligibility: "tsa-1" };
+      const r = await app.inject({ method: "POST", url: "/v1/entrances", headers: { authorization: `Bearer ${REPORTING_TOKEN}`, "content-type": "application/json" }, payload });
       expect(r.statusCode).toBe(401);
-      expect(manager.jobs).toHaveLength(0);
+      expect(runner.jobs).toHaveLength(0);
     });
 
     it("serves nothing on the reporting routes when REPORTING_AUTH_TOKEN is not configured", async () => {
-      const bare = await buildServer({ config: testConfig(), logger: createMemoryLogger(), childManager: manager, ping: () => db.ping(), reporting: db.reporting });
+      const bare = await buildServer({ config: testConfig(), logger: createMemoryLogger(), runner, ping: () => db.ping(), reporting: db.reporting });
       await bare.ready();
       try {
         await seedCompany(db, "a", "example.com", SCOPE, [{ ref: ref(1), at: at(0) }]);
@@ -294,62 +283,6 @@ describe("reporting API", () => {
         "version",
         "website_id",
       ]);
-    });
-  });
-
-  describe("/v1/resolve activity fields", () => {
-    const post = (payload: Record<string, unknown>) => app.inject({ method: "POST", url: "/v1/resolve", headers: resolverAuth, payload });
-
-    it("passes a valid observation_ref to the child and echoes the activity fields on a qualified response", async () => {
-      outcomeFor = (job) => qualifiedOutcome({ company_id: 42, previously_seen: true, recorded: true, observation_ref: job.observationRef });
-      const r = await post({ website_id: "site-test", ip: TEST_IP, observation_ref: ref(1) });
-      expect(r.statusCode).toBe(200);
-      expect(manager.jobs[0]!.observationRef).toBe(ref(1));
-      expect(r.json()).toMatchObject({ status: "qualified", company_id: 42, previously_seen_company: true, activity_recorded: true, observation_ref: ref(1) });
-      expect(Object.keys(r.json()).sort()).toEqual(["activity_recorded", "company", "company_id", "observation_ref", "previously_seen_company", "source", "status", "version"]);
-    });
-
-    it("generates a distinct random reference per request when the caller omits it", async () => {
-      await post({ website_id: "site-test", ip: TEST_IP });
-      await post({ website_id: "site-test", ip: TEST_IP });
-      const refs = manager.jobs.map((j) => j.observationRef);
-      expect(refs).toHaveLength(2);
-      expect(refs[0]).not.toBe(refs[1]);
-      for (const x of refs) expect(x).toMatch(OBSERVATION_REF_PATTERN);
-      expect(generateObservationRef()).toMatch(OBSERVATION_REF_PATTERN);
-      expect(generateObservationRef()).toHaveLength(22);
-    });
-
-    it("rejects malformed observation_ref values with 400 before any child runs", async () => {
-      for (const bad of ["short", "x".repeat(65), "has space 0123456789abcdef", "obs/ref/0123456789abcdef", 123, null, ""]) {
-        const r = await post({ website_id: "site-test", ip: TEST_IP, observation_ref: bad });
-        expect(r.statusCode, String(bad)).toBe(400);
-      }
-      expect(manager.jobs).toHaveLength(0);
-    });
-
-    it("omits the activity fields when the child reports none, on failures and on non-qualified outcomes", async () => {
-      outcomeFor = () => qualifiedOutcome();
-      const plain = await post({ website_id: "site-test", ip: TEST_IP, observation_ref: ref(1) });
-      expect(Object.keys(plain.json()).sort()).toEqual(["company", "source", "status", "version"]);
-      outcomeFor = (job) => qualifiedOutcome({ company_id: 7, previously_seen: null, recorded: false, observation_ref: job.observationRef });
-      const failed = await post({ website_id: "site-test", ip: TEST_IP, observation_ref: ref(2) });
-      expect(failed.json()).toMatchObject({ status: "qualified", company_id: 7, previously_seen_company: null, activity_recorded: false, observation_ref: ref(2) });
-      outcomeFor = () => ({ status: "no_match", company: null, source: "cache", reason: "cache_fresh" });
-      const none = await post({ website_id: "site-test", ip: TEST_IP, observation_ref: ref(3) });
-      expect(Object.keys(none.json()).sort()).toEqual(["company", "source", "status", "version"]);
-    });
-
-    it("logs the company id and recorded flag but never the reference, the IP or the domain", async () => {
-      outcomeFor = (job) => qualifiedOutcome({ company_id: 42, previously_seen: false, recorded: true, observation_ref: job.observationRef });
-      const start = logger.entries.length;
-      await post({ website_id: "site-test", ip: TEST_IP, observation_ref: ref(1) });
-      const completed = logger.entries.slice(start).find((l) => l["event"] === "request_completed");
-      expect(completed).toMatchObject({ company_id: 42, recorded: true });
-      const text = JSON.stringify(logger.entries.slice(start));
-      expect(text).not.toContain(ref(1));
-      expect(text).not.toContain(TEST_IP);
-      expect(text).not.toContain("example.com");
     });
   });
 });

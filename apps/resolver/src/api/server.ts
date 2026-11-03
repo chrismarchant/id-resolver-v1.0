@@ -28,7 +28,7 @@ import type { ReportingRepository } from "../contracts/db.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
-import { registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
+import { deriveFeedCursorKey, registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
 import { EntranceBodySchema } from "./schema.js";
 
 export const ENTRANCES_ROUTE = "/v1/entrances";
@@ -273,6 +273,11 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       reporting: deps.reporting,
       logger,
       sendError,
+      // reporting-feed.v1 (CHR-71): cursor MAC key derived from the server-only
+      // IP_HMAC_SECRET with a dedicated label; the consumer holds the reporting
+      // token, so it must not key the cursor. Rotating the secret invalidates
+      // outstanding cursors (400) and consumers resynchronise idempotently.
+      feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
     });
   }
 

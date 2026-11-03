@@ -27,7 +27,15 @@ export interface CreatePoolOptions {
   statementTimeoutMs?: number;
   /** Client-side bound per query; defaults to the statement timeout plus QUERY_TIMEOUT_MARGIN_MS. */
   queryTimeoutMs?: number;
+  /**
+   * Server-side bound on a session idling inside an open transaction. A stalled
+   * writer otherwise holds its transaction id open and with it the
+   * reporting-feed horizon (CHR-71), which statement_timeout alone cannot bound.
+   */
+  idleInTransactionTimeoutMs?: number;
 }
+
+export const DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = 5_000;
 
 export const DEFAULT_POOL_MAX = 2;
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 3_000;
@@ -70,6 +78,7 @@ export function createPool(opts: CreatePoolOptions): Pool {
     max: opts.max ?? DEFAULT_POOL_MAX,
     statement_timeout: opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS,
     query_timeout: opts.queryTimeoutMs ?? (opts.statementTimeoutMs ?? DEFAULT_STATEMENT_TIMEOUT_MS) + QUERY_TIMEOUT_MARGIN_MS,
+    idle_in_transaction_session_timeout: opts.idleInTransactionTimeoutMs ?? DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
     application_name: "id-resolver",
     connectionTimeoutMillis: 2_000,
     idleTimeoutMillis: 10_000,

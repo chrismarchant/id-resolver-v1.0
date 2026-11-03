@@ -13,11 +13,10 @@
  * Synthetic data only: example.* domains, no IPs.
  */
 import pg from "pg";
-import type { FastifyInstance, FastifyReply } from "fastify";
+import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
-import { deriveFeedCursorKey, FEED_ROUTE, registerReportingRoutes } from "../../src/api/reporting.js";
-import type { ErrorCode } from "../../src/contracts/api.js";
-import type { ChildManager } from "../../src/contracts/child-manager.js";
+import { deriveFeedCursorKey, FEED_ROUTE } from "../../src/api/reporting.js";
+import type { Runner } from "../../src/contracts/runtime.js";
 import type { ObservationScope } from "../../src/contracts/db.js";
 import type { FeedItemWire, FeedObservationWire, ReportingFeedResponse } from "../../src/contracts/reporting-feed.js";
 import type { Db } from "../../src/db/index.js";
@@ -31,45 +30,31 @@ export const OTHER_SCOPE: ObservationScope = { installationId: "inst-test", webs
 export const reportingAuth = { authorization: `Bearer ${FEED_REPORTING_TOKEN}` };
 export const websiteAuth = { authorization: `Bearer ${TEST_AUTH_TOKEN}` };
 
-const STATUS: Record<ErrorCode, number> = {
-  unauthorized: 401,
-  forbidden: 403,
-  invalid_request: 400,
-  not_found: 404,
-  payload_too_large: 413,
-  rate_limited: 429,
-  overloaded: 503,
-  not_ready: 503,
-  internal: 500,
-};
 
-const idleChildManager: ChildManager = {
+export const idleRunner: Runner = {
   activeCount: () => 0,
   capacity: () => 1,
-  run: async () => ({ status: "unavailable", company: null, source: "none", reason: "test" }),
-  shutdown: async () => {},
+  run: async () => ({ status: "unavailable", source: "none", reason: "internal_error" }),
+  shutdown: async () => ({ drained: true, activeJobs: 0, pendingWrites: 0 }),
 };
 
 /**
- * The real server (auth hook, "reporting" rate-limit bucket, error handler)
- * with the reporting routes registered as server.ts must do once MAIN wires
- * the feed: registerReportingRoutes(app, { ..., feed: { cursorKey:
- * deriveFeedCursorKey(config.IP_HMAC_SECRET) } }).
+ * The real server exactly as production builds it: server.ts registers the
+ * reporting routes, including the feed with its cursor key derived from
+ * IP_HMAC_SECRET, so these suites exercise the real wiring.
  */
 export async function buildFeedServer(db: Db, overrides: Record<string, string> = {}) {
   // The proof suites page thousands of times a minute; the bucket itself is tested separately.
   const config = testConfig({ REPORTING_AUTH_TOKEN: FEED_REPORTING_TOKEN, RATE_LIMIT_PER_MINUTE: "100000", ...overrides });
   const logger = createMemoryLogger();
-  const app = await buildServer({ config, logger, childManager: idleChildManager, ping: () => db.ping() });
-  registerReportingRoutes(app, {
-    scope: { installation_id: config.INSTALLATION_ID, website_id: config.WEBSITE_ID },
-    reporting: db.reporting,
-    logger,
-    sendError: (reply: FastifyReply, error: ErrorCode) => reply.code(STATUS[error]).send({ version: "1", error }),
-    feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
-  });
+  const app = await buildServer({ config, logger, runner: idleRunner, ping: () => db.ping(), reporting: db.reporting });
   await app.ready();
   return { app, logger, config };
+}
+
+/** The cursor key the server derives for a given config (for tests that forge or check cursors). */
+export function feedCursorKeyFor(config: { IP_HMAC_SECRET: string }): Buffer {
+  return deriveFeedCursorKey(config.IP_HMAC_SECRET);
 }
 
 export interface FeedHttpResult {

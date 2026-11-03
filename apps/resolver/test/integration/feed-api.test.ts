@@ -23,6 +23,7 @@ import {
   FEED_SCOPE,
   FeedConsumer,
   getFeed,
+  idleRunner,
   insertObservation,
   obsIds,
   openWriter,
@@ -94,7 +95,7 @@ describe("reporting feed API", () => {
 
     it("fails closed without a cursor key: the route does not exist", async () => {
       const config = testConfig({ REPORTING_AUTH_TOKEN: FEED_REPORTING_TOKEN });
-      const bare = await buildServer({ config, logger: createMemoryLogger(), childManager: { activeCount: () => 0, capacity: () => 1, run: async () => ({ status: "unavailable", company: null, source: "none" }), shutdown: async () => {} }, ping: () => db.ping() });
+      const bare = await buildServer({ config, logger: createMemoryLogger(), runner: idleRunner, ping: () => db.ping() });
       registerReportingRoutes(bare, { scope: SCOPE_WIRE, reporting: db.reporting, logger: createMemoryLogger(), sendError: (reply, error) => reply.code(error === "unauthorized" ? 401 : 400).send({ version: "1", error }) });
       await bare.ready();
       try {
