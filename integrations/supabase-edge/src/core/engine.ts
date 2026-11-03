@@ -275,7 +275,8 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
 
     let applied;
     try {
-      applied = await deps.store.applyPage({ expectedCursor: cursor, expectedResetFrom: resetFrom, nextCursor: page.nextCursor, items: page.items });
+      // drained: the final page records the drain atomically with itself (CHR-66 R2-8).
+      applied = await deps.store.applyPage({ expectedCursor: cursor, expectedResetFrom: resetFrom, nextCursor: page.nextCursor, items: page.items, drained: !page.hasMore });
     } catch {
       return finish("store_error");
     }

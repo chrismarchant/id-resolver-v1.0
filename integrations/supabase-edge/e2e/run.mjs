@@ -31,14 +31,14 @@ const DAY_MS = 86_400_000;
 const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "observations", "pages", "reconcile", "status", "tombstones"];
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 /** idr_schema_version() of sql/0001_idr_projection.sql (PROJECTION_SCHEMA_VERSION in src/core/types.ts). */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 /** Trigger functions: no role but the owner holds EXECUTE (CHR-66 G4-L4). */
 const TRIGGER_FUNCTIONS = ["idr_sync_gaps_guard"];
 /** Expected grantees of an idr_* function's ACL. */
 const expectedFnGrantees = (proname, owner) => (TRIGGER_FUNCTIONS.includes(proname) ? [owner] : [owner, "service_role"].sort());
 const IDR_FUNCTIONS = [
   "idr_get_sync_state(text)",
-  "idr_apply_feed_page(text,text,text,jsonb,text)",
+  "idr_apply_feed_page(text,text,text,jsonb,text,boolean)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
@@ -745,9 +745,9 @@ async function s7Rls() {
     if (!has(t, "authenticated", "SELECT")) viol.push(`authenticated lacks SELECT:${t}`);
     if (!has(t, "service_role", "SELECT")) viol.push(`service_role lacks SELECT:${t}`);
   }
-  for (const t of TABLES.filter((x) => x !== "idr_sync_gaps")) for (const p of ["INSERT", "UPDATE", "DELETE"]) if (!has(t, "service_role", p)) viol.push(`service_role lacks ${p}:${t}`);
-  for (const p of ["DELETE", "TRUNCATE"]) if (has("idr_sync_gaps", "service_role", p)) viol.push(`service_role:${p}:idr_sync_gaps`);
-  check("table privileges: anon none; authenticated SELECT only; service_role writes, but no DELETE/TRUNCATE on idr_sync_gaps (catalog)", viol.length === 0, viol.join(" ") || `${tp.length} privileges checked`);
+  // CHR-66 R2-8: service_role reads only; it writes through the SECURITY DEFINER functions alone.
+  for (const t of [...TABLES, "idr_daily_company_activity"]) for (const p of WRITE) if (has(t, "service_role", p)) viol.push(`service_role:${p}:${t}`);
+  check("table privileges: anon none; authenticated and service_role SELECT only; writes only through the idr_* functions (catalog)", viol.length === 0, viol.join(" ") || `${tp.length} privileges checked`);
   // CHR-66 G4-L4: nothing beyond what the SQL grants survives Supabase's default privileges.
   const extra = tp.filter((a) => a.x && (["TRUNCATE", "REFERENCES", "TRIGGER"].includes(a.p) || (a.t === "idr_daily_company_activity" && a.p !== "SELECT"))).map((a) => `${a.r}:${a.p}:${a.t}`);
   const seq = (

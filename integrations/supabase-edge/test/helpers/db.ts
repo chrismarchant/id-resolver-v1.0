@@ -42,6 +42,7 @@ export async function freshPublicSchema(pool: pg.Pool): Promise<void> {
   await pool.query("drop schema public cascade");
   await pool.query("create schema public");
   await ensureSupabaseRoles(pool);
+  await pool.query("grant usage on schema public to anon, authenticated, service_role");
   for (const kind of ["tables", "sequences", "functions"]) {
     await pool.query(`alter default privileges in schema public grant all on ${kind} to anon, authenticated, service_role`);
   }
@@ -190,8 +191,8 @@ export class PgStore implements Store {
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
       c.query<{ r: { applied: boolean; observations?: number; tombstones?: number } }>(
-        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5) as r",
-        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom],
+        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5,$6) as r",
+        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom, a.drained],
       ),
     );
     const v = r.rows[0]!.r;

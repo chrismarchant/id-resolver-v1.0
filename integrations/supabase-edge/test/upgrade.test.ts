@@ -137,7 +137,8 @@ describe.each(["6318ab2", "f12b1ad", "fced2ea"] as const)("upgrade from the %s r
     const sigs = fns.map((f) => f.sig);
     expect(sigs).not.toContain("idr_apply_feed_page(text,text,text,jsonb)");
     expect(sigs).not.toContain("idr_record_sync_gap(text,text)");
-    expect(sigs).toContain("idr_apply_feed_page(text,text,text,jsonb,text)");
+    expect(sigs).not.toContain("idr_apply_feed_page(text,text,text,jsonb,text)");
+    expect(sigs).toContain("idr_apply_feed_page(text,text,text,jsonb,text,boolean)");
     expect(sigs).toContain("idr_record_sync_gap(text,text,text)");
     expect(sigs).not.toContain("idr_resolve_sync_gaps(text)");
     expect(sigs).toContain("idr_resolve_sync_gaps(text,text)");
@@ -172,6 +173,24 @@ describe.each(["6318ab2", "f12b1ad", "fced2ea"] as const)("upgrade from the %s r
     expect(gaps).toHaveLength(1);
     expect(gaps[0]).toMatchObject({ resolution: "full_resync" });
     expect((await counts(pool)).observations).toBe(4);
+  });
+});
+
+describe("upgrade from schema 4 in the middle of a resync (R2-8)", () => {
+  it("a gap whose resync and replay started under schema 4 resolves at the first drained run after the upgrade, with no new resync", async () => {
+    await installLegacy("fced2ea");
+    await seedLegacyState("fced2ea"); // obs 1-2 at c2, an open gap with needs_resync
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    // The replay's first page, applied by the schema-4 function (five arguments, no drain flag).
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb, null)", [INSTALLATION, JSON.stringify([obs(1, 7, D)])]));
+    await ensureProjection(pool);
+    const st = (await pool.query("select replay_generation::int as r, drained_generation from public.idr_sync_state")).rows[0];
+    expect(st).toEqual({ r: 1, drained_generation: null }); // no drain proven yet
+    expect(await new PgStore(pool).resolveGaps("c1")).toBe(0);
+    mock.items = [1, 2, 3, 4].map((i) => obs(i, 7, D));
+    const r = await runSync(testConfig(mock), testDeps(new PgStore(pool)));
+    expect(r).toMatchObject({ status: "ok", gapsResolved: 1 });
+    expect((await gapRows(pool)).map((g) => g.resolution)).toEqual(["full_resync"]);
   });
 });
 

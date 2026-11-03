@@ -8,7 +8,7 @@ const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync
 const FUNCS = [
   "idr_schema_version()",
   "idr_get_sync_state(text)",
-  "idr_apply_feed_page(text,text,text,jsonb,text)",
+  "idr_apply_feed_page(text,text,text,jsonb,text,boolean)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
@@ -108,7 +108,7 @@ describe("row level security", () => {
     const calls: Record<string, [string, unknown[]]> = {
       "idr_schema_version()": ["select public.idr_schema_version()", []],
       "idr_get_sync_state(text)": ["select public.idr_get_sync_state($1)", [INSTALLATION]],
-      "idr_apply_feed_page(text,text,text,jsonb,text)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null)", [INSTALLATION]],
+      "idr_apply_feed_page(text,text,text,jsonb,text,boolean)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null, false)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
       "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
@@ -135,14 +135,21 @@ describe("row level security", () => {
     }
   });
 
-  it("functions are SECURITY INVOKER with an empty search_path", async () => {
-    const r = await pool.query<{ proname: string; prosecdef: boolean; proconfig: string[] | null }>(
-      "select proname, prosecdef, proconfig from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
+  it("R2-8: the six writing functions are SECURITY DEFINER, owned by the tables' owner; the readers and the trigger stay SECURITY INVOKER; all have an empty search_path", async () => {
+    const DEFINER = ["idr_apply_feed_page", "idr_begin_resync", "idr_record_sync_gap", "idr_record_sync_status", "idr_reset_cursor", "idr_resolve_sync_gaps"];
+    const r = await pool.query<{ proname: string; prosecdef: boolean; proconfig: string[] | null; same_owner: boolean }>(
+      `select p.proname, p.prosecdef, p.proconfig,
+              p.proowner = (select c.relowner from pg_class c where c.oid = 'public.idr_sync_gaps'::regclass) as same_owner
+         from pg_proc p where p.pronamespace = 'public'::regnamespace and p.proname like 'idr\\_%'`,
     );
+    expect(r.rows.filter((x) => x.prosecdef).map((x) => x.proname).sort()).toEqual(DEFINER);
     for (const row of r.rows) {
-      expect(row.prosecdef, row.proname).toBe(false);
-      expect(row.proconfig, row.proname).toContain('search_path=""');
+      expect(row.proconfig, row.proname).toEqual(['search_path=""']);
+      expect(row.same_owner, row.proname).toBe(true);
     }
+    // Every table, the view and the functions have one owner (the role that applied the script).
+    const owners = await pool.query("select distinct relowner from pg_class where relnamespace = 'public'::regnamespace and relname like 'idr\\_%'");
+    expect(owners.rowCount).toBe(1);
   });
 });
 

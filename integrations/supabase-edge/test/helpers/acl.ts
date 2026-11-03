@@ -8,24 +8,24 @@ import type pg from "pg";
 
 export type Grants = Record<string, Record<string, string[]>>;
 
-const WRITE = ["DELETE", "INSERT", "SELECT", "UPDATE"];
+/** Read only: service_role writes through the SECURITY DEFINER functions alone (CHR-66 R2-8). */
+const READ = ["SELECT"];
 
 /** Every idr_* table, view and sequence: grantee -> privileges, nothing else. */
 export const EXPECTED_RELATION_GRANTS: Grants = {
-  idr_companies: { authenticated: ["SELECT"], service_role: WRITE },
-  idr_observations: { authenticated: ["SELECT"], service_role: WRITE },
-  idr_tombstones: { authenticated: ["SELECT"], service_role: WRITE },
-  idr_sync_state: { authenticated: ["SELECT"], service_role: WRITE },
-  // Append-only: no DELETE or TRUNCATE for service_role.
-  idr_sync_gaps: { authenticated: ["SELECT"], service_role: ["INSERT", "SELECT", "UPDATE"] },
-  idr_daily_company_activity: { authenticated: ["SELECT"], service_role: ["SELECT"] },
+  idr_companies: { authenticated: READ, service_role: READ },
+  idr_observations: { authenticated: READ, service_role: READ },
+  idr_tombstones: { authenticated: READ, service_role: READ },
+  idr_sync_state: { authenticated: READ, service_role: READ },
+  idr_sync_gaps: { authenticated: READ, service_role: READ },
+  idr_daily_company_activity: { authenticated: READ, service_role: READ },
   // An identity column needs no sequence privilege to insert.
   idr_sync_gaps_id_seq: {},
 };
 
 /** Every idr_* function: grantee -> privileges. */
 export const EXPECTED_FUNCTION_GRANTS: Grants = {
-  "idr_apply_feed_page(text,text,text,jsonb,text)": { service_role: ["EXECUTE"] },
+  "idr_apply_feed_page(text,text,text,jsonb,text,boolean)": { service_role: ["EXECUTE"] },
   "idr_begin_resync(text)": { service_role: ["EXECUTE"] },
   "idr_get_sync_state(text)": { service_role: ["EXECUTE"] },
   "idr_reconcile_counts(text,date,date)": { service_role: ["EXECUTE"] },
