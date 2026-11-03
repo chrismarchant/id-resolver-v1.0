@@ -38,13 +38,18 @@ object, then grants only this:
 | --- | --- | --- | --- | --- |
 | `anon` | nothing | nothing | nothing | nothing |
 | `authenticated` | `SELECT` (rows only with the `idr_reader` claim) | `SELECT` (claim) | `SELECT` | nothing |
-| `service_role` | `SELECT` | `SELECT` | `SELECT` | `EXECUTE` (not on the trigger function `idr_sync_gaps_guard`) |
+| `service_role` | `SELECT` | `SELECT` | `SELECT` | `EXECUTE`, except on `idr_begin_resync` (the operator's action, owner only) and the trigger function `idr_sync_gaps_guard` |
 
 `service_role` writes **only through the functions** (CHR-66 R2-8). The six that write
 (`idr_apply_feed_page`, `idr_record_sync_status`, `idr_reset_cursor`, `idr_begin_resync`,
 `idr_record_sync_gap`, `idr_resolve_sync_gaps`) are `SECURITY DEFINER`: they run as the owner of the
-tables (the role that applied the script), with an empty `search_path`, no dynamic SQL and
-validated arguments, and only `service_role` may execute them. So a holder of the service-role key
+tables (the role that applied the script), with `search_path = pg_catalog, pg_temp`, no dynamic
+SQL and validated arguments, and only `service_role` may execute them (`idr_begin_resync`: only
+the owner). The temporary schema is listed **last** on purpose (CHR-66 G5R1-M1): with an empty
+`search_path`, PostgreSQL still looks up type names in the caller's temporary schema first, so a
+session that may call these functions could have planted a `pg_temp.text` (or `jsonb`,
+`timestamptz`) domain whose check ran its own code with the owner's rights. Schema 6 (Gate 5
+before this fix) had that flaw; re-run the script (schema 7) on every project. So a holder of the service-role key
 cannot insert a gap row, mark one resolved, or change `needs_resync`, the generations,
 `reset_from_*` or `drained_generation` directly; the state machine described under "`needs_resync`
 and `idr_sync_gaps`" is the only way. A change by hand (for example deleting projection rows) must
@@ -163,7 +168,7 @@ Follow `sql/schedule.example.sql`: store `idr_sync_url` and `idr_sync_secret` in
 3. `select * from public.idr_daily_company_activity order by day desc limit 10;`
 4. Optional: set `IDR_RECONCILE_DAYS=3`; status `reconcile_mismatch` means the projection
    disagrees with the resolver's `/v1/reporting/summary` for those days (see troubleshooting).
-5. A signed-in user WITH the `idr_reader` claim can read the tables; a signed-in user without it, and `anon`, see nothing; nothing writes except the `idr_*` functions, which only `service_role` may call.
+5. A signed-in user WITH the `idr_reader` claim can read the tables; a signed-in user without it, and `anon`, see nothing; nothing writes except the `idr_*` functions, which only `service_role` may call (`idr_begin_resync` only the owner).
 
 ### Who may read the projection
 
@@ -201,7 +206,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. The first page after that check is sent at once and only once (no retry or backoff; any failure ends the run with the position kept, so the next run checks again); what remains unchecked is the interval between the resolver's check and that one request (plus, right after a 400, the one store write that keeps the position), each bounded by its timeout | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
-| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 6 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 7 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 
@@ -227,7 +232,9 @@ to run (`schema_mismatch`) unless the installed SQL is the version it requires.
 2. Accept that observations pruned from the resolver buffer in the gap cannot be recovered
    from it. The existing projection is kept (the client owns commercial-history retention).
 3. Restart from the start of the retained buffer:
-   `select public.idr_begin_resync('<installation-id>');` (in the SQL editor, or as `service_role`).
+   `select public.idr_begin_resync('<installation-id>');` in the SQL editor, as the owner of the
+   projection (the role that applied the script). `service_role` may not call it (CHR-66 G5R1-L3),
+   so the service-role key alone cannot release a halted gap.
    Replays are idempotent, so overlap with data already stored is harmless.
 4. Let the function run until a run drains the buffer (`status = ok`). That run sets
    `resolved_at` and `resolution = 'full_resync'` on the open gap and reports `"gaps_resolved": 1`.
@@ -255,15 +262,21 @@ to run (`schema_mismatch`) unless the installed SQL is the version it requires.
   and on a run that reports `"gap_recorded": false`.
 - Readers with the `idr_reader` claim can see the gap log (same RLS as the other tables). Nobody
   writes it directly: only the `SECURITY DEFINER` functions `idr_record_sync_gap`,
-  `idr_begin_resync` and `idr_resolve_sync_gaps` (executable by `service_role` only) insert or
-  resolve rows, and the guard trigger refuses a row inserted already resolved, any change but
+  `idr_resolve_sync_gaps` (executable by `service_role`) and `idr_begin_resync` (owner only) insert
+  or resolve rows, and the guard trigger refuses a row inserted already resolved, any change but
   the one resolution, and every delete, even by the owner.
-- What this does **not** prove: the SQL cannot check that a page came from the resolver. A holder
-  of the service-role key can still call the functions in order with fabricated pages (resync,
-  then a "final" page) and so reach a resolution. Every step of that is then in
-  `idr_sync_state` (`resync_requested_at`, the generations, `drained_generation`, `cursor`), and a
-  fabricated cursor is rejected by the resolver at the next run. Keep the service-role key as
-  secret as the database password.
+- What this does **not** prove: the SQL cannot check that a page came from the resolver.
+  - A **halted** gap (`needs_resync`) can be released only by the owner running
+    `idr_begin_resync`. The service-role key cannot release it, and so cannot reach a resolution
+    for it.
+  - **Residual:** once the owner has requested a resync, a holder of the service-role key can
+    call `idr_apply_feed_page` with a fabricated "final" page (`p_drained = true`) and then
+    `idr_resolve_sync_gaps`, and so mark that gap resolved without a real drain. Nothing durable
+    records that the pages were fabricated: `cursor`, the generations and `drained_generation` are
+    overwritten by the next runs. And if the fabricated page carries a genuine feed cursor (the
+    reporting token sits in the same function's secrets), the resolver accepts it at the next
+    run. Keep the service-role key as secret as the database password, and treat a gap resolved
+    unusually fast after a resync as suspect.
 
 ### `reconcile_mismatch`
 

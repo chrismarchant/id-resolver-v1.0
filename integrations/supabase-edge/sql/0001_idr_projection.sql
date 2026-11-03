@@ -12,7 +12,8 @@
 --
 -- Roles: relies on the standard Supabase roles anon, authenticated and
 -- service_role. Writes happen only through the idr_* functions below, which
--- only service_role may execute (the Edge Function uses the service key).
+-- only service_role may execute (the Edge Function uses the service key);
+-- idr_begin_resync, the operator's action, only the owner (CHR-66 G5R1-L3).
 -- The writing functions are SECURITY DEFINER (CHR-66 R2-8): service_role has
 -- no direct INSERT, UPDATE or DELETE on any table, so the sync state, the gap
 -- log and the projection change only through those functions' checks.
@@ -187,7 +188,7 @@ comment on table public.idr_sync_gaps is
 create or replace function public.idr_sync_gaps_guard()
 returns trigger
 language plpgsql
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 begin
   if tg_op in ('DELETE', 'TRUNCATE') then
@@ -304,15 +305,25 @@ begin
 end $$;
 
 -- ---------------------------------------------------------------------------
--- Functions, all with an empty search_path (every object is schema-qualified,
--- so no caller-controlled schema can capture a name).
+-- Functions. Every one has `search_path = pg_catalog, pg_temp`, with the
+-- caller's temporary schema explicitly LAST (CHR-66 G5R1-M1). An empty
+-- search_path is not enough: PostgreSQL then still searches the session's
+-- temporary schema FIRST for relation and type names (never for functions or
+-- operators), so a caller could create pg_temp.text, jsonb or timestamptz as
+-- a domain whose CHECK runs its own code, and a SECURITY DEFINER function
+-- that declared or cast to that type ran that code with the owner's rights.
+-- With pg_catalog first, every type name resolves to the built-in type. As
+-- defence in depth, the writing functions also name pg_catalog.text, jsonb
+-- and timestamptz explicitly (int, bigint and boolean are grammar keywords,
+-- always pg_catalog's), and every relation is qualified with public.
 -- The six functions that write (idr_apply_feed_page, idr_record_sync_status,
 -- idr_reset_cursor, idr_begin_resync, idr_record_sync_gap and
 -- idr_resolve_sync_gaps) are SECURITY DEFINER (CHR-66 R2-8): they run as the
 -- owner of the tables, so service_role needs no table write privilege and the
 -- state machine below (compare-and-set, generations, the drain proof) is the
 -- only way to change the sync state or the gap log. Each one validates its
--- arguments, uses no dynamic SQL, and only service_role may execute it.
+-- arguments, uses no dynamic SQL, and only service_role may execute it
+-- (idr_begin_resync: only the owner, CHR-66 G5R1-L3).
 -- The read-only functions (idr_get_sync_state, idr_reconcile_counts,
 -- idr_schema_version) stay SECURITY INVOKER: service_role can read the tables.
 -- ---------------------------------------------------------------------------
@@ -323,7 +334,7 @@ create or replace function public.idr_get_sync_state(p_installation_id text)
 returns jsonb
 language plpgsql
 stable
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 begin
   return coalesce(
@@ -363,12 +374,12 @@ create or replace function public.idr_apply_feed_page(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
-  v_cursor text;
-  v_reset_from text;
-  v_item jsonb;
+  v_cursor pg_catalog.text;
+  v_reset_from pg_catalog.text;
+  v_item pg_catalog.jsonb;
   v_obs int := 0;
   v_tomb int := 0;
   v_rows int;
@@ -413,7 +424,7 @@ begin
       insert into public.idr_observations
         (installation_id, observation_id, company_id, observed_at, method, page_key, acquisition, entrance_contract)
         values (p_installation_id, (v_item ->> 'observation_id')::bigint, (v_item ->> 'company_id')::bigint,
-                (v_item ->> 'observed_at')::timestamptz, v_item ->> 'method', v_item ->> 'page_key',
+                (v_item ->> 'observed_at')::pg_catalog.timestamptz, v_item ->> 'method', v_item ->> 'page_key',
                 v_item ->> 'acquisition', v_item ->> 'entrance_contract')
         on conflict (installation_id, observation_id) do nothing;
       get diagnostics v_rows = row_count;
@@ -421,7 +432,7 @@ begin
     elsif v_item ->> 'type' = 'company_erased' then
       insert into public.idr_tombstones (installation_id, tombstone_id, company_id, erased_at)
         values (p_installation_id, (v_item ->> 'tombstone_id')::bigint, (v_item ->> 'company_id')::bigint,
-                (v_item ->> 'erased_at')::timestamptz)
+                (v_item ->> 'erased_at')::pg_catalog.timestamptz)
         on conflict (installation_id, tombstone_id) do nothing;
       get diagnostics v_rows = row_count;
       v_tomb := v_tomb + v_rows;
@@ -455,7 +466,7 @@ create or replace function public.idr_record_sync_status(
 ) returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 begin
   if p_installation_id is null or char_length(p_installation_id) not between 1 and 128 or p_status is null then
@@ -486,7 +497,7 @@ create or replace function public.idr_reset_cursor(p_installation_id text, p_exp
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
   v_rows int;
@@ -528,13 +539,13 @@ create or replace function public.idr_begin_resync(p_installation_id text)
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
   v_needs boolean;
-  v_cursor text;
-  v_reset_from text;
-  v_last_applied timestamptz;
+  v_cursor pg_catalog.text;
+  v_reset_from pg_catalog.text;
+  v_last_applied pg_catalog.timestamptz;
   v_generation bigint;
   v_id bigint;
 begin
@@ -588,14 +599,14 @@ create or replace function public.idr_record_sync_gap(p_installation_id text, p_
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
-  v_cursor text;
-  v_reset_from text;
+  v_cursor pg_catalog.text;
+  v_reset_from pg_catalog.text;
   v_reset_gen bigint;
   v_needs boolean;
-  v_last_applied timestamptz;
+  v_last_applied pg_catalog.timestamptz;
   v_generation bigint;
   v_detected bigint;
   v_halt boolean;
@@ -656,7 +667,7 @@ create or replace function public.idr_resolve_sync_gaps(p_installation_id text, 
 returns jsonb
 language plpgsql
 security definer
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
 declare
   v_rows int;
@@ -686,7 +697,7 @@ create or replace function public.idr_reconcile_counts(p_installation_id text, p
 returns jsonb
 language sql
 stable
-set search_path = ''
+set search_path = pg_catalog, pg_temp
 as $$
   select jsonb_build_object(
     'observations', count(*),
@@ -711,7 +722,10 @@ revoke all on function public.idr_sync_gaps_guard() from public, anon, authentic
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text, boolean) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
-grant execute on function public.idr_begin_resync(text) to service_role;
+-- idr_begin_resync is NOT granted to service_role (CHR-66 G5R1-L3): it is the
+-- operator's action, run as the owner (for example in the SQL editor), and the
+-- Edge function never calls it. Without it, the service-role key cannot
+-- release a halted gap (needs_resync) and then assert a drain for it.
 grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
 grant execute on function public.idr_record_sync_gap(text, text, text) to service_role;
@@ -723,7 +737,11 @@ grant execute on function public.idr_resolve_sync_gaps(text, text) to service_ro
 -- code expects, so code/SQL skew can never silently drop gap evidence.
 -- (The script's one-statement form changes nothing that is installed, so it
 -- does not change this version.)
--- 6 = this release: the writing functions are SECURITY DEFINER, service_role
+-- 7 = this release: every function has search_path = pg_catalog, pg_temp, so
+-- a caller's temporary schema cannot capture a type name in a SECURITY
+-- DEFINER function (CHR-66 G5R1-M1); idr_begin_resync is the owner's alone
+-- (G5R1-L3). The engine refuses any earlier install. 6 = the writing
+-- functions are SECURITY DEFINER, service_role
 -- has no direct table write, and a gap resolves only after a drained replay
 -- (drained_generation; CHR-66 R2-8). 5 = exact privileges under Supabase's
 -- default privileges (CHR-66 G4-L4). 4 = the gap log with compare-and-set, the reset_from_cursor
@@ -736,8 +754,8 @@ create or replace function public.idr_schema_version()
 returns integer
 language sql
 immutable
-set search_path = ''
-as $$ select 6 $$;
+set search_path = pg_catalog, pg_temp
+as $$ select 7 $$;
 revoke all on function public.idr_schema_version() from public, anon, authenticated, service_role;
 grant execute on function public.idr_schema_version() to service_role;
 

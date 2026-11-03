@@ -120,7 +120,7 @@ describe("authorised invocation", () => {
     expect(await gapRows(pool)).toHaveLength(1);
 
     // After the operator's resync the first drained run reports the resolution; the row stays.
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const resynced = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), deps());
     expect(resynced.status).toBe(200);
     expect(await resynced.json()).toMatchObject({ status: "ok", gap_recorded: false, gaps_resolved: 1 });

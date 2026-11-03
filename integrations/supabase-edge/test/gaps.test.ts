@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, functionGrants, relationGrants } from "./helpers/acl.ts";
-import { INSTALLATION, SQL_PATH, asRole, freshPublicSchema, gapRows, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
+import { INSTALLATION, asRole, dropOwner, gapRows, installAsOwner, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
 
@@ -57,7 +57,8 @@ const nextPage = (expected: string, next: string, { final = true }: { final?: bo
   svc("select public.idr_apply_feed_page($1, $2, $3, '[]'::jsonb, null, $4)", [INSTALLATION, expected, next, final]);
 const generations = async () =>
   (await pool.query<{ resync: string; replay: string }>("select resync_generation::text as resync, replay_generation::text as replay from public.idr_sync_state")).rows[0];
-const beginResync = () => svc("select public.idr_begin_resync($1)", [INSTALLATION]);
+/** The operator's action, as the owner (the pool's role): service_role may not call it (CHR-66 G5R1-L3). */
+const beginResync = () => pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
 const READER = { role: "authenticated", app_metadata: { idr_reader: true } };
 
 describe("recording", () => {
@@ -137,8 +138,7 @@ describe("resolution", () => {
   it("R2-9: a resync whose transaction started BEFORE a concurrent gap record but committed after it still resolves that gap (row-lock order, not start time)", async () => {
     const a = await pool.connect();
     try {
-      await a.query("begin");
-      await a.query("set local role service_role");
+      await a.query("begin"); // the operator's transaction, as the owner
       await a.query("select now()"); // the transaction's start timestamp is now fixed
       await new Promise((r) => setTimeout(r, 20));
       const g = await recordGap(); // commits while A is open
@@ -186,7 +186,7 @@ describe("R2-6: begin_resync never clears needs_resync without a gap on record",
   it("records the missing gap itself, bounded by the stored state, before clearing the flag; resolvable after the replay", async () => {
     await flagOnly("c2");
     expect(await gapRows(pool)).toHaveLength(0);
-    const r = (await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r;
+    const r = (await pool.query<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r;
     expect(r).toEqual({ ok: true, gap_recorded: true });
     const gaps = await gapRows(pool);
     expect(gaps).toHaveLength(1);
@@ -198,20 +198,20 @@ describe("R2-6: begin_resync never clears needs_resync without a gap on record",
 
   it("adds no second row when a gap is already open, and none when needs_resync is not set", async () => {
     await recordGap();
-    expect((await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
+    expect((await pool.query<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
     expect(await gapRows(pool)).toHaveLength(1);
     await replay("c1");
-    expect((await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
+    expect((await pool.query<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
     expect(await gapRows(pool)).toHaveLength(1);
   });
 
   it("a voluntary resync keeps the stored cursor (and its generation) for the re-check; one with needs_resync does not", async () => {
     await svc("select public.idr_apply_feed_page($1, null, 'c4', '[]'::jsonb, null)", [INSTALLATION]);
-    await svc("select public.idr_begin_resync($1)", [INSTALLATION]);
+    await beginResync();
     const v = await pool.query("select cursor, reset_from_cursor, reset_from_generation::int as g, resync_generation::int as r from public.idr_sync_state");
     expect(v.rows[0]).toEqual({ cursor: null, reset_from_cursor: "c4", g: 0, r: 1 });
     // A second voluntary resync before any run keeps the same pending position and generation.
-    await svc("select public.idr_begin_resync($1)", [INSTALLATION]);
+    await beginResync();
     expect((await pool.query("select reset_from_cursor, reset_from_generation::int as g from public.idr_sync_state")).rows[0]).toEqual({ reset_from_cursor: "c4", g: 0 });
     // Its 410 records the gap at generation 0 without halting (a resync was requested after it).
     const r = (await svc<{ r: { recorded: boolean; needs_resync: boolean } }>("select public.idr_record_sync_gap($1, 'cursor_expired', 'c4') as r", [INSTALLATION])).rows[0]!.r;
@@ -328,8 +328,6 @@ describe("R2-8: a gap resolves only after a drained replay; service_role cannot 
       ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, '', false)", [INSTALLATION]],
       ["select public.idr_apply_feed_page(repeat('x', 129), null, 'c1', '[]'::jsonb, null, false)", []],
       ["select public.idr_apply_feed_page($1, null, repeat('c', 4097), '[]'::jsonb, null, false)", [INSTALLATION]],
-      ["select public.idr_begin_resync('')", []],
-      ["select public.idr_begin_resync(null)", []],
       ["select public.idr_reset_cursor($1, '')", [INSTALLATION]],
       ["select public.idr_record_sync_status('', 'ok', null)", []],
       ["select public.idr_record_sync_status($1, null, null)", [INSTALLATION]],
@@ -338,8 +336,44 @@ describe("R2-8: a gap resolves only after a drained replay; service_role cannot 
       ["select public.idr_resolve_sync_gaps($1, '')", [INSTALLATION]],
     ];
     for (const [sql, args] of bad) await expect(svc(sql, args), sql).rejects.toThrow(/invalid_arguments/);
+    // The operator's function, called as the owner.
+    for (const sql of ["select public.idr_begin_resync('')", "select public.idr_begin_resync(null)"]) await expect(pool.query(sql), sql).rejects.toThrow(/invalid_arguments/);
     expect((await pool.query("select count(*)::int as n from public.idr_sync_state")).rows[0].n).toBe(0);
     expect(await gapRows(pool)).toHaveLength(0);
+  });
+});
+
+describe("G5R1-L3: only the owner may release a halted gap (idr_begin_resync is not executable by service_role)", () => {
+  it("service_role, anon and authenticated cannot execute idr_begin_resync; the owner can", async () => {
+    await recordGap();
+    for (const role of ["service_role", "anon", "authenticated"]) {
+      await expect(asRole(pool, role, (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION])), role).rejects.toThrow(/permission denied/);
+    }
+    expect((await pool.query("select needs_resync from public.idr_sync_state")).rows[0]).toEqual({ needs_resync: true });
+    expect((await beginResync()).rows[0]).toBeDefined();
+    expect((await pool.query("select needs_resync from public.idr_sync_state")).rows[0]).toEqual({ needs_resync: false });
+  });
+
+  it("the review's forged-drain sequence (P2) no longer resolves a halted gap: service_role cannot release it, and every other call leaves it open", async () => {
+    await svc("select public.idr_apply_feed_page($1, null, 'real-c1', '[]'::jsonb, null)", [INSTALLATION]);
+    await recordGap(); // halted: needs_resync
+    // 1. release the halt: refused (it was allowed before G5R1-L3)
+    await expect(svc("select public.idr_begin_resync($1)", [INSTALLATION])).rejects.toThrow(/permission denied/);
+    // 2. a fabricated "final" page, from null and from the stored cursor
+    expect((await svc<{ r: { applied: boolean } }>("select public.idr_apply_feed_page($1, null, 'forged', '[]'::jsonb, null, true) as r", [INSTALLATION])).rows[0]!.r.applied).toBe(false);
+    expect((await svc<{ r: { applied: boolean } }>("select public.idr_apply_feed_page($1, 'real-c1', 'forged', '[]'::jsonb, null, true) as r", [INSTALLATION])).rows[0]!.r.applied).toBe(true);
+    // 3. resolve: nothing, the halt is still in place
+    expect(await resolveGaps("forged")).toBe(0);
+    expect((await gapRows(pool)).map((g) => g.resolved_at)).toEqual([null]);
+    expect((await pool.query("select needs_resync from public.idr_sync_state")).rows[0]).toEqual({ needs_resync: true });
+  });
+
+  it("documented residual: once the owner has requested a resync, the key can still assert a drain (the SQL cannot verify the feed)", async () => {
+    await svc("select public.idr_apply_feed_page($1, null, 'real-c1', '[]'::jsonb, null)", [INSTALLATION]);
+    await recordGap();
+    await beginResync(); // the operator's legitimate request
+    await svc("select public.idr_apply_feed_page($1, null, 'forged', '[]'::jsonb, null, true)", [INSTALLATION]);
+    expect(await resolveGaps("forged")).toBe(1);
   });
 });
 
@@ -408,27 +442,10 @@ describe("row level security", () => {
 describe("R2-8 with an ordinary owner: the script applied by a role that is neither superuser nor BYPASSRLS (on Supabase, postgres is not a superuser)", () => {
   const OWNER = "idr_test_owner";
   beforeAll(async () => {
-    await freshPublicSchema(pool);
-    await pool.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${OWNER}') then create role ${OWNER} nologin nosuperuser nobypassrls; end if; end $$`);
-    await pool.query(`grant usage, create on schema public to ${OWNER}`);
-    await pool.query(`grant usage on schema auth to ${OWNER}`);
-    // Supabase's default privileges, for objects this role creates.
-    for (const kind of ["tables", "sequences", "functions"]) {
-      await pool.query(`alter default privileges for role ${OWNER} in schema public grant all on ${kind} to anon, authenticated, service_role`);
-    }
-    const c = await pool.connect();
-    try {
-      await c.query(`set role ${OWNER}`);
-      await c.query(readFileSync(SQL_PATH, "utf8"));
-    } finally {
-      await c.query("reset role").catch(() => undefined);
-      c.release();
-    }
+    await installAsOwner(pool, OWNER);
   });
   afterAll(async () => {
-    await resetDatabase(pool);
-    await pool.query(`drop owned by ${OWNER}`);
-    await pool.query(`drop role ${OWNER}`);
+    await dropOwner(pool, OWNER);
   });
 
   it("everything is owned by that role, which has no superuser or BYPASSRLS attribute; the grants are exactly as with any owner", async () => {
@@ -442,11 +459,12 @@ describe("R2-8 with an ordinary owner: the script applied by a role that is neit
     expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
   });
 
-  it("as service_role, through the definer functions only: apply, record, resync, a partial replay (no resolution), the final page, resolve", async () => {
+  it("through the definer functions only: the engine's calls as service_role, the resync as the owner; apply, record, resync, a partial replay (no resolution), the final page, resolve", async () => {
     const item = { type: "observation", observation_id: "1", company_id: 7, domain: "example.com", organisation_name: null, observed_at: "2026-11-02T09:00:00.000Z", method: "cache", page_key: "/", acquisition: null, entrance_contract: null };
     expect((await svc<{ r: unknown }>("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null, true) as r", [INSTALLATION, JSON.stringify([item])])).rows[0]!.r).toEqual({ applied: true, observations: 1, tombstones: 0 });
     expect(await recordGap()).toMatchObject({ recorded: true, new: true });
-    await beginResync();
+    await expect(svc("select public.idr_begin_resync($1)", [INSTALLATION])).rejects.toThrow(/permission denied/);
+    await asRole(pool, OWNER, (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
     await replay("c1", { final: false });
     expect(await resolveGaps()).toBe(0);
     await nextPage("c1", "c2");
