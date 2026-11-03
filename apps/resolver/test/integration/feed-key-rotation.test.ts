@@ -8,7 +8,15 @@
  * compares the position a WELL-FORMED but unverified cursor claims with the
  * scope's retention watermark: strictly before it -> 410 cursor_expired (what
  * the same cursor got before the rotation); otherwise 400. The claim never
- * selects or serves items. Malformed cursors stay 400.
+ * selects or serves items. Malformed cursors stay 400. The owner approved
+ * this as a clarification of frozen guarantee 3 (3 Nov 2026).
+ *
+ * "cursor regression matrix" names one test per cursor category (valid,
+ * expired, rotated, forged, malformed) and proves, with a statement-level spy
+ * on the repository's pool, that untrusted cursor bytes never reach the
+ * database: a malformed cursor causes no call at all, and a cursor whose tag
+ * does not verify causes exactly one statement, the watermark read bound to
+ * the configured scope, and never the feed query.
  *
  * Real PostgreSQL, the real server wiring (cursor key derived from
  * IP_HMAC_SECRET by server.ts), and, end to end, the reference Supabase Edge
@@ -19,13 +27,17 @@
  *
  * Synthetic data only: example.* domains, no IPs.
  */
+import { randomBytes } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
 import { decodeFeedCursor, deriveFeedCursorKey, encodeFeedCursor, FEED_ROUTE, unverifiedFeedCursorPosition } from "../../src/api/reporting.js";
 import { FEED_KIND_OBSERVATION, FEED_KIND_TOMBSTONE, FEED_START, type FeedPosition } from "../../src/contracts/reporting-feed.js";
+import type { ReportingRepository } from "../../src/contracts/db.js";
 import type { Db } from "../../src/db/index.js";
-import { createFeedRetention, retentionCutoff, type FeedRetention } from "../../src/db/retention.js";
+import type { Pool } from "../../src/db/pool.js";
+import { createReportingRepository, FEED_SQL } from "../../src/db/reporting-repo.js";
+import { createFeedRetention, FEED_WATERMARK_SQL, retentionCutoff, type FeedRetention } from "../../src/db/retention.js";
 import { createMemoryLogger } from "../../src/log/index.js";
 import { createTestDb } from "../helpers/db.js";
 import { TEST_HMAC_SECRET, testConfig } from "../helpers/env.js";
@@ -232,7 +244,7 @@ describe("reporting feed: cursor-key rotation vs the retention watermark (N1)", 
     }
     // A forged cursor claiming a pruned position is indistinguishable from a
     // stale one (that is what the tag is for), so it gets 410: an error that
-    // serves nothing and asks the consumer to resynchronise.
+    // serves nothing and signals a potential continuity gap to the consumer.
     expect(await rawFeed(app, encodeFeedCursor(pos(old[2]!), deriveFeedCursorKey(["forged", "secret", "0123456789abcdef0123456789abcdef"].join("-")), SCOPE_WIRE))).toEqual({ status: 410, body: EXPIRED });
   });
 
@@ -283,6 +295,230 @@ describe("reporting feed: cursor-key rotation vs the retention watermark (N1)", 
     } finally {
       await broken.close();
     }
+  });
+});
+
+// ---- regression matrix: forged, expired, rotated, malformed, valid ------------
+//
+// Owner clarification (3 Nov 2026) of guarantee 3. Every request goes through
+// a reporting repository built over a pool that records each statement and
+// its parameters, and through a proxy that records each repository method
+// called, so "no database call", "no feed query" and "only the watermark read,
+// parameterised by the configured scope" are facts, not inferences.
+
+const EXPIRED_RAW = '{"version":"1","error":"cursor_expired"}';
+const INVALID_RAW = '{"version":"1","error":"invalid_request"}';
+
+interface Spy {
+  reporting: ReportingRepository;
+  statements: Array<{ text: string; values: unknown[] }>;
+  methods: string[];
+  reset(): void;
+}
+
+function spiedReporting(db: Db): Spy {
+  const statements: Spy["statements"] = [];
+  const methods: string[] = [];
+  const pool = {
+    query: (text: string, values?: unknown[]) => {
+      statements.push({ text, values: [...(values ?? [])] });
+      return db.pool.query(text, values);
+    },
+  } as unknown as Pool;
+  const inner = createReportingRepository(pool);
+  const reporting = new Proxy(inner, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof v !== "function") return v;
+      return (...args: unknown[]) => {
+        methods.push(String(prop));
+        return (v as (...a: unknown[]) => unknown).apply(target, args);
+      };
+    },
+  });
+  return {
+    reporting,
+    statements,
+    methods,
+    reset() {
+      statements.length = 0;
+      methods.length = 0;
+    },
+  };
+}
+
+/** A well-formed cursor (canonical, format 1, valid kind and id) whose 16-byte tag is random. */
+function forgedCursor(p: FeedPosition): string {
+  const b = Buffer.from(encodeFeedCursor(p, NEW_KEY, SCOPE_WIRE), "base64url");
+  randomBytes(16).copy(b, 18);
+  return b.toString("base64url");
+}
+
+describe("reporting feed: cursor regression matrix (owner clarification of guarantee 3)", () => {
+  let db: Db;
+  let spy: Spy;
+  let app: FastifyInstance;
+  let retention: FeedRetention;
+  const SCOPE_PARAMS = [FEED_SCOPE.installationId, FEED_SCOPE.websiteId];
+
+  beforeAll(async () => {
+    db = await createTestDb({ max: 6 });
+    spy = spiedReporting(db);
+    const config = testConfig({ REPORTING_AUTH_TOKEN: FEED_REPORTING_TOKEN, RATE_LIMIT_PER_MINUTE: "100000" });
+    app = await buildServer({ config, logger: createMemoryLogger(), runner: idleRunner, ping: () => db.ping(), reporting: spy.reporting });
+    await app.ready();
+    retention = createFeedRetention(db.pool);
+  });
+  beforeEach(async () => {
+    await resetFeedDb(db);
+  });
+  afterAll(async () => {
+    await resetFeedDb(db);
+    await app.close();
+    await db.close();
+  });
+
+  const now = Date.now();
+  /** obs 0-4 are pruned (obs 4 becomes the watermark), obs 5-7 are retained. */
+  async function seedAndPrune(): Promise<{ old: InsertedObservation[]; fresh: InsertedObservation[]; wm: FeedPosition }> {
+    const company = await createCompany(db.pool, "matrix.example");
+    const old: InsertedObservation[] = [];
+    const fresh: InsertedObservation[] = [];
+    for (let i = 0; i < 5; i++) old.push(await insertObservation(db.pool, { companyId: company, observedAt: new Date(now - (10 - i) * DAY) }));
+    for (let i = 0; i < 3; i++) fresh.push(await insertObservation(db.pool, { companyId: company, observedAt: new Date(now - i * 60_000) }));
+    expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 5), { batch: 100 })).deleted).toBe(5);
+    const wm = pos(old[4]!);
+    expect(await retention.watermark(FEED_SCOPE)).toEqual(wm);
+    spy.reset();
+    return { old, fresh, wm };
+  }
+  async function request(after: string): Promise<{ status: number; raw: string }> {
+    spy.reset();
+    const r = await app.inject({ method: "GET", url: `${FEED_ROUTE}?after=${encodeURIComponent(after)}`, headers: reportingAuth });
+    return { status: r.statusCode, raw: r.body };
+  }
+  /** The error path made exactly one statement: the watermark read, bound to the configured scope only. */
+  function expectOnlyScopedWatermarkRead(label: string): void {
+    expect(spy.methods, label).toEqual(["feedWatermark"]);
+    expect(spy.statements, label).toEqual([{ text: FEED_WATERMARK_SQL, values: SCOPE_PARAMS }]);
+  }
+
+  it("valid: a current-key cursor at or after the watermark -> 200 with the retained items; one feed statement, no separate watermark read", async () => {
+    const { fresh, wm } = await seedAndPrune();
+    const r = await request(encodeFeedCursor(wm, NEW_KEY, SCOPE_WIRE));
+    expect(r.status).toBe(200);
+    expect(obsIds(JSON.parse(r.raw).items)).toEqual(fresh.map((f) => f.id));
+    expect(spy.methods).toEqual(["feed"]);
+    expect(spy.statements.map((x) => x.text)).toEqual([FEED_SQL]);
+    // A valid cursor with no watermark at all is served normally too.
+    await resetFeedDb(db);
+    const company = await createCompany(db.pool, "matrix-valid.example");
+    const a = await insertObservation(db.pool, { companyId: company });
+    const b = await insertObservation(db.pool, { companyId: company });
+    const page = await request(encodeFeedCursor(pos(a), NEW_KEY, SCOPE_WIRE));
+    expect(page.status).toBe(200);
+    expect(obsIds(JSON.parse(page.raw).items)).toEqual([b.id]);
+  });
+
+  it("expired: a current-key (valid tag) cursor strictly before the watermark -> 410 with exactly {version, error} and no items", async () => {
+    const { old } = await seedAndPrune();
+    for (const p of [FEED_START, pos(old[0]!), pos(old[3]!)]) {
+      const r = await request(encodeFeedCursor(p, NEW_KEY, SCOPE_WIRE));
+      expect(r.status, String(p.id)).toBe(410);
+      expect(r.raw).toBe(EXPIRED_RAW);
+      expect(spy.methods).toEqual(["feed"]); // a verified cursor: the watermark is read in the feed statement's snapshot
+    }
+  });
+
+  it("rotated: a stale-key cursor below the watermark -> 410 with no items and no feed query; at or after it -> 400", async () => {
+    const { old, fresh, wm } = await seedAndPrune();
+    for (const p of [FEED_START, pos(old[0]!), pos(old[3]!), { ...wm, id: wm.id - 1n }]) {
+      const r = await request(staleCursor(p));
+      expect(r.status, String(p.id)).toBe(410);
+      expect(r.raw).toBe(EXPIRED_RAW);
+      expectOnlyScopedWatermarkRead(`rotated below ${p.id}`);
+    }
+    for (const p of [wm, { txid: wm.txid, kind: FEED_KIND_TOMBSTONE, id: 0n } as FeedPosition, pos(fresh[0]!), pos(fresh[2]!)]) {
+      const r = await request(staleCursor(p));
+      expect(r.status, String(p.id)).toBe(400);
+      expect(r.raw).toBe(INVALID_RAW);
+      expectOnlyScopedWatermarkRead(`rotated at/after ${p.id}`);
+    }
+  });
+
+  it("forged: a well-formed cursor with a random tag claiming a pruned position -> 410, no items, no feed query; claiming a position within retention -> 400", async () => {
+    const { old, fresh, wm } = await seedAndPrune();
+    for (const p of [FEED_START, pos(old[1]!), { ...wm, id: wm.id - 1n }]) {
+      const c = forgedCursor(p);
+      expect(decodeFeedCursor(c, NEW_KEY, SCOPE_WIRE)).toBeUndefined();
+      const r = await request(c);
+      expect(r.status, String(p.id)).toBe(410);
+      expect(r.raw).toBe(EXPIRED_RAW);
+      expectOnlyScopedWatermarkRead(`forged below ${p.id}`);
+    }
+    for (const p of [wm, pos(fresh[1]!), { txid: 18_446_744_073_709_551_615n, kind: FEED_KIND_TOMBSTONE, id: 9_223_372_036_854_775_807n } as FeedPosition]) {
+      const r = await request(forgedCursor(p));
+      expect(r.status, String(p.id)).toBe(400);
+      expect(r.raw).toBe(INVALID_RAW);
+      expectOnlyScopedWatermarkRead(`forged within retention ${p.id}`);
+    }
+    // A forged cursor with no watermark in the scope at all -> 400.
+    await resetFeedDb(db);
+    const r = await request(forgedCursor(FEED_START));
+    expect(r.status).toBe(400);
+    expectOnlyScopedWatermarkRead("forged, no watermark");
+  });
+
+  it("malformed: 400 with no database call at all, even when the bytes would claim a pruned position", async () => {
+    const { old } = await seedAndPrune();
+    const stale = staleCursor(pos(old[0]!));
+    const bytes = Buffer.from(stale, "base64url");
+    const withByte = (i: number, v: number) => {
+      const b = Buffer.from(bytes);
+      b[i] = v;
+      return b.toString("base64url");
+    };
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const last = stale[stale.length - 1]!;
+    const malformed = [
+      stale.slice(0, -1),
+      stale + "A",
+      stale.slice(0, -1) + alphabet[(alphabet.indexOf(last) & ~0b1111) | ((alphabet.indexOf(last) + 1) & 0b1111)]!,
+      withByte(0, 2),
+      withByte(9, 2),
+      withByte(10, 0x80),
+      "A".repeat(46),
+      Buffer.from(JSON.stringify({ t: 1, o: 1 })).toString("base64url"),
+      "not-a-cursor",
+      "not base64url!",
+      "%00",
+      "A".repeat(129),
+    ];
+    for (const m of malformed) {
+      const r = await request(m);
+      expect(r.status, m).toBe(400);
+      expect(r.raw, m).toBe(INVALID_RAW);
+      expect(spy.methods, m).toEqual([]);
+      expect(spy.statements, m).toEqual([]);
+    }
+  });
+
+  it("untrusted cursor bytes never parameterise a query: every MAC failure issues the identical scope-only statement, whatever the cursor claims", async () => {
+    const { old, fresh } = await seedAndPrune();
+    const failures = [staleCursor(pos(old[0]!)), staleCursor(pos(fresh[2]!)), forgedCursor(pos(old[2]!)), forgedCursor(pos(fresh[0]!))];
+    const seen: string[] = [];
+    for (const c of failures) {
+      await request(c);
+      expectOnlyScopedWatermarkRead(c);
+      const values = JSON.stringify(spy.statements[0]!.values);
+      // No part of the claimed position (txid or id, in any base) reaches the parameters.
+      const claimed = unverifiedFeedCursorPosition(c)!;
+      for (const part of [claimed.txid.toString(), claimed.id.toString()]) expect(values).not.toContain(part);
+      seen.push(JSON.stringify(spy.statements));
+    }
+    expect(new Set(seen).size).toBe(1);
+    // The claim is decoded from the fixed 34-byte buffer only: other lengths have no claim.
+    for (const len of [33, 35]) expect(unverifiedFeedCursorPosition(randomBytes(len).toString("base64url"))).toBeUndefined();
   });
 });
 

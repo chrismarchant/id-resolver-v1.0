@@ -278,7 +278,9 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // reporting-feed.v1 (CHR-71): cursor MAC key derived from the server-only
       // IP_HMAC_SECRET with a dedicated label; the consumer holds the reporting
       // token, so it must not key the cursor. Rotating the secret invalidates
-      // outstanding cursors (400) and consumers resynchronise idempotently.
+      // outstanding cursors: 410 for one behind the retention watermark (a
+      // potential continuity gap), otherwise 400 and an idempotent replay
+      // (docs/contracts/reporting-feed.v1.md, CHR-66 N1).
       feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
     });
   }

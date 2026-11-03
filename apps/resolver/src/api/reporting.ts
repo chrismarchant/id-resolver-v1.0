@@ -167,10 +167,12 @@ const I64_MAX = 0x7fff_ffff_ffff_ffffn;
  * it). Domain-separated from every other use of that secret by its label, so
  * the derived key reveals nothing about the fingerprint key. Rotating the
  * secret invalidates outstanding cursors: a stale cursor whose position lies
- * strictly before the scope's retention watermark gets 410 cursor_expired
- * (data was missed; see registerFeedRoute), any other gets 400, after which
- * the consumer resynchronises from the start of the buffer, which is safe
- * because nothing after its position was pruned and it applies idempotently.
+ * strictly before the scope's retention watermark gets 410 cursor_expired (a
+ * potential synchronisation continuity gap; see registerFeedRoute), any other
+ * gets 400, after which the consumer restarts from the start of the buffer,
+ * which is safe because nothing after its position was pruned and it applies
+ * idempotently. A separate cursor-signing secret with a key ring is deferred
+ * beyond V1.
  */
 export function deriveFeedCursorKey(secret: string): Buffer {
   if (typeof secret !== "string" || secret.length < 32) throw new Error("feed cursor key: secret too short");
@@ -388,17 +390,25 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
  * statement (src/db/reporting-repo.ts, FEED_SQL); this handler only validates,
  * signs and projects.
  *
- * A cursor whose tag does not verify is never served. It is usually stale:
- * the cursor key derives from IP_HMAC_SECRET, so rotating that secret
- * invalidates every outstanding cursor. A consumer answers 400 with an
- * automatic restart from the start of the buffer, which is only safe when
- * nothing after its position was pruned. So when the cursor is well-formed
- * and the position it claims lies strictly before the scope's retention
- * watermark, the answer is 410 cursor_expired (data was missed, the consumer
- * must alert), exactly what the same cursor would have received before the
- * rotation; otherwise 400. The claimed position decides only between these two
- * errors. If the watermark cannot be read the answer is 500, never a 400 that
- * could trigger a silent reset.
+ * A cursor whose tag does not verify is never served (owner clarification of
+ * guarantee 3, CHR-66 N1). It is usually stale: the cursor key derives from
+ * IP_HMAC_SECRET, so rotating that secret invalidates every outstanding
+ * cursor; a failed tag does not establish that it was ever authentic either.
+ * A consumer answers 400 with an automatic restart from the start of the
+ * buffer, which is only safe when nothing after its position was pruned. So
+ * when the cursor is well-formed and the position it claims lies strictly
+ * before the scope's retention watermark, the answer is 410 cursor_expired (a
+ * potential continuity gap the consumer must record and alert on), exactly
+ * what the same cursor would have received before the rotation; otherwise
+ * 400. Both answers carry no items.
+ *
+ * Untrusted bytes stay out of the database: a malformed cursor causes no
+ * database call; for a well-formed one the claimed position is decoded from
+ * the fixed 34-byte buffer and compared IN MEMORY with the watermark, which is
+ * read by a statement parameterised only by the server-configured scope
+ * (FEED_WATERMARK_SQL). reporting.feed is never called on this path. If the
+ * watermark cannot be read the answer is 500, never a 400 that could trigger
+ * a silent reset.
  */
 function registerFeedRoute(app: FastifyInstance, deps: ReportingDeps, feed: ReportingFeedOptions): void {
   const { scope, reporting, logger, sendError } = deps;

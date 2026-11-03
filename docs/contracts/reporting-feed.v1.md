@@ -3,7 +3,9 @@
 Status: **frozen interface for Gate 3; implemented with a proof suite
 (CHR-71, `apps/resolver/test/integration/feed-*.test.ts`), pending independent
 review (CHR-66)**. The sections after "Reconciliation" are implementation
-clarifications; they do not change the frozen interface above them.
+clarifications; they do not change the frozen interface above them, except
+where an **owner clarification** says so explicitly (guarantees 3 and 6:
+"Owner clarification (3 Nov 2026, CHR-66 N1) of guarantee 3" below).
 The consumer is a client-owned Supabase Edge Function (reference adapter in
 `integrations/supabase-edge`). The resolver never pushes and holds no client
 credentials.
@@ -49,7 +51,10 @@ credential; the website token is rejected). `limit` defaults to 200. Omit
    the feed back; this is bounded by `statement_timeout`.
 3. `next_cursor` is opaque, integrity-protected (a tampered cursor gives
    `400 invalid_request`) and always present: with no new items it encodes
-   the same position.
+   the same position. *Refined by the owner clarification of 3 Nov 2026
+   (CHR-66 N1, below): a structurally valid cursor whose tag does not verify
+   and that claims a position strictly before the retention watermark gets
+   `410 cursor_expired`.*
 4. Re-requesting the same cursor returns the same items in the same order,
    plus possibly more at the end. **Exception:** observations of a company
    erased in the meantime may be absent; the `company_erased` tombstone always
@@ -59,8 +64,12 @@ credential; the website token is rejected). `limit` defaults to 200. Omit
    and must persist `next_cursor` only after the page is applied (atomically
    with it where possible).
 6. A cursor older than the resolver's retention buffer gives `410` with
-   `{ "version": "1", "error": "cursor_expired" }`. The consumer has missed
-   data and must alert and resynchronise from the start of the buffer. It
+   `{ "version": "1", "error": "cursor_expired" }` and no items. *(Wording
+   clarified by the owner, 3 Nov 2026, CHR-66 N1:)* this signals a
+   **potential synchronisation continuity gap**, never a recovery. The
+   consumer must record the gap durably, alert, and resynchronise from the
+   start of the buffer; the resynchronisation rebuilds the projection from
+   what is still retained and does not recover items pruned before it. It
    must never silently skip.
 
 ## Retention (owner decision D3)
@@ -104,37 +113,52 @@ UTC days inside the retained window.
   reporting token is not used because the consumer holds it). **Addition:**
   rotating that secret invalidates every outstanding cursor: its tag no longer
   verifies.
-* **Clarification (CHR-66 N1): a cursor whose tag does not verify.** Such a
-  cursor never selects or serves items. The answer depends only on whether
-  it is well-formed (46 canonical base64url characters, known format, valid
-  kind and id) and on the position it claims, read **without** verification:
-  * well-formed and the claimed position lies **strictly before** the scope's
-    retention watermark: `410 cursor_expired`, exactly what the same cursor
-    received before the rotation. Data was missed; guarantee 6 applies
-    (alert, operator-driven resynchronisation).
-  * any other case (malformed, or claiming a position at or after the
-    watermark, or no watermark yet): `400 invalid_request`.
+* **Owner clarification (3 Nov 2026, CHR-66 N1) of guarantee 3.** A
+  structurally valid cursor that claims a position strictly before the
+  retention watermark receives `410 cursor_expired` even when its integrity
+  tag cannot be verified. A failed signature does not establish that the
+  cursor was ever authentic, and such a cursor cannot be told apart from one
+  signed with a rotated key. Malformed cursors, and cursors with an invalid
+  tag whose claimed position is within retention, still receive `400
+  invalid_request`. This error path returns no items. The claimed position is
+  only compared in memory with the scope's watermark; it never parameterises a
+  database query and triggers no other processing. A 410 signals a
+  **potential synchronisation continuity gap**, never a successful recovery.
+  The consumer must record it durably and alert, even if it later performs a
+  full resynchronisation (the reference adapter records it in
+  `idr_sync_gaps`). A separate cursor-signing secret with a key ring is
+  deferred beyond V1.
+
+  Precise behaviour for a cursor whose tag does not verify:
+  * structurally valid (46 canonical base64url characters, known format,
+    valid kind and id) and the claimed position lies **strictly before** the
+    scope's retention watermark: `410` with exactly
+    `{ "version": "1", "error": "cursor_expired" }`, which is what the same
+    cursor received before a rotation of `IP_HMAC_SECRET`;
+  * structurally valid and claiming a position at or after the watermark, or
+    the scope has no watermark yet: `400 invalid_request`;
+  * malformed: `400 invalid_request`, with no database access at all;
   * the watermark cannot be read: `500 internal`, never a `400`.
 
-  A consumer that receives `400` to a request **that carried a cursor** must
-  automatically restart from the start of the buffer (reset its stored cursor,
-  using the same compare-and-set as any cursor change, and request without
-  `after`). That replay is safe: the resolver has pruned nothing after the
-  cursor's position (otherwise the answer would have been `410`), and the
-  consumer applies idempotently. A `400` to a request **without** a cursor is
-  a contract error and must not trigger a reset. The reference engine records
-  the status `cursor_rejected` for a run that restarted after a `400`, and
-  `needs_resync` after a `410`.
+  The only database access on this path is the read of the scope's
+  watermark, parameterised by the server-configured scope alone; the feed
+  query is never run. A consumer that receives `400` to a request **that
+  carried a cursor** must automatically restart from the start of the buffer
+  (reset its stored cursor, using the same compare-and-set as any cursor
+  change, and request without `after`). That replay is safe: the resolver has
+  pruned nothing after the cursor's position (otherwise the answer would have
+  been `410`), and the consumer applies idempotently. A `400` to a request
+  **without** a cursor is a contract error and must not trigger a reset. The
+  reference engine records the status `cursor_rejected` for a run that
+  restarted after a `400`, and `needs_resync` plus an `idr_sync_gaps` row
+  after a `410`.
 
-  Precisely: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
+  In short: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
   is behind the retention watermark, and otherwise `400` followed by a safe
-  replay. Limits: (a) the tag cannot tell a stale cursor from a forged one or
-  one issued for another scope, so such a cursor that claims a position
-  before the watermark also gets `410`; this refines guarantee 3 (a tampered
-  cursor gets `400`) and serves nothing. (b) The watermark check and the
-  consumer's restarted request are two reads: a retention run that passes the
-  consumer's position in the moment between them is not reported. Positions
-  are not secret, so answering from the claimed position leaks nothing.
+  replay. Known limit: the watermark check and the consumer's restarted
+  request are two reads, so a retention run that passes the consumer's
+  position in the moment between them is not reported. Positions are not
+  secret, so answering from the claimed position leaks nothing.
 
 ### Erasure and re-observation
 
@@ -168,8 +192,9 @@ UTC days inside the retained window.
   in the same statement as the delete, whatever the deletion path (retention,
   the inherited prune, a cascade or a manual delete), so no item can leave the
   feed silently. A cursor **strictly before** the watermark gets `410
-  cursor_expired`; a cursor at or after it continues normally. This holds for
-  a cursor whose tag no longer verifies as well (see "Positions and cursors").
+  cursor_expired` (a potential continuity gap; guarantee 6); a cursor at or
+  after it continues normally. This holds for a structurally valid cursor
+  whose tag does not verify as well (see "Positions and cursors").
   Omitting `after` always works and starts from the oldest retained item.
 * **Addition:** tombstones are never pruned by retention, so a consumer that
   resynchronises from the start still receives every erasure.

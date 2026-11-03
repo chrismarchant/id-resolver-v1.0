@@ -41,7 +41,8 @@ WHERE ctid IN (
   FOR UPDATE SKIP LOCKED)
 RETURNING 1`;
 
-const WATERMARK_SQL = `
+/** $1/$2 scope, and nothing else: no caller-supplied value ever parameterises this read. */
+export const FEED_WATERMARK_SQL = `
 SELECT pruned_through_txid::text AS txid, pruned_through_id::text AS id
 FROM feed_retention_watermarks
 WHERE installation_id = $1::text AND website_id = $2::text`;
@@ -53,7 +54,7 @@ WHERE installation_id = $1::text AND website_id = $2::text`;
  * (FEED_SQL in reporting-repo.ts). Callers wrap it in `guarded`.
  */
 export async function queryFeedWatermark(pool: Pool, scope: ObservationScope): Promise<FeedPosition | null> {
-  const res = await pool.query<{ txid: string; id: string }>(WATERMARK_SQL, [scope.installationId, scope.websiteId]);
+  const res = await pool.query<{ txid: string; id: string }>(FEED_WATERMARK_SQL, [scope.installationId, scope.websiteId]);
   const r = res.rows[0];
   return r ? { txid: BigInt(r.txid), kind: FEED_KIND_OBSERVATION, id: BigInt(r.id) } : null;
 }
