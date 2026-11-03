@@ -114,7 +114,12 @@ then make every feed consumer resynchronise.
 
 * `GET /healthz`: liveness, always 200 while the process serves HTTP.
 * `GET /readyz`: 200 only when the database answers and a job slot is free;
-  503 during shutdown.
+  503 during shutdown. The probe is unauthenticated and not rate limited, so
+  its database ping is cached for 1 s and single-flight (CHR-66 F6): however
+  many probes arrive, at most one ping is in flight and at most one starts
+  per second, so a probe flood cannot take connections from entrance jobs or
+  the feed. A database failure therefore shows within about 1 s plus the
+  ping's own 1 s timeout; the job-slot check is made on every request.
 
 ## Residual risks of the single-process model
 

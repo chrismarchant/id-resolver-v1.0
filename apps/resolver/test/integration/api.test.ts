@@ -7,6 +7,7 @@
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { READINESS_CACHE_MS } from "../../src/api/readiness.js";
 import { buildServer } from "../../src/api/server.js";
 import { createMemoryLogger } from "../../src/log/index.js";
 import { RunnerOverloadedError, type JobRequest, type ResolutionOutcome, type Runner } from "../../src/contracts/runtime.js";
@@ -70,7 +71,9 @@ describe("resolver API: POST /v1/entrances", () => {
   let runner: ReturnType<typeof fakeRunner>;
   let pingOk = true;
   let outcomeFor: (job: JobRequest) => Promise<ResolutionOutcome> = async () => QUALIFIED_RECORDED;
-  const now = () => NOW;
+  // Fixed at NOW; only the readiness tests move it (readiness caches by this clock) and they restore it.
+  let clockMs = NOW;
+  const now = () => clockMs;
 
   beforeAll(async () => {
     logger = createMemoryLogger();
@@ -327,13 +330,71 @@ describe("resolver API: POST /v1/entrances", () => {
   });
 
   it("serves liveness and readiness", async () => {
-    expect((await app.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
-    expect((await app.inject({ method: "GET", url: "/readyz" })).statusCode).toBe(200);
-    pingOk = false;
-    const r = await app.inject({ method: "GET", url: "/readyz" });
-    expect(r.statusCode).toBe(503);
-    expect(r.json()).toEqual({ ok: false });
-    pingOk = true;
+    try {
+      expect((await app.inject({ method: "GET", url: "/healthz" })).statusCode).toBe(200);
+      expect((await app.inject({ method: "GET", url: "/readyz" })).statusCode).toBe(200);
+      pingOk = false;
+      // One ping result is reused for READINESS_CACHE_MS (CHR-66 F6): the failure shows once that window has passed.
+      clockMs += READINESS_CACHE_MS;
+      const r = await app.inject({ method: "GET", url: "/readyz" });
+      expect(r.statusCode).toBe(503);
+      expect(r.json()).toEqual({ ok: false });
+      pingOk = true;
+      clockMs += READINESS_CACHE_MS;
+      expect((await app.inject({ method: "GET", url: "/readyz" })).statusCode).toBe(200);
+    } finally {
+      pingOk = true;
+      clockMs = NOW;
+    }
+  });
+
+  it("readiness pings the database at most once per window, however many unauthenticated probes arrive; concurrent probes share one ping (CHR-66 F6)", async () => {
+    let clock = NOW;
+    let pings = 0;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let result: () => boolean = () => true;
+    const ping = async () => {
+      pings += 1;
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight -= 1;
+      return result();
+    };
+    const app7 = await buildServer({ config: testConfig(), logger, runner: fakeRunner(), ping, now: () => clock });
+    const burst = async (n: number) => (await Promise.all(Array.from({ length: n }, () => app7.inject({ method: "GET", url: "/readyz" })))).map((r) => r.statusCode);
+    try {
+      // 50 concurrent probes: one ping, shared.
+      expect(await burst(50)).toEqual(Array(50).fill(200));
+      expect(pings).toBe(1);
+      // More probes inside the same window reuse the result.
+      clock += READINESS_CACHE_MS - 1;
+      expect(await burst(50)).toEqual(Array(50).fill(200));
+      expect(pings).toBe(1);
+      // The next window: exactly one more ping, and it sees the database fail.
+      result = () => false;
+      clock += 1;
+      expect(await burst(50)).toEqual(Array(50).fill(503));
+      expect(pings).toBe(2);
+      // A failure is cached too, so a flood while the database is down adds no pool demand.
+      expect(await burst(50)).toEqual(Array(50).fill(503));
+      expect(pings).toBe(2);
+      // A throwing ping counts as not ready.
+      result = () => {
+        throw new Error("injected failure");
+      };
+      clock += READINESS_CACHE_MS;
+      expect(await burst(20)).toEqual(Array(20).fill(503));
+      expect(pings).toBe(3);
+      result = () => true;
+      clock += READINESS_CACHE_MS;
+      expect(await burst(20)).toEqual(Array(20).fill(200));
+      expect(pings).toBe(4);
+      expect(maxInFlight).toBe(1);
+    } finally {
+      await app7.close();
+    }
   });
 
   it("authenticates by matched route, not raw request target", async () => {
