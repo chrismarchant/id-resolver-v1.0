@@ -2,12 +2,14 @@
 //   node --test docs/staging/acceptance/self-test.mjs
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { createCanary, headersContaining, loadConfig } from "./canary-sink.mjs";
-import { Refusal, confirmTarget, hostInZone, makeRedactor, parseTarget, percentile, rawRequest } from "./lib/common.mjs";
+import { containsIp, createCanary, headersContaining, ipLiterals, loadConfig, scrubIps as canaryScrub } from "./canary-sink.mjs";
+import { Refusal, confirmTarget, hostInZone, makeRedactor, parseTarget, percentile, rawRequest, scrubIps } from "./lib/common.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TOKEN = "0123456789abcdef0123456789abcdef"; // the repository's allowlisted synthetic pattern
@@ -58,6 +60,36 @@ test("headersContaining returns names, never values", () => {
   assert.deepEqual(headersContaining({ "x-real-ip": IP }, null), []);
 });
 
+// The tester's IP in every spelling a platform or proxy might use (G4-I8 / T5).
+const IP_SPELLINGS = [IP, `${IP}:443`, `[${IP}]`, `::ffff:${IP}`, "::FFFF:C633:6407", "::ffff:c633:6407", "64:ff9b::c633:6407", `::${IP}`];
+const IP6 = "2001:db8::7"; // RFC 3849
+const IP6_SPELLINGS = [IP6, "2001:DB8::7", "2001:0db8:0000:0000:0000:0000:0000:0007", "2001:db8:0:0:0:0:0:7", `[${IP6}]:443`, "2001:DB8:0::0:7"];
+
+test("the canary recognises the tester's IP in any spelling, in raw headers (every repeated copy), and returns names only", () => {
+  for (const v of IP_SPELLINGS) assert.equal(containsIp(`for="${v}";proto=https`, IP), true, v);
+  for (const v of IP6_SPELLINGS) assert.equal(containsIp(`a, ${v}`, IP6), true, v);
+  for (const v of ["203.0.113.9", "198.51.100.8", "2001:db8::8", "1.1 edge", "cf-ray-abc", "2026-11-03T10:00:00Z"]) assert.equal(containsIp(v, IP), false, v);
+  // Node keeps only the first User-Agent / Referer in req.headers; the raw headers keep every copy.
+  const raw = ["User-Agent", "site-worker/1.0", "user-agent", `x ${IP}`, "Referer", "https://www.example.com/", "X-Visitor", "::FFFF:C633:6407", "Via", "1.1 edge", "Bad Name", IP];
+  assert.deepEqual(headersContaining(raw, IP), ["<nonstandard-name>", "user-agent", "x-visitor"]);
+  assert.deepEqual(headersContaining(raw, null), []);
+});
+
+test("scrubIps (redactor and canary) removes every IP spelling and keeps ordinary text", () => {
+  const text = [...IP_SPELLINGS, ...IP6_SPELLINGS, "connect ECONNREFUSED 203.0.113.5:443", "fe80::1%eth0"].join(" | ");
+  for (const scrub of [scrubIps, canaryScrub]) {
+    const out = scrub(text);
+    assert.deepEqual(ipLiterals(out), [], out);
+    assert.ok(!/198\.51|c633|2001:|db8|203\.0/i.test(out), out);
+  }
+  for (const keep of ["median 12.3 ms p95 4.5", "2026-11-03T22:13:00.123Z", "cf-connecting-ip 0/40", "Wrangler 4.157.0", "/landing/ttfb-abcd-12"]) {
+    assert.equal(scrubIps(keep), keep);
+    assert.equal(canaryScrub(keep), keep);
+  }
+  const r = makeRedactor([TOKEN, IP6], {});
+  assert.equal(r(`a ${IP6.toUpperCase()} b 2001:0db8:0000:0000:0000:0000:0000:0007 c ${TOKEN}`), "a [redacted] b [ip] c [redacted]");
+});
+
 test("canary: authentication, modes, IP booleans, header canary, ceiling, and no IP in its results", async () => {
   const cfg = loadConfig({ CANARY_TOKEN: TOKEN, CANARY_BIND: "127.0.0.1", PORT: "1" });
   const { server } = createCanary(cfg);
@@ -85,8 +117,12 @@ test("canary: authentication, modes, IP booleans, header canary, ceiling, and no
     assert.equal((await post("/_canary/mode", { mode: "503" })).status, 204);
     assert.equal((await post("/v1/entrances", { ...entrance, entrance_id: "abcdefghijklmnop4" })).status, 503);
     assert.equal((await post("/ceiling/probe/25", {})).status, 204);
+    // Body strings that carry an IP are kept with [ip] in its place.
+    assert.equal((await post("/m/ok/v1/events", { contract: "event.v1", event_id: `eeeeeeeeeeeeeeee2`, name: `x ${IP}`, page_key: `/landing/${IP}/::ffff:c633:6407`, [IP]: 1 })).status, 200);
     const res = await rawRequest(`${base}/_canary/results`, { headers: auth });
     assert.equal(res.status, 200);
+    assert.deepEqual(ipLiterals(res.body), [], "the results contain no IP literal in any spelling");
+    assert.ok(!/c633/i.test(res.body));
     assert.ok(!res.body.includes(IP), "the results never contain the tester's IP");
     assert.ok(!res.body.includes(FORGED), "the results never contain the forged IP");
     assert.ok(!res.body.includes(TOKEN), "the results never contain the token");
@@ -99,6 +135,10 @@ test("canary: authentication, modes, IP booleans, header canary, ceiling, and no
     assert.deepEqual([third.mode, third.ip.matchesForged, third.ip.matchesExpected], ["500", true, false]);
     assert.equal(j.counts.authFailed, 2);
     assert.deepEqual(j.ceiling.map((c) => [c.probeId, c.offsetS]), [["probe", 25]]);
+    const scrubbed = j.records.find((r) => r.id === "eeeeeeeeeeeeeeee2");
+    assert.deepEqual([scrubbed.pageKey, scrubbed.name, scrubbed.keys.includes("[ip]"), scrubbed.bodyContainsClientIp], ["/landing/[ip]/[ip]", "x [ip]", true, true]);
+    assert.equal(first.bodyContainsClientIp, false, "the entrance's own ip field does not count");
+    assert.ok(first.headerNames.includes("x-real-ip") && first.headerNames.includes("cf-connecting-ip"));
     assert.equal((await post("/_canary/reset", {})).status, 204);
     const after = JSON.parse((await rawRequest(`${base}/_canary/results`, { headers: auth })).body);
     assert.deepEqual([after.records.length, after.expectationSet, after.mode], [0, false, "ok"]);
@@ -179,4 +219,113 @@ test("supabase-hosted-check refuses to run without explicit targets, and never e
   const dry = run("supabase-hosted-check.mjs", SB, ["--dry-run", "--confirm-target", "abcdefghijklmnopqrst"]);
   assert.equal(dry.status, 0, dry.stderr);
   for (const v of [TOKEN, "abcdefghijklmnopqrst", "idr-staging"]) assert.ok(!dry.stdout.includes(v), `dry-run output must not contain ${v}`);
+});
+
+// End to end: cf-site-check (phase ttfb, --local-probe) against a stand-in site whose outbound requests leak the
+// tester's IP in many headers and spellings. The run must FAIL G4-I8 with the header NAMES, and nothing it prints or
+// writes may contain the IP in any form.
+function standInSite(canaryPort, leak) {
+  let n = 0;
+  return http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "text/html" }).end("<!doctype html><html><body>page</body></html>");
+    const path = new URL(req.url, "http://site.invalid").pathname;
+    if (!path.startsWith("/landing/")) return; // the control prefix of --local-probe is /m/none/
+    const ip = req.headers["cf-connecting-ip"]; // --local-probe sends the tester IP here, like the probe app reads it
+    const body = JSON.stringify({ contract: "entrance.v1", website_id: "w", ip, entrance_id: `entrance${String(++n).padStart(12, "0")}`, occurred_at: "2026-11-03T10:00:00Z", page_key: path, acquisition: "direct", eligibility: "tsa-1" });
+    const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json", "content-length": Buffer.byteLength(body), ...leak };
+    const out = http.request({ host: "127.0.0.1", port: canaryPort, path: "/v1/entrances", method: "POST", headers }, (r) => r.resume());
+    out.on("error", () => {});
+    out.end(body);
+  });
+}
+
+async function runLeakCase(testerIp, leak) {
+  const cfg = loadConfig({ CANARY_TOKEN: TOKEN, CANARY_BIND: "127.0.0.1", PORT: "1" });
+  const { server: canary } = createCanary(cfg);
+  await new Promise((r) => canary.listen(0, "127.0.0.1", r));
+  const canaryPort = canary.address().port;
+  const site = standInSite(canaryPort, leak);
+  await new Promise((r) => site.listen(0, "127.0.0.1", r));
+  const sitePort = site.address().port;
+  const dir = mkdtempSync(join(tmpdir(), "idr-selftest-"));
+  const outFile = join(dir, "out.json");
+  try {
+    const env = {
+      ACCEPT_SITE_URL: `http://127.0.0.1:${sitePort}`,
+      ACCEPT_SITE_ZONE: "probe.invalid",
+      ACCEPT_RESOLVER_URL: `http://127.0.0.1:${canaryPort}`,
+      ACCEPT_CANARY_URL: `http://127.0.0.1:${canaryPort}`,
+      ACCEPT_CANARY_TOKEN: TOKEN,
+      ACCEPT_TESTER_IP: testerIp,
+    };
+    const r = await new Promise((resolve) => {
+      const p = spawn(process.execPath, [join(HERE, "cf-site-check.mjs"), "--local-probe", "--phase", "ttfb", "--samples", "5", "--confirm-target", `127.0.0.1:${sitePort}`, "--out", outFile], { env: { PATH: process.env.PATH, ...env } });
+      let stdout = "";
+      let stderr = "";
+      p.stdout.on("data", (d) => (stdout += d));
+      p.stderr.on("data", (d) => (stderr += d));
+      p.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+    return { ...r, file: readFileSync(outFile, "utf8") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    site.closeAllConnections();
+    canary.closeAllConnections();
+    await new Promise((r) => site.close(r));
+    await new Promise((r) => canary.close(r));
+  }
+}
+
+const G4I8_FAIL = /FAIL \[ttfb \(canary mode ok\)\] ttfb: G4-I8, no request header at the resolver's hosting position carries the visitor's IP \(local workerd\) \(headers carrying it: ([a-z0-9<>, -]+)\)/;
+
+test("cf-site-check: an IPv4 tester IP leaked in many headers and spellings is a G4-I8 FAIL naming the headers, and no output holds the IP", async () => {
+  const leak = {
+    "cf-connecting-ip": IP,
+    "x-real-ip": IP,
+    "x-forwarded-for": `192.0.2.1, ${IP}`,
+    forwarded: `for="${IP}:443";proto=https`,
+    "true-client-ip": `::ffff:${IP}`,
+    "x-visitor": "::FFFF:C633:6407",
+    "user-agent": ["site-worker/1.0", `worker ${IP}`], // the second copy is dropped from Node's req.headers
+    "cf-ray": "0123456789abcdef-AMS",
+  };
+  const r = await runLeakCase(IP, leak);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  const m = G4I8_FAIL.exec(r.stdout);
+  assert.ok(m, r.stdout);
+  assert.equal(m[1], "cf-connecting-ip, forwarded, true-client-ip, user-agent, x-forwarded-for, x-real-ip, x-visitor");
+  assert.match(r.stdout, /PASS .*trust policy cloudflare: the entrance carried the tester's real IP/);
+  assert.match(r.stdout, /every header name that arrived \(all were inspected\) \(.*x-visitor/);
+  const doc = JSON.parse(r.file);
+  assert.ok(doc.items.some((i) => i.kind === "FAIL" && /headers carrying it: cf-connecting-ip/.test(i.detail)));
+  for (const [where, text] of [["stdout", r.stdout], ["stderr", r.stderr], ["--out file", r.file]]) {
+    assert.deepEqual(ipLiterals(text), [], `${where} holds no IP literal`);
+    for (const form of [IP, "198.51.100", "c633", "6407", "51.100.7"]) assert.ok(!text.toLowerCase().includes(form.toLowerCase()), `${where} must not contain ${form}`);
+  }
+});
+
+test("cf-site-check: an IPv6 tester IP leaked in other spellings is a G4-I8 FAIL, and no output holds the IP", async () => {
+  const leak = {
+    "cf-connecting-ip": "2001:DB8::7",
+    "x-real-ip": "2001:0db8:0000:0000:0000:0000:0000:0007",
+    forwarded: `for="[${IP6}]:443"`,
+    "x-forwarded-for": "192.0.2.1, 2001:db8:0:0::7",
+    referer: ["https://www.example.com/", `https://www.example.com/?via=${IP6}`],
+  };
+  const r = await runLeakCase(IP6, leak);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  const m = G4I8_FAIL.exec(r.stdout);
+  assert.ok(m, r.stdout);
+  assert.equal(m[1], "cf-connecting-ip, forwarded, referer, x-forwarded-for, x-real-ip");
+  for (const [where, text] of [["stdout", r.stdout], ["stderr", r.stderr], ["--out file", r.file]]) {
+    assert.deepEqual(ipLiterals(text), [], `${where} holds no IP literal`);
+    assert.ok(!/2001:|db8/i.test(text), `${where} must not contain any spelling of the IPv6 address`);
+  }
+});
+
+test("cf-site-check: a stand-in site that leaks nothing gives INFO (local: no edge claim) and exit 0", async () => {
+  const r = await runLeakCase(IP, { "cf-ray": "0123456789abcdef-AMS" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /INFO \[ttfb \(canary mode ok\)\] ttfb: G4-I8 header canary \(local workerd: not the production edge, no claim\) \(no header carried the tester IP/);
+  assert.deepEqual(ipLiterals(r.stdout + r.file), []);
 });

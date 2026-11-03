@@ -1,3 +1,4 @@
+import { isCollectorPath } from "./collector-path.js";
 import { intIn, resolveDelivery, type ResolvedDelivery, type ResolverDeliveryOptions } from "./config.js";
 import { deliverEvent } from "./delivery.js";
 import { formatOccurredAt, normalisePageKey } from "./payload.js";
@@ -160,9 +161,11 @@ interface State {
   replay: ReplayCache;
   rate: RateBudget;
   inFlight: InFlight;
+  /** `skipped/collector:path_mismatch` was reported (at most once per route instance). */
+  pathMismatchReported: boolean;
 }
 
-const newState = (cfg: ResolvedCollector): State => ({ cfg, replay: new ReplayCache(cfg.replayCacheSize, 2 * cfg.maxClockSkewMs), rate: new RateBudget(cfg.rateEvents, cfg.rateWindowMs), inFlight: { n: 0 } });
+const newState = (cfg: ResolvedCollector): State => ({ cfg, replay: new ReplayCache(cfg.replayCacheSize, 2 * cfg.maxClockSkewMs), rate: new RateBudget(cfg.rateEvents, cfg.rateWindowMs), inFlight: { n: 0 }, pathMismatchReported: false });
 
 /** No body, no cookie, never cached. */
 function bare(status: number): Response {
@@ -299,6 +302,9 @@ async function askConsent(hook: (request: Request) => boolean | Promise<boolean>
  *
  * `options` may be a function, evaluated on the first request. A lazily found configuration error disables the
  * route (every POST is answered `204` and dropped) and is reported once as `skipped/config_invalid`.
+ *
+ * Mount it at `collectorPath` (default `/idr/e`), the path the entrance middleware never reports. When a POST
+ * arrives on another path, `skipped/collector:path_mismatch` is reported once; the answer is unchanged.
  */
 export function createCollectorRoute(options: CollectorRouteOptions | (() => CollectorRouteOptions)): CollectorRouteHandler {
   if (typeof (globalThis as { window?: unknown }).window !== "undefined") {
@@ -333,6 +339,20 @@ export function createCollectorRoute(options: CollectorRouteOptions | (() => Col
       void fire(c.onDeliveryResult, skipped(`collector:${reason}`, started));
       return bare(status);
     };
+    // A signal only, never a refusal: the route is mounted at a path other than `collectorPath`, so the entrance
+    // middleware (which excludes `collectorPath`) does not exclude this route's path. Reported once per instance.
+    if (!s.pathMismatchReported) {
+      let path: string | null = null;
+      try {
+        path = new URL(request.url).pathname;
+      } catch {
+        path = null;
+      }
+      if (path !== null && !isCollectorPath(path, c.collectorPath)) {
+        s.pathMismatchReported = true;
+        void fire(c.onDeliveryResult, skipped("collector:path_mismatch", started));
+      }
+    }
 
     // 2. CSRF-style origin checks.
     const origin = request.headers.get("origin");

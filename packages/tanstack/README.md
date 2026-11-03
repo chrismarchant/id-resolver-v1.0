@@ -76,6 +76,7 @@ exactly what `next()` returned, so it composes with any other middleware.
 | `maxInFlight` | 50 (1 to 500) | reports in flight per process/isolate; extra ones are dropped (`overload`) |
 | `onUnsupportedBackground`, `blockingBudgetMs` | `"drop"`, 250 (50 to 1000) | edge isolate with no `waitUntil` only: drop, or block for at most the budget |
 | `eligibility` | `{}` | `includePaths`, `excludePaths` (exact path, `/prefix/*`, or RegExp), `extraBotPatterns` |
+| `collectorPath` | `/idr/e` | the path of the collector route (`createCollectorRoute`), never reported, see "What is sent, and when". A plain path: no query string, fragment, wildcard, percent-encoding, empty or dot segment; at most 256 characters; not `/` |
 | `pageKeyMapper` | none | your own mapper, e.g. `compileRouteTemplates(["/blog/:slug", "/products/:id"])`. The conservative default mapper still runs after it (see below) |
 | `pageKeyDefaultMapper` | `true` | `false` switches the default mapper off so that `pageKeyMapper` alone decides; requires `pageKeyMapper` (see below) |
 | `siteHosts` | host of the request URL | host names counted as "internal" referrers |
@@ -112,6 +113,32 @@ HTML response to a **GET** that is not excluded by any of:
 * static asset extensions, `/_serverFn`, `/_server`, `/_build`, `/assets`, `/.well-known`, `/api`, health paths
   (`/health`, `/healthz`, `/readyz`, `/livez`, `/ping`), robots, sitemaps, favicon
 * your `excludePaths` (and anything outside `includePaths`, when set)
+* **the collector path**, by default and without any configuration (see below)
+
+**The collector path is never an entrance.** With only `POST` registered on the collector route (as shown under
+"Browser events"), TanStack Start serves a `GET` or `HEAD` to `/idr/e` itself: its router renders the empty route
+page, `200 text/html`. Before Gate 5 the middleware reported such a browser navigation as an entrance with
+`page_key` `/idr/e` (finding G5-D-F1). The middleware now never reports the path in `collectorPath` (default
+`/idr/e`):
+
+* whether or not the site mounts `createCollectorRoute`, whatever the route's `allow` list or `consent` mode;
+* for every HTTP method (it is checked before the method rule, on its own);
+* in every spelling the router routes there: upper or mixed case (TanStack Router matches static segments
+  case-insensitively by default), trailing or repeated slashes, percent-encoded characters (`/idr/%65`), and a
+  doubled leading slash. An encoded `%2F` separator is excluded too. That is deliberate over-exclusion of this one
+  path. A different path is never excluded: `/idr/ex`, `/idr/e-mail`, `/idr` and `/idr/e/x` stay eligible;
+* `includePaths` cannot re-admit it, and `excludePaths: ["/idr/e"]` is no longer needed (it is harmless).
+
+Such a request is reported to `onDeliveryResult` as `skipped/eligibility:collector_path`. Only the report is
+skipped: the page, its status and its headers are exactly what your router answered, and the response object is
+returned untouched.
+
+**One path, three places.** The collector's `endpoint`, the route file's path (`createFileRoute("/idr/e")`) and
+`collectorPath` must be the same value. With the documented `/idr/e` the default already matches and you configure
+nothing. If you mount the route elsewhere, set `collectorPath` to that path in the options of **both** the middleware
+and the route (one shared options object does both). If a `POST` reaches the route on any other path, the route
+reports `skipped/collector:path_mismatch` once per instance (its answers do not change). That signal means the
+middleware is not excluding the path the route really lives on.
 
 The body is exactly: `contract`, `website_id`, `ip`, `entrance_id` (128-bit random, base64url), `occurred_at` (now, UTC),
 `page_key` (normalised path with identifier-like segments replaced, see below; at most 256 characters, never a query string or fragment), `acquisition` (one of
@@ -208,8 +235,10 @@ Called once per handled request with a non-identifying object, never with an IP,
 ```
 
 `reason`: `ok`; `timeout`, `network`, `http_4xx`, `http_429`, `http_5xx`, `http_other` (dropped); `overload` (dropped);
-`no_background_context`, `config_invalid`, `eligibility:<rule>` (for example `eligibility:bot_or_monitor`),
-`ip:<reason>` (for example `ip:ip_non_public`, `ip:header_missing`), `collector:<check>` (the collector route, see below) (skipped). A thrown or rejected hook is ignored.
+`no_background_context`, `config_invalid`, `eligibility:<rule>` (for example `eligibility:bot_or_monitor`, or
+`eligibility:collector_path` for a request to the collector path), `ip:<reason>` (for example `ip:ip_non_public`,
+`ip:header_missing`), `collector:<check>` (the collector route, see below, including `collector:path_mismatch`)
+(skipped). A thrown or rejected hook is ignored.
 
 ```ts
 onDeliveryResult: (r) => { if (r.outcome !== "skipped") console.log("idr", r.outcome, r.reason, r.attempts); }
@@ -263,7 +292,7 @@ billing decisions.
 ### TanStack Start server route
 
 ```ts
-// src/routes/idr.e.ts  ->  POST /idr/e   (use the same path as the collector's `endpoint`)
+// src/routes/idr.e.ts  ->  POST /idr/e   (the same path as the collector's `endpoint` and `collectorPath`)
 import { createFileRoute } from "@tanstack/react-router";
 import { createCollectorRoute } from "@salescrusader/idr-tanstack";
 
@@ -295,8 +324,8 @@ pattern and checks that neither the route code nor the token reaches client asse
 
 It uses the same server-only variables as the middleware, and the same resolver options: `resolverUrl`, `token`,
 `websiteId`, `timeoutMs`, `retry`, `retryDelayMs`, `maxInFlight`, `onUnsupportedBackground`, `blockingBudgetMs`,
-`pageKeyMapper`, `pageKeyDefaultMapper`, `allowInsecureHttp` and `onDeliveryResult`. One shared object can
-therefore be spread into both. The route has **no trust policy** and ignores one if given: it never reads a
+`pageKeyMapper`, `pageKeyDefaultMapper`, `allowInsecureHttp`, `collectorPath` and `onDeliveryResult`. One shared
+object can therefore be spread into both. The route has **no trust policy** and ignores one if given: it never reads a
 client IP.
 
 | option | default | meaning |
@@ -315,7 +344,7 @@ client IP.
 
 | # | check | refusal |
 |---|---|---|
-| 1 | method is `POST` | `405` (`Allow: POST`) |
+| 1 | method is `POST` | `405` (`Allow: POST`), only for a request the route sees: see the note below |
 | 2 | `Origin` is one of the site origins (missing, `null` or foreign: refused); `Sec-Fetch-Site`, when present, is `same-origin` | `403` |
 | 3 | content type is `application/json` or `text/plain` (the beacon's type) | `415` |
 | 4 | body at most 1 KiB: a larger `Content-Length` is refused without reading, and a streamed body is cancelled as soon as it passes 1 KiB; the whole body must arrive within `bodyTimeoutMs`, or the stream is cancelled | `413` / `408` |
@@ -326,11 +355,22 @@ client IP.
 | 9 | `event_id` not already accepted (replay cache, kept for twice the skew window; the resolver also stores one row per `event_id`) | `409` |
 | 10 | per-instance rate budget | `429` |
 
+**Check 1 and `GET`.** The route handles only the methods you register it for. With only `POST` registered, as
+above, a `GET` or `HEAD` to `/idr/e` never reaches `createCollectorRoute`: TanStack Start's router serves it as the
+empty route page (`200 text/html`, verified with TanStack Start 1.168 under local workerd). That is not an event:
+nothing is accepted or forwarded, and the middleware does not report it as an entrance (see "What is sent, and
+when"). A client therefore sees `405` only for methods the framework hands to the route. If you prefer `GET` and
+`HEAD` to answer `405` as well, register them yourself with a bare answer, for example
+`GET: () => new Response(null, { status: 405, headers: { allow: "POST", "cache-control": "no-store" } })` and the
+same for `HEAD`. This is optional; the entrance exclusion does not depend on it.
+
 An accepted event is answered `204` immediately, and then forwarded in the background. Every answer is bare: no
 body, no `Set-Cookie`, `Cache-Control: no-store`. A refusal is reported to `onDeliveryResult` as
 `skipped/collector:<check>`, where `<check>` is one of `origin`, `sec_fetch_site`, `content_type`, `too_large`,
 `body_timeout`, `malformed`, `schema`, `path`, `vocabulary`, `not_allowed`, `consent_off`, `gpc`, `consent`,
-`consent_timeout`, `occurred_at`, `replay` or `rate`.
+`consent_timeout`, `occurred_at`, `replay` or `rate`. One more `collector:` reason is a signal, not a refusal:
+`path_mismatch`, reported once per route instance when a `POST` arrives on a path other than `collectorPath` (the
+event is still handled as usual; see "One path, three places").
 
 ### What it forwards, and what it never reads
 
@@ -344,7 +384,8 @@ The forwarded body is exactly the `event.v1` resolver body, built from the valid
 * `page_key` comes from the browser's `path`, mapped with **the same composed mapper as the middleware**: your
   `pageKeyMapper`, then the default mapper. The browser's value is never forwarded as is.
 * `occurred_at` is re-serialised as whole-second UTC.
-* The forwarded request carries only `Authorization: Bearer <token>`, `Content-Type` and `Accept`.
+* The forwarded request carries only `Authorization: Bearer <token>`, `Content-Type` and `Accept`, as set by the
+  adapter (see "Outbound headers" below for what the platform may add).
 * The route reads only the `Origin`, `Sec-Fetch-Site`, `Content-Type`, `Content-Length` and `Sec-GPC` request
   headers. It never reads or forwards `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, the user
   agent, cookies, the referrer or any other header. Your own `hasConsent` hook may read your consent cookie; its
@@ -365,10 +406,28 @@ Delivery uses the same machinery and lifecycle as the entrance middleware (see "
 With an options function, a configuration error found at the first request disables the route: every POST gets
 `204` and is dropped, and `skipped/config_invalid` is reported once. An invalid options object throws at creation.
 
+## Outbound headers (G4-I8)
+
+Every request the adapter sends (entrances, events and `checkConnectivity`) is built from scratch: a URL string and
+exactly three headers, `Authorization: Bearer <token>`, `Content-Type: application/json` and
+`Accept: application/json`. The incoming request, its headers and its body are never copied, cloned or forwarded:
+not `CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`, `Forwarded`, `True-Client-IP`, `CF-IPCountry`, cookies, the
+user agent, the referrer, `Origin`, `Sec-GPC` or any other header. `test/outbound-headers.test.ts` asserts the exact
+header set on both paths for a request that carries the visitor's IP in all of those headers.
+
+**What the local tests cannot show.** These tests, the probe app under local workerd (`wrangler dev --local`,
+miniflare) and the Node runs show only what the adapter sets. They cannot show what the Cloudflare platform adds
+to a Worker's subrequest after it leaves the adapter. According to Cloudflare's header reference (as found by
+search; the versions found disagree, see the staging plan), such a subrequest can carry `CF-Connecting-IP` and
+`X-Real-IP`, and for some destinations these may hold the visitor's IP. No D4 transport
+isolation (no visitor IP reaching the resolver's host) is claimed from local tests. The staging test T5, run on
+the real Cloudflare edge, decides (`docs/staging/CLOUDFLARE_TEST_SITE.md`, section 4).
+
 ## Lower-level primitives
 
 `buildEntrance(request, options)` (eligibility, trust policy and payload, nothing sent), `selectClientIp(request,
-trustPolicy)`, `isEligible(request, rules)`, `classifyAcquisition({ referrer, siteHosts, utmMedium })`,
+trustPolicy)`, `isEligible(request, rules, collectorPath?)` (`collectorPath` defaults to `DEFAULT_COLLECTOR_PATH`,
+`/idr/e`; an invalid value throws), `classifyAcquisition({ referrer, siteHosts, utmMedium })`,
 `normalisePageKey(pathOrUrl, mapper?)` (applies exactly the mapper it is given; pass
 `composePageKeyMapper(yourMapper)` to get the adapter's composition with the default), `compileRouteTemplates(templates)`,
 `defaultPageKeyMapper`, `parsePublicIp(text)`, `checkConnectivity(options)`.

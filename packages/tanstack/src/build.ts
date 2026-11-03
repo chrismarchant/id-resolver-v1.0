@@ -12,7 +12,7 @@ export type BuildResult =
   | { ok: false; stage: "ip"; reason: IpRejectReason };
 
 export function buildFromConfig(request: Request, cfg: ResolvedConfig): BuildResult {
-  const elig = isEligible(request, cfg.eligibility);
+  const elig = isEligible(request, cfg.eligibility, cfg.collectorPath);
   if (!elig.eligible) return { ok: false, stage: "eligibility", reason: elig.reason };
   const sel = selectClientIp(request, cfg.trustPolicy, { allowDocumentationRanges: cfg.allowDocumentationRanges });
   if (!sel.ok) return { ok: false, stage: "ip", reason: sel.reason };

@@ -88,7 +88,7 @@ nothing the collector does throws into the page.
 
 | option | meaning |
 |---|---|
-| `endpoint` | required. A **same-origin path** such as `/idr/e`. Absolute URLs, `//host`, `/\host`, other schemes, a query or a fragment are refused at init |
+| `endpoint` | required. A **same-origin path** such as `/idr/e`. Absolute URLs, `//host`, `/\host`, other schemes, a query or a fragment are refused at init. Use the same path as the server route and the server adapter's `collectorPath` (default `/idr/e`), so that a navigation to it is never reported as an entrance (`packages/tanstack/README.md`) |
 | `allow` | required. The names this site collects, a subset of the vocabulary. Any other name is dropped silently, and an unknown name in `allow` throws |
 | `consent` | required. `"required"`, `"not_required"` or `"off"` (see below) |
 | `hasConsent()` | consent platform hook: returns `true` once the visitor has consented |

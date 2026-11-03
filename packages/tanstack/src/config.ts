@@ -1,3 +1,4 @@
+import { resolveCollectorPath } from "./collector-path.js";
 import type { EligibilityRules } from "./eligibility.js";
 import { composePageKeyMapper, type PageKeyMapper } from "./payload.js";
 import { validateTrustPolicy } from "./trust.js";
@@ -61,6 +62,13 @@ export interface ResolverDeliveryOptions {
   pageKeyDefaultMapper?: boolean;
   /** Permit an http:// resolver URL. Local development only. */
   allowInsecureHttp?: boolean;
+  /**
+   * The path of the first-party collector route, default `/idr/e`. The entrance middleware never reports a request
+   * to it (any method, any spelling the router would route there); the collector route reports
+   * `skipped/collector:path_mismatch` once when it is mounted elsewhere. Must equal the browser collector's
+   * `endpoint` and the route file's path. A plain path: no query string, fragment, wildcard or percent-encoding.
+   */
+  collectorPath?: string;
   /** Receives non-identifying status for every handled request. Exceptions it throws are swallowed. */
   onDeliveryResult?: (result: DeliveryResult) => void | Promise<void>;
   /** Injectable fetch (tests). Default: global fetch. */
@@ -91,6 +99,8 @@ export interface ResolvedDelivery {
   blockingBudgetMs: number;
   /** The mapper actually applied: the site's own mapper (if any) followed by the default, unless opted out. */
   pageKeyMapper: PageKeyMapper;
+  /** The collector path's match key (lower case, no trailing slash), see `isCollectorPath`. */
+  collectorPath: string;
   onDeliveryResult: ((result: DeliveryResult) => void | Promise<void>) | undefined;
   fetch: typeof fetch | undefined;
 }
@@ -151,6 +161,7 @@ export function resolveDelivery(options: ResolverDeliveryOptions): ResolvedDeliv
   if (options.pageKeyDefaultMapper === false && siteMapper === undefined) {
     throw new Error("idr-tanstack: pageKeyDefaultMapper: false requires your own pageKeyMapper");
   }
+  const collectorPath = resolveCollectorPath(options.collectorPath);
   const base = url.pathname.replace(/\/+$/, "");
   return {
     resolverBase: `${url.origin}${base}`,
@@ -163,6 +174,7 @@ export function resolveDelivery(options: ResolverDeliveryOptions): ResolvedDeliv
     onUnsupportedBackground,
     blockingBudgetMs,
     pageKeyMapper: composePageKeyMapper(siteMapper, options.pageKeyDefaultMapper !== false),
+    collectorPath,
     onDeliveryResult: options.onDeliveryResult,
     fetch: options.fetch,
   };

@@ -818,3 +818,54 @@ describe("collector route: configuration", () => {
     }
   });
 });
+
+describe("collector route: mounted at collectorPath (G5-D-F1 path_mismatch signal)", () => {
+  const at = (path: string) => ({ url: `${SITE}${path}` });
+  const mismatches = (t: ReturnType<typeof setup>) => t.reasons().filter((r) => r === "collector:path_mismatch").length;
+
+  it("at the default /idr/e (and its variants): no signal", async () => {
+    const t = setup();
+    for (const path of ["/idr/e", "/idr/e/", "/IDR/E", "/idr/%65"]) expect((await t.send(post(event(), {}, at(path)))).status).toBe(204);
+    expect(mismatches(t)).toBe(0);
+    expect(t.forwarded).toHaveLength(4);
+  });
+
+  it("mounted elsewhere: skipped/collector:path_mismatch once per instance; every answer and forward is unchanged", async () => {
+    const t = setup();
+    expect((await t.send(post(event(), {}, at("/t/collect")))).status).toBe(204);
+    expect((await t.send(post(event(), {}, at("/t/collect")))).status).toBe(204);
+    await expectBare(await t.send(post(event(), { origin: "https://evil.example.net" }, at("/t/collect"))), 403);
+    await expectBare(await t.send(post("{not json", {}, at("/t/collect"))), 400);
+    expect(t.forwarded).toHaveLength(2);
+    expect(t.reasons()).toEqual(["collector:path_mismatch", "collector:origin", "collector:malformed"]);
+    expect(t.results.filter((r) => r.outcome === "delivered")).toHaveLength(2);
+    // Non-identifying: the signal carries no path.
+    expect(JSON.stringify(t.results)).not.toContain("/t/collect");
+  });
+
+  it("a custom collectorPath that matches the mount point: no signal", async () => {
+    const t = setup({ collectorPath: "/t/collect" });
+    expect((await t.send(post(event(), {}, at("/t/collect")))).status).toBe(204);
+    expect((await t.send(post(event(), {}, at("/T/Collect/")))).status).toBe(204);
+    expect(mismatches(t)).toBe(0);
+    const u = setup({ collectorPath: "/t/collect" });
+    expect((await u.send(post(event(), {}, at("/idr/e")))).status).toBe(204);
+    expect(mismatches(u)).toBe(1);
+  });
+
+  it("a GET still gets the bare 405 and no signal", async () => {
+    const t = setup();
+    await expectBare(await t.send(post(event(), {}, { method: "GET", url: `${SITE}/t/collect` })), 405);
+    expect(t.results).toHaveLength(0);
+  });
+
+  it("an invalid collectorPath throws at creation (eager) and disables the route with config_invalid (lazy)", async () => {
+    expect(() => createCollectorRoute({ resolverUrl: RESOLVER, token: TEST_TOKEN, websiteId: "example-site", allow: ["cta_click"], collectorPath: "/idr/e?x=1" })).toThrow(/collectorPath/);
+    const results: DeliveryResult[] = [];
+    const r = fakeResolver();
+    const route = createCollectorRoute(() => ({ resolverUrl: RESOLVER, token: TEST_TOKEN, websiteId: "example-site", allow: ["cta_click"], collectorPath: "/", fetch: r.fetch, onDeliveryResult: (x) => void results.push(x) }));
+    expect((await route(post(event()))).status).toBe(204);
+    expect(r.forwarded).toHaveLength(0);
+    expect(results).toEqual([expect.objectContaining({ outcome: "skipped", reason: "config_invalid" })]);
+  });
+});

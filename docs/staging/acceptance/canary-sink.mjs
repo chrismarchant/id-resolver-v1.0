@@ -11,7 +11,11 @@
 //   * whether the body's `ip` equals the tester's IP or the forged IP (booleans only: the IP is never stored);
 //   * which request HEADERS were present, and the NAMES of headers whose value contains the tester's IP
 //     (G4-I8: a platform-added CF-Connecting-IP / X-Real-IP / X-Forwarded-For carrying the visitor's IP).
-// No header value, IP address or token is stored, logged or returned.
+//     Every header is inspected, every copy of a repeated header included (raw headers), and the IP is recognised in
+//     any spelling: upper or lower case, compressed or expanded IPv6, with a port or brackets, and IPv4 embedded in
+//     IPv6 (::ffff:a.b.c.d, its hex form ::ffff:xxxx:xxxx, ::a.b.c.d, 64:ff9b::a.b.c.d).
+// No header value, IP address or token is stored, logged or returned. The comparison happens in memory; strings
+// kept from request bodies (page_key, event name, ids, key names) have any IP literal replaced by [ip].
 //
 // Environment (all required unless marked optional; there are no defaults that point anywhere):
 //   CANARY_TOKEN         at least 32 characters. Bearer expected on /v1/* (set the staging site's
@@ -34,6 +38,7 @@
 //       node canary-sink.mjs --self-check     (validates the environment and exits; prints no value)
 import http from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import { pathToFileURL } from "node:url";
 
 const MODES = /^(ok|500|503|429|401|hang|reset|slow:(\d{1,5}))$/;
@@ -88,15 +93,91 @@ function bearerOk(req, token) {
   return timingSafeEqual(digest(given), digest(token)) && given.length === token.length;
 }
 
-/** Header NAMES whose value contains the needle (conservative substring match: a false positive fails safe). */
-export function headersContaining(headers, needle) {
-  if (!needle) return [];
-  const names = [];
-  for (const [name, value] of Object.entries(headers)) {
-    const v = Array.isArray(value) ? value.join(",") : String(value ?? "");
-    if (v.includes(needle)) names.push(name);
+/** Canonical text of one IP address (IPv4 dotted decimal; IPv6 compressed lower case, embedded IPv4 as hex), or null. */
+export function canonicalIp(text) {
+  const t = String(text ?? "").trim();
+  const kind = isIP(t);
+  if (kind === 4) return t;
+  if (kind !== 6) return null;
+  try {
+    return new URL(`http://[${t}]`).hostname.slice(1, -1);
+  } catch {
+    return null;
   }
-  return names.sort();
+}
+
+/** The canonical spellings that identify one address: itself, and for IPv4 the IPv6 forms that embed it. */
+export function ipForms(address) {
+  const c = canonicalIp(address);
+  if (c === null) return [];
+  if (isIP(c) !== 4) return [c];
+  const o = c.split(".").map(Number);
+  const hex = `${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  return [c, `::ffff:${hex}`, `::${hex}`, `64:ff9b::${hex}`];
+}
+
+/**
+ * Every IP literal in a text, canonicalised: tokens of hex digits, dots and colons, also with a trailing port or
+ * dot removed, and every dotted quad inside a token. Linear in the text length.
+ */
+export function ipLiterals(text) {
+  const out = new Set();
+  for (const m of String(text ?? "").matchAll(/[0-9A-Fa-f:.]{2,}/g)) {
+    const tok = m[0];
+    const tries = [tok, tok.replace(/\.+$/, ""), tok.replace(/:\d{1,5}$/, ""), tok.replace(/(?<!:):$/, "")];
+    for (const q of tok.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)) tries.push(q[0]);
+    for (const t of tries) {
+      const c = canonicalIp(t);
+      if (c !== null) out.add(c);
+    }
+  }
+  return [...out];
+}
+
+/** Replaces every IP literal (any spelling) in a kept string with [ip]. */
+export function scrubIps(text) {
+  return String(text).replace(/[0-9A-Fa-f:.]{2,}/g, (tok) => (ipLiterals(tok).length > 0 ? "[ip]" : tok));
+}
+
+/** Header names as kept: lower case, and a name outside the token alphabet is not kept verbatim. */
+const safeName = (name) => {
+  const n = String(name).toLowerCase();
+  return /^[a-z0-9-]{1,64}$/.test(n) ? n : "<nonstandard-name>";
+};
+
+/** [name, value] pairs: from raw headers ([n, v, n, v, ...], every repeated copy) or from a header object. */
+function headerPairs(headers) {
+  if (Array.isArray(headers)) {
+    const pairs = [];
+    for (let i = 0; i + 1 < headers.length; i += 2) pairs.push([headers[i], headers[i + 1]]);
+    return pairs;
+  }
+  return Object.entries(headers ?? {}).flatMap(([n, v]) => (Array.isArray(v) ? v.map((x) => [n, x]) : [[n, v]]));
+}
+
+/** True when the text contains the address in any spelling (case-insensitive substring, or a canonical IP match). */
+export function containsIp(text, address) {
+  if (!address) return false;
+  const v = String(text ?? "");
+  if (v.toLowerCase().includes(String(address).toLowerCase())) return true;
+  const forms = ipForms(address);
+  return forms.length > 0 && ipLiterals(v).some((ip) => forms.includes(ip));
+}
+
+/**
+ * Header NAMES whose value contains the address in any spelling (conservative: a false positive fails safe).
+ * Accepts raw headers (preferred: Node drops repeated copies of some headers from req.headers) or a header object.
+ */
+export function headersContaining(headers, address) {
+  if (!address) return [];
+  const names = new Set();
+  for (const [name, value] of headerPairs(headers)) if (containsIp(value, address)) names.add(safeName(name));
+  return [...names].sort();
+}
+
+/** The names of every header present (sanitised), for the "all headers checked" summary. */
+function headerNames(rawHeaders) {
+  return [...new Set(headerPairs(rawHeaders).map(([n]) => safeName(n)))].sort();
 }
 
 export function createCanary(cfg) {
@@ -135,9 +216,11 @@ export function createCanary(cfg) {
   function summary() {
     const presence = {};
     const withClientIp = {};
+    const names = {};
     for (const r of state.records) {
       for (const [k, v] of Object.entries(r.headerPresence)) if (v) presence[k] = (presence[k] ?? 0) + 1;
       for (const k of r.headersWithClientIp) withClientIp[k] = (withClientIp[k] ?? 0) + 1;
+      for (const k of r.headerNames) names[k] = (names[k] ?? 0) + 1;
     }
     return {
       contract: "idr-staging-canary.v1",
@@ -152,6 +235,7 @@ export function createCanary(cfg) {
         ceiling: state.ceiling.length,
       },
       headerPresence: presence,
+      headerNamesSeen: names,
       headersWithClientIp: withClientIp,
       records: state.records,
       ceiling: state.ceiling,
@@ -193,7 +277,7 @@ export function createCanary(cfg) {
     }
     if (path === "/_canary/expect") {
       const ip = typeof body.client_ip === "string" ? body.client_ip.trim() : "";
-      if (ip.length < 3 || ip.length > 64 || !/^[0-9a-fA-F:.]+$/.test(ip)) return send(res, 400, { error: "client_ip" });
+      if (ip.length < 3 || ip.length > 64 || !/^[0-9a-fA-F:.]+$/.test(ip) || canonicalIp(ip) === null) return send(res, 400, { error: "client_ip" });
       state.expectedIp = ip;
       return send(res, 204, undefined);
     }
@@ -216,28 +300,34 @@ export function createCanary(cfg) {
     const attempt = (state.seen.get(key) ?? 0) + 1;
     state.seen.set(key, attempt);
     const ipField = typeof body.ip === "string" ? body.ip : null;
+    const sameIp = (a, b) => a !== null && b !== null && canonicalIp(a) !== null && canonicalIp(a) === canonicalIp(b);
     const presence = {};
     for (const h of HEADER_WATCH) presence[h] = req.headers[h] !== undefined;
+    // Everything kept below is a boolean, a count, a header NAME, or a body string with IP literals replaced.
+    const kept = (v, max) => (typeof v === "string" ? scrubIps(v.slice(0, max)) : null);
     const record = {
       seq: state.records.length + 1,
       route,
       mode,
       at: Date.now(),
       attempt,
-      keys: Object.keys(body).sort(),
-      contract: typeof body.contract === "string" ? body.contract : null,
-      pageKey: typeof body.page_key === "string" ? body.page_key.slice(0, 256) : null,
-      name: route === "events" && typeof body.name === "string" ? body.name.slice(0, 64) : null,
-      id: typeof id === "string" ? id.slice(0, 64) : null,
+      keys: Object.keys(body).map((k) => scrubIps(k.slice(0, 64))).sort(),
+      contract: kept(body.contract, 32),
+      pageKey: kept(body.page_key, 256),
+      name: route === "events" ? kept(body.name, 64) : null,
+      id: kept(id, 64),
       bearer: true,
       ip: {
         present: ipField !== null,
-        matchesExpected: ipField !== null && state.expectedIp !== null && ipField === state.expectedIp,
-        matchesForged: ipField !== null && ipField === cfg.forgedIp,
+        matchesExpected: sameIp(ipField, state.expectedIp),
+        matchesForged: sameIp(ipField, cfg.forgedIp),
       },
+      // The tester's IP anywhere in the body other than the entrance's `ip` field (an event body has no `ip`).
+      bodyContainsClientIp: containsIp(JSON.stringify({ ...body, ip: undefined }), state.expectedIp),
       headerPresence: presence,
-      headersWithClientIp: headersContaining(req.headers, state.expectedIp),
-      headersWithForgedIp: headersContaining(req.headers, cfg.forgedIp),
+      headerNames: headerNames(req.rawHeaders),
+      headersWithClientIp: headersContaining(req.rawHeaders, state.expectedIp),
+      headersWithForgedIp: headersContaining(req.rawHeaders, cfg.forgedIp),
     };
     if (state.records.length < MAX_RECORDS) state.records.push(record);
 

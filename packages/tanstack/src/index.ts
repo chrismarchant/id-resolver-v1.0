@@ -1,6 +1,7 @@
 export { createIdrServerMiddleware, type IdrMiddlewareArgs } from "./middleware.js";
 export { buildEntrance, type BuildResult } from "./build.js";
 export { selectClientIp } from "./trust.js";
+export { DEFAULT_COLLECTOR_PATH } from "./collector-path.js";
 export { isEligible, type EligibilityRules, type EligibilityResult, type IneligibleReason, type PathPattern } from "./eligibility.js";
 export { classifyAcquisition, normalisePageKey, compileRouteTemplates, composePageKeyMapper, defaultPageKeyMapper, generateEntranceId, type AcquisitionInput, type PageKeyMapper } from "./payload.js";
 export { parsePublicIp, type ParsedIp } from "./ip.js";
