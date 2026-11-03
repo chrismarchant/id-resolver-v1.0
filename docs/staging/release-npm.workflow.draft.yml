@@ -1,0 +1,170 @@
+# DRAFT, NOT ACTIVE. Proposed npm release workflow for @salescrusader/idr-collector and
+# @salescrusader/idr-tanstack (owner decision D5). It lives under docs/staging/ on purpose: GitHub runs only files
+# in .github/workflows/. Activating it is an owner decision that needs the prerequisites in docs/NPM_PUBLISHING.md
+# (npm org and 2FA, a trusted publisher per package pointing at this file name and the environment below, the
+# GitHub environment with the owner as required reviewer, a tag ruleset). To activate: copy it to
+# .github/workflows/release-npm.yml unchanged (the trusted publisher is bound to that file name).
+#
+# Design:
+#   * Tag-triggered (idr-collector-v<semver>, idr-tanstack-v<semver>) or manual on a tag ref; never from a branch.
+#   * gate: the tag matches package.json, the package is no longer private, the tagged commit is on main, and
+#     ci.yml succeeded for exactly that commit.
+#   * verify: the package's own verify, with the bundle-safety probe and the real-browser CSP test REQUIRED.
+#   * publish: runs only after the owner approves the npm-release environment; npm trusted publishing (OIDC,
+#     id-token: write), so there is no npm token anywhere; provenance; a file-list allowlist and a size budget are
+#     checked on the exact tarball contents before publishing.
+#   * Actions are pinned to full commit SHAs (the same pins as ci.yml). Untrusted values (tag names, inputs) reach
+#     shell steps only through environment variables, never through ${{ }} inside a script.
+name: release-npm
+
+on:
+  push:
+    tags:
+      - "idr-collector-v*"
+      - "idr-tanstack-v*"
+  workflow_dispatch:
+    inputs:
+      dist_tag:
+        description: "npm dist-tag for a release version (prereleases always go to next)"
+        type: choice
+        options: ["latest", "next"]
+        default: "latest"
+
+permissions: {}
+
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: gate (tag, version, CI green on main)
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      workspace: ${{ steps.map.outputs.workspace }}
+      version: ${{ steps.map.outputs.version }}
+      dist_tag: ${{ steps.map.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Map the tag to a package and check its manifest
+        id: map
+        env:
+          TAG: ${{ github.ref_name }}
+          INPUT_DIST_TAG: ${{ inputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            idr-collector-v*) ws="@salescrusader/idr-collector"; dir="packages/collector"; v="${TAG#idr-collector-v}" ;;
+            idr-tanstack-v*)  ws="@salescrusader/idr-tanstack";  dir="packages/tanstack";  v="${TAG#idr-tanstack-v}" ;;
+            *) echo "unexpected tag"; exit 1 ;;
+          esac
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "the tag does not end in a semver"; exit 1; }
+          [ "$(node -p "require('./$dir/package.json').version")" = "$v" ] || { echo "package.json version differs from the tag"; exit 1; }
+          [ "$(node -p "require('./$dir/package.json').private === true")" = "false" ] || { echo "package.json still has private: true"; exit 1; }
+          [ "$(node -p "require('./$dir/package.json').license")" != "UNLICENSED" ] || { echo "license is still UNLICENSED"; exit 1; }
+          [ -f "$dir/LICENSE" ] || { echo "no LICENSE file in the package"; exit 1; }
+          [ -n "$(node -p "(require('./$dir/package.json').repository || {}).url || ''")" ] || { echo "package.json has no repository.url (needed for provenance)"; exit 1; }
+          if [[ "$v" == *-* ]]; then dist="next"; else dist="${INPUT_DIST_TAG:-latest}"; fi
+          echo "workspace=$ws" >> "$GITHUB_OUTPUT"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist" >> "$GITHUB_OUTPUT"
+      - name: The tagged commit is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: ci.yml succeeded for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          n=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=success&per_page=1" --jq '.total_count')
+          [ "$n" -ge 1 ] || { echo "no successful ci.yml run for this commit"; exit 1; }
+
+  verify:
+    name: verify the package (probe and browser tests required)
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high
+      - name: Probe app (bundle-safety input; own lockfile)
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix packages/tanstack/verification/cf-lifecycle
+      - name: Verify
+        env:
+          WS: ${{ needs.gate.outputs.workspace }}
+          IDR_REQUIRE_PROBE: "1"
+          IDR_REQUIRE_BROWSER: "1"
+        run: npm run verify -w "$WS"
+
+  publish:
+    name: publish to npm (owner approval, trusted publishing)
+    needs: [gate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Required reviewer: the owner. Deployment rule: tags idr-collector-v* and idr-tanstack-v* only.
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm trusted publishing and provenance; no npm token exists
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No registry-url here: setup-node would then write an .npmrc that expects a token.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: npm CLI with trusted publishing (11.5.1 or later), exact version
+        run: npm install -g npm@11.21.1 --ignore-scripts
+      - run: npm ci --ignore-scripts
+      - name: Build
+        env:
+          WS: ${{ needs.gate.outputs.workspace }}
+        run: npm run build -w "$WS"
+      - name: Pack and check the exact contents (allowlist, version, size budget)
+        env:
+          WS: ${{ needs.gate.outputs.workspace }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm pack -w "$WS" --dry-run --json --ignore-scripts > "$RUNNER_TEMP/pack.json"
+          node -e '
+            const j = JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"))[0];
+            const allow = {
+              "@salescrusader/idr-collector": [/^(README\.md|LICENSE|package\.json)$/, /^dist\/(index|vocabulary)\.(js|d\.ts)$/, /^dist\/idr-collector\.min\.js$/],
+              "@salescrusader/idr-tanstack": [/^(README\.md|LICENSE|LOVABLE_SETUP\.md|package\.json)$/, /^dist\/[a-z-]+\.(js|d\.ts)$/],
+            }[j.name];
+            const budget = { "@salescrusader/idr-collector": 20000, "@salescrusader/idr-tanstack": 60000 }[j.name];
+            const bad = j.files.map((f) => f.path).filter((p) => !allow.some((re) => re.test(p)));
+            const problems = [];
+            if (j.name !== process.env.WS) problems.push("name");
+            if (j.version !== process.env.VERSION) problems.push("version");
+            if (bad.length) problems.push("unexpected files: " + bad.join(", "));
+            if (j.size > budget) problems.push("packed size " + j.size + " over budget " + budget);
+            if (problems.length) { console.error(problems.join("; ")); process.exit(1); }
+            console.log(j.name + "@" + j.version + ": " + j.entryCount + " files, " + j.size + " bytes packed, shasum " + j.shasum);
+          '
+      - name: Publish (provenance; OIDC trusted publishing)
+        env:
+          WS: ${{ needs.gate.outputs.workspace }}
+          DIST_TAG: ${{ needs.gate.outputs.dist_tag }}
+        run: npm publish -w "$WS" --access public --tag "$DIST_TAG" --provenance --ignore-scripts
