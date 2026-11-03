@@ -17,11 +17,35 @@ export async function createTestDb(opts: { max?: number } = {}): Promise<Db> {
   return db;
 }
 
-/** Truncates every application table (not schema_migrations). */
+export const RESET_TABLES_SQL =
+  "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE";
+
+/**
+ * Truncates every application table (not schema_migrations).
+ *
+ * Migration 0007 rejects TRUNCATE (and tombstone or watermark deletes) of the
+ * feed tables, so the reset runs in one transaction with
+ * `SET LOCAL session_replication_role = replica`, which fires no ordinary
+ * trigger for that transaction only. That setting needs superuser (the test
+ * role is one; the CI service container's POSTGRES_USER is one) and is an
+ * out-of-band, test-only bypass: the service never uses it, and using it on a
+ * live deployment requires every feed consumer to resynchronise.
+ */
 export async function resetTestDb(db: Db): Promise<void> {
-  await db.pool.query(
-    "TRUNCATE TABLE feed_tombstones, feed_retention_watermarks, company_observation_refs, company_observations, company_scope_stats, ip_resolution_cache, companies, usage_periods, deployment_controls RESTART IDENTITY CASCADE",
-  );
+  const client = await db.pool.connect();
+  let failed = false;
+  try {
+    await client.query("BEGIN");
+    await client.query("SET LOCAL session_replication_role = replica");
+    await client.query(RESET_TABLES_SQL);
+    await client.query("COMMIT");
+  } catch (err) {
+    failed = true;
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release(failed);
+  }
 }
 
 /** Synthetic fingerprint: sha256 of a label. Never derived from a real IP. */

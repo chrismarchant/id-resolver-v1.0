@@ -97,6 +97,19 @@ start** while any migration of this build is not applied, naming the missing
 files. A database that is ahead of the build (a rollback) is reported in the
 `migration_check` log line but not refused.
 
+Feed immutability (migration 0007, CHR-66 F5): the database refuses any
+UPDATE of a served observation column, any UPDATE or DELETE of an erasure
+tombstone, TRUNCATE of `company_observations`, `feed_tombstones` or
+`feed_retention_watermarks`, and any DELETE or backward move of the retention
+watermark. Observations leave the feed only by DELETE (retention, erasure,
+cascades, manual statements), which the watermark or a tombstone always
+makes visible to consumers. The only bypass is
+`SET session_replication_role = replica` (superuser-only, or an explicit
+`GRANT SET` on that parameter) or disabling triggers as the table owner:
+these are out-of-band operations, used by the test reset only. Never use
+them on a live deployment except as documented break-glass maintenance, and
+then make every feed consumer resynchronise.
+
 ## Health
 
 * `GET /healthz`: liveness, always 200 while the process serves HTTP.
