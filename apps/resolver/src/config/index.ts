@@ -8,6 +8,7 @@ import { z } from "zod";
 import { IDENTIFIER_PATTERN } from "../contracts/api.js";
 import { EVENT_CONSENT_MODES } from "../contracts/event.js";
 import { parseCaCert, parseTlsPins, SSL_MODES, type DbTlsConfig } from "../db/tls.js";
+import { DEFAULT_RUNTIME_ROLE, RUNTIME_PASSWORD_PATTERN, RUNTIME_ROLE_PATTERN } from "../db/runtime-role.js";
 
 const intInRange = (min: number, max: number, def: number) =>
   z.coerce.number().int().min(min).max(max).default(def);
@@ -57,6 +58,14 @@ export const ConfigSchema = z.object({
   DATABASE_CA_CERT: z.string().max(65_536).optional(),
   /** DATABASE_SSL=no-verify is refused when NODE_ENV=production unless this is set (development deployment only). */
   ALLOW_UNVERIFIED_DATABASE_TLS: boolFromString(false),
+
+  // Database roles (src/db/runtime-role.ts; RUNTIME.md "Database roles")
+  /** The least-privilege login role the service connects as; created and granted by the migrate step. */
+  DATABASE_RUNTIME_ROLE: z.string().regex(RUNTIME_ROLE_PATTERN, "lowercase letters, digits, underscore; 1-63 chars; not starting with a digit or pg_").default(DEFAULT_RUNTIME_ROLE),
+  /** Secret. Set = role separation on: migrate sets the role's password, the service logs in with it. */
+  DATABASE_RUNTIME_PASSWORD: z.string().regex(RUNTIME_PASSWORD_PATTERN, "32-256 printable ASCII characters, no '%' (use openssl rand -hex 32)").optional(),
+  /** NODE_ENV=production refuses to run as the DATABASE_URL owner role unless this is set (development deployment only). */
+  ALLOW_OWNER_DATABASE_ROLE: boolFromString(false),
 
 
   // Provider
@@ -130,7 +139,7 @@ export type Config = z.infer<typeof ConfigSchema>;
 /** Minimum shutdown time beyond one request deadline, so in-flight jobs can settle before the process exits. */
 export const SHUTDOWN_DRAIN_MARGIN_MS = 500;
 
-export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL"] as const;
+export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL", "DATABASE_RUNTIME_PASSWORD"] as const;
 
 /** Kept out of describeConfig (not secret, but large and of no use in a log line). */
 const UNLOGGED_KEYS = ["DATABASE_CA_CERT"] as const;
@@ -166,6 +175,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const cfg = parsed.data;
   resolveDatabaseTls(cfg);
+  resolveRuntimeCredentials(cfg);
   if (cfg.PROVIDER_MODE === "mock" && cfg.NODE_ENV === "production" && !cfg.ALLOW_MOCK_PROVIDER) {
     throw new ConfigError("invalid configuration: PROVIDER_MODE=mock is refused when NODE_ENV=production unless ALLOW_MOCK_PROVIDER=true");
   }
@@ -231,6 +241,38 @@ export function resolveDatabaseTls(cfg: DatabaseTlsSettings): DbTlsConfig {
   return { mode, ...(pins ? { pins } : {}), ...(caCert ? { caCert } : {}) };
 }
 
+export type DatabaseRoleSettings = Pick<Config, "NODE_ENV" | "DATABASE_URL" | "DATABASE_RUNTIME_ROLE" | "DATABASE_RUNTIME_PASSWORD" | "ALLOW_OWNER_DATABASE_ROLE">;
+
+/** The DATABASE_URL user name (decoded), or "" when the URL has none or cannot be parsed. */
+export function databaseUrlUser(databaseUrl: string): string {
+  try {
+    return decodeURIComponent(new URL(databaseUrl).username);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The service's login: the runtime role when DATABASE_RUNTIME_PASSWORD is set,
+ * otherwise undefined (the DATABASE_URL user, i.e. the owner). Production
+ * refuses the owner unless ALLOW_OWNER_DATABASE_ROLE=true. Throws ConfigError
+ * naming variables only.
+ */
+export function resolveRuntimeCredentials(cfg: DatabaseRoleSettings): { user: string; password: string } | undefined {
+  if (cfg.DATABASE_RUNTIME_PASSWORD !== undefined) {
+    if (cfg.DATABASE_RUNTIME_ROLE === databaseUrlUser(cfg.DATABASE_URL)) {
+      throw new ConfigError("invalid configuration: DATABASE_RUNTIME_ROLE must differ from the DATABASE_URL user (the owner that runs migrations)");
+    }
+    return { user: cfg.DATABASE_RUNTIME_ROLE, password: cfg.DATABASE_RUNTIME_PASSWORD };
+  }
+  if (cfg.NODE_ENV === "production" && !cfg.ALLOW_OWNER_DATABASE_ROLE) {
+    throw new ConfigError(
+      "invalid configuration: NODE_ENV=production requires the separate runtime database role: set DATABASE_RUNTIME_PASSWORD (see RUNTIME.md), or ALLOW_OWNER_DATABASE_ROLE=true on a development deployment only",
+    );
+  }
+  return undefined;
+}
+
 const DatabaseTlsSchema = ConfigSchema.pick({
   NODE_ENV: true,
   DATABASE_SSL: true,
@@ -264,7 +306,7 @@ export function loadDatabaseTls(env: NodeJS.ProcessEnv = process.env): { tls: Db
 }
 
 export interface OverrideState {
-  variable: "ALLOW_MOCK_PROVIDER" | "ALLOW_UNVERIFIED_DATABASE_TLS";
+  variable: "ALLOW_MOCK_PROVIDER" | "ALLOW_UNVERIFIED_DATABASE_TLS" | "ALLOW_OWNER_DATABASE_ROLE";
   /** active: it is relaxing a production control right now; inert: set but without effect (remove it). */
   state: "active" | "inert";
 }
@@ -275,6 +317,7 @@ export function configOverrides(cfg: Config): OverrideState[] {
   const out: OverrideState[] = [];
   if (cfg.ALLOW_MOCK_PROVIDER) out.push({ variable: "ALLOW_MOCK_PROVIDER", state: production && cfg.PROVIDER_MODE === "mock" ? "active" : "inert" });
   if (cfg.ALLOW_UNVERIFIED_DATABASE_TLS) out.push({ variable: "ALLOW_UNVERIFIED_DATABASE_TLS", state: production && cfg.DATABASE_SSL === "no-verify" ? "active" : "inert" });
+  if (cfg.ALLOW_OWNER_DATABASE_ROLE) out.push({ variable: "ALLOW_OWNER_DATABASE_ROLE", state: production && cfg.DATABASE_RUNTIME_PASSWORD === undefined ? "active" : "inert" });
   return out;
 }
 

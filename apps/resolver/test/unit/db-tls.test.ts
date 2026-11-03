@@ -11,6 +11,7 @@ import { DbTlsError, parseCaCert, parseTlsPins, pgTlsOptions, PinnedTlsSocket } 
 import { loadOpsConfig } from "../../src/ops/env.js";
 import { targetOf } from "../../src/ops/db-tls-fingerprint.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
+import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
 import { makeCertificate } from "../helpers/tls.js";
 
 const PIN_A = "a".repeat(64);
@@ -23,6 +24,8 @@ const REQUIRED = {
   IP_HMAC_SECRET: TEST_HMAC_SECRET,
   DATABASE_URL: "postgres://user:pw@db.invalid:5432/resolver",
   OBSERVATION_RETENTION_DAYS: "14",
+  // Production (the default NODE_ENV) requires the separate runtime role (Gate 5).
+  DATABASE_RUNTIME_PASSWORD: TEST_RUNTIME_PASSWORD,
 };
 
 function errorOf(fn: () => unknown): string {

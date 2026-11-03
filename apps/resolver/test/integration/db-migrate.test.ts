@@ -245,7 +245,7 @@ describe("privacy guard: no IP-bearing schema", () => {
 
       // Upgrade: 0003 then 0004 apply (then the additive V1 0005, which leaves existing rows' values unchanged).
       const upgrade = await applyMigrations(p);
-      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql", "0008_browser_events.sql"]);
+      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql", "0008_browser_events.sql", "0009_runtime_role_support.sql"]);
       const identities = await p.query<{ website_id: string; company_id: string; first_observation_ref: string | null }>(
         "SELECT website_id, company_id, first_observation_ref FROM company_scope_stats ORDER BY website_id, company_id",
       );

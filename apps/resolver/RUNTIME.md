@@ -196,6 +196,108 @@ the volume was replaced): new connections fail closed. Take both readings
 above, set the new pin, redeploy. Put `valid_to` minus 45 days in the
 operations calendar to keep renewals planned.
 
+## Database roles
+
+Two PostgreSQL roles (Gate 5; `src/db/runtime-role.ts`):
+
+| Role | Credentials | Used by | Can |
+|---|---|---|---|
+| **owner** | `DATABASE_URL` | `node dist/db/migrate.js` (the pre-deploy step) and every `ops:*` command | everything: owns every object, runs DDL |
+| **runtime** (`DATABASE_RUNTIME_ROLE`, default `idr_runtime`) | `DATABASE_URL` host and database, `DATABASE_RUNTIME_ROLE`, `DATABASE_RUNTIME_PASSWORD` | the service process only | exactly the grants below |
+
+The feed guards of migrations 0006/0007 are triggers. Only the table owner
+(`ALTER TABLE ... DISABLE TRIGGER`) or a superuser (`SET
+session_replication_role = replica`) can bypass them, and `TRUNCATE` skips
+row triggers. The runtime role has none of that, so a leaked runtime
+credential cannot rewrite, silently delete or truncate feed items, move the
+retention watermark or remove a tombstone.
+
+**Runtime grants** (`RUNTIME_GRANTS`; every other privilege in the schema is
+revoked on every migrate run):
+
+| Table | Runtime privileges | Why |
+|---|---|---|
+| `ip_resolution_cache` | SELECT, INSERT, UPDATE, DELETE | leases, fenced commits, expiry pruning |
+| `usage_periods` | SELECT, INSERT, UPDATE | cap reservation, counters |
+| `companies` | SELECT, INSERT, UPDATE (`organisation_name`, `last_seen_at`) | resolution upsert, activity timestamp, the per-company lock |
+| `company_observations` | SELECT, INSERT, DELETE, UPDATE (`id`) | entrances, the feed, retention; UPDATE on `id` only because `SELECT ... FOR UPDATE SKIP LOCKED` needs an UPDATE privilege, and the 0006 trigger rejects any change of `id` |
+| `company_observation_refs` | SELECT, INSERT | idempotency records |
+| `company_scope_stats` | SELECT, INSERT, UPDATE | activity summary |
+| `browser_events` | SELECT, INSERT, DELETE, UPDATE (`id`) | events and their retention (same `FOR UPDATE` reason) |
+| `feed_tombstones`, `feed_retention_watermarks`, `deployment_controls`, `schema_migrations` | SELECT | the feed, the kill-switch read, the startup schema check |
+| sequences of `companies`, `company_observations`, `browser_events` | USAGE | inserts |
+
+Not granted: TRUNCATE, TRIGGER, REFERENCES on anything; DELETE on
+`companies`, `company_observation_refs`, `company_scope_stats`; any write to
+`feed_tombstones`, `feed_retention_watermarks` or `deployment_controls`; CREATE
+on the schema or the database; ownership; role memberships (so no `SET ROLE`
+to the owner); SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS; SET on
+`session_replication_role`. Temporary tables remain possible through PostgreSQL's
+default PUBLIC privilege; they are private to the session and cannot touch
+the guarded tables. Retention still advances the watermark because the 0006
+trigger function runs as its owner (migration 0009, `SECURITY DEFINER` with a
+pinned `search_path`).
+
+**Owner-only operations.** `ops:erase-company` (writes tombstones, deletes
+the company and its history) and `ops:kill-switch` (writes
+`deployment_controls`) need privileges the runtime role deliberately lacks;
+every ops command connects with `DATABASE_URL`. `ops:usage` and `ops:prune`
+also run as the owner (one rule for every ops command); `ops:prune` deletes
+through the same triggers.
+
+**Provisioning** (`node dist/db/migrate.js`, after the migrations, under the
+migration advisory lock, one transaction, on every run, only when
+`DATABASE_RUNTIME_PASSWORD` is set):
+
+1. creates the role (`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+   NOREPLICATION NOBYPASSRLS NOINHERIT`), or updates it when it exists;
+   refuses (the deploy fails, nothing changes) if a role of that name exists
+   with an elevated attribute, a membership or owned objects: it never
+   demotes a role it did not create;
+2. sets its password as a SCRAM-SHA-256 verifier computed in the migrate
+   process, so the plaintext never appears in SQL text, server logs or
+   `pg_stat_activity`;
+3. revokes every privilege it holds in the schema and grants exactly the
+   table above. Objects created by future migrations get their grants from
+   this map, re-applied on every run (no `ALTER DEFAULT PRIVILEGES`). An
+   object without an entry gets no privilege and is named in a warning;
+   `test/integration/runtime-role.test.ts` fails while any object the
+   migrations create has no entry;
+4. checks the result is least privilege (fails otherwise, e.g. CREATE on
+   `public` granted to PUBLIC on PostgreSQL 14 and older).
+
+The owner needs CREATEROLE (or superuser, as on Railway) for step 1.
+Changing `DATABASE_RUNTIME_PASSWORD` rotates the password at the next deploy:
+the pre-deploy migrate sets it before the new service instance starts.
+Connections the old instance already holds stay open until it stops; any new
+connection it opens after the migrate fails authentication.
+
+**Startup.** With `DATABASE_RUNTIME_PASSWORD` set the service logs in as the
+runtime role and checks its own login (`database_role_check`): it refuses to
+start (exit 1, naming the excess, e.g. `owns_objects`, `superuser`) if the
+login can do anything listed under "Not granted". A wrong password exits 1
+with `database authentication failed (28P01)` and a hint that the pre-deploy
+migrate must have run with the same value. Without `DATABASE_RUNTIME_PASSWORD`
+the service logs in as the owner: refused when `NODE_ENV=production` unless
+the dev-only `ALLOW_OWNER_DATABASE_ROLE=true` is set (a `config_override`
+warning on every start). `config_loaded` reports `db_role: runtime|owner`.
+
+**Configuration matrix.**
+
+| Deployment | `DATABASE_SSL` | TLS variables | Role variables | Overrides |
+|---|---|---|---|---|
+| Production | `verify-pinned` (or `require` with a CA-issued certificate) | `DATABASE_TLS_PIN_SHA256` (optional `DATABASE_CA_CERT`) | `DATABASE_RUNTIME_PASSWORD` (sealed), optional `DATABASE_RUNTIME_ROLE` | none |
+| Development (Railway), target | `verify-pinned` | `DATABASE_TLS_PIN_SHA256` | `DATABASE_RUNTIME_PASSWORD` (sealed) | `ALLOW_MOCK_PROVIDER` only |
+| Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them) |
+| Local development / tests | `disable` with `NODE_ENV=development` or `test` | — | optional | — |
+
+**Rollback.** The previous build (no role separation) connects as the owner
+with `DATABASE_URL`, which still works: migration 0009 changes no table,
+the owner keeps every privilege, and a build that does not know 0009 reports
+the database as ahead (`migration_check`) instead of refusing. Leaving the
+runtime role in place is harmless; to remove it, as the owner: `DROP OWNED BY
+idr_runtime; DROP ROLE idr_runtime;` (after no build uses it).
+
 ## Browser events (CHR-64)
 
 Contract `event.v1` (`docs/contracts/event.v1.md`), owner decision D4:
@@ -251,8 +353,9 @@ browser events are **never** associated with companies.
 ## Migrations
 
 Migrations never run on application start. They run as the deploy
-pre-step (`railway.json` `preDeployCommand: node dist/db/migrate.js`,
-advisory-locked, forward-only; locally `npm run migrate`). At startup the
+pre-step (`node dist/db/migrate.js`, the service's pre-deploy command;
+advisory-locked, forward-only; locally `npm run migrate`), as the owner (`DATABASE_URL`), and then provision the runtime role
+(see "Database roles"). At startup the
 service compares `migrations/*.sql` with `schema_migrations` and **refuses to
 start** while any migration of this build is not applied, naming the missing
 files. A database that is ahead of the build (a rollback) is reported in the
@@ -267,7 +370,8 @@ cascades, manual statements), which the watermark or a tombstone always
 makes visible to consumers. The only bypass is
 `SET session_replication_role = replica` (superuser-only, or an explicit
 `GRANT SET` on that parameter) or disabling triggers as the table owner:
-these are out-of-band operations, used by the test reset only. Never use
+these are out-of-band operations, used by the test reset only, and the
+runtime role the service uses can do neither (see "Database roles"). Never use
 them on a live deployment except as documented break-glass maintenance, and
 then make every feed consumer resynchronise.
 

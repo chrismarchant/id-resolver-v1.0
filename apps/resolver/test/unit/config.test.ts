@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ConfigError, describeConfig, loadConfig, REMOVED_VARIABLES, scrubSecretEnv, SECRET_KEYS } from "../../src/config/index.js";
 import { loadOpsConfig, loadRetentionDays } from "../../src/ops/env.js";
 import { testConfig, TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
+import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
 
 /** The minimum a deployment must set (no defaults exist for these). */
 const REQUIRED = {
@@ -11,6 +12,8 @@ const REQUIRED = {
   IP_HMAC_SECRET: TEST_HMAC_SECRET,
   DATABASE_URL: "postgres://user:pw@db.invalid:5432/resolver",
   OBSERVATION_RETENTION_DAYS: "14",
+  // Production (the default NODE_ENV) requires the separate runtime role (Gate 5).
+  DATABASE_RUNTIME_PASSWORD: TEST_RUNTIME_PASSWORD,
 };
 
 function errorOf(fn: () => unknown): string {

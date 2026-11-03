@@ -39,6 +39,7 @@ export const LOG_EVENTS = [
   "maintenance_backlog",
   "event_prune",
   "config_override",
+  "database_role_check",
 ] as const;
 
 export type LogEvent = (typeof LOG_EVENTS)[number];
@@ -77,6 +78,7 @@ export const LOG_FIELDS = [
   "event_consent_mode",
   "variable",
   "tls_mode",
+  "db_role",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];

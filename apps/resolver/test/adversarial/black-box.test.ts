@@ -89,6 +89,7 @@ describe("black-box service process", () => {
     );
     mock = await startMockEnrichServer({ slowMs: 4_000 });
     prodDb = await startProductionDb();
+    await prodDb.provision();
     const env: NodeJS.ProcessEnv = {
       PATH: process.env["PATH"] ?? "",
       NODE_ENV: "production",

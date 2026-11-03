@@ -80,8 +80,9 @@ association.
 
 * **Migrations never run on application start.** Railway runs
   `node dist/db/migrate.js` as the pre-deploy command (advisory-locked,
-  forward-only); a failed migration fails the deployment. The service also
-  **refuses to start while migrations are pending**.
+  forward-only, as the owner; it also provisions the runtime role); a failed
+  migration fails the deployment. The service also **refuses to start while
+  migrations are pending**.
 * **Railway configuration:** Railway Config as Code (`railway.json`) is
   deprecated: new services cannot opt in, and it stops being read on
   2026-12-01. Service settings are applied through the Railway API for now;
@@ -115,6 +116,19 @@ association.
     **Production (before Gate 6):** `verify-pinned` (or `require` with a
     CA-issued certificate) and a private-network-only database with no TCP
     proxy or public domain.
+* **Database roles** *(Gate 5)*: the owner (`DATABASE_URL`) runs migrations
+  and the ops commands; the service connects as a least-privilege runtime
+  role (`DATABASE_RUNTIME_ROLE`, default `idr_runtime`, password
+  `DATABASE_RUNTIME_PASSWORD`, sealed) that the pre-deploy migrate creates
+  and grants exactly what the runtime paths need: no TRUNCATE, no DDL, no
+  ownership, no trigger control, no `session_replication_role`, no write to
+  tombstones, the retention watermark or the kill switch. The 0006/0007 feed
+  guards therefore cannot be bypassed with a leaked runtime credential.
+  Production refuses to run as the owner unless the dev-only
+  `ALLOW_OWNER_DATABASE_ROLE=true` is set, and refuses a runtime login that
+  is not least-privilege. Erasure and the kill switch are owner operations.
+  Details, grants and the configuration matrix:
+  [RUNTIME.md, "Database roles"](../apps/resolver/RUNTIME.md#database-roles).
 * **Paid enrichment is off unless** `PROVIDER_MODE=live` and
   `ENRICHMENT_ENABLED=true`.
 * **Spend controls:** an atomic period cap and a runtime kill switch

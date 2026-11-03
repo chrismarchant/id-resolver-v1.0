@@ -2,13 +2,15 @@
  * Startup refusals of the real service process (src/main.ts), from the
  * outside: pending migrations (migrations never run on start), the mock
  * provider in production, the required retention window (D3), removed
- * pre-CHR-70 variables and the production database TLS policy (Gate 5).
+ * pre-CHR-70 variables, the production database TLS policy and the
+ * separate runtime role (Gate 5).
  * Every refusal exits non-zero before listening, names the problem, and
  * never prints a secret or the database URL.
  *
  * The service runs in its production posture: NODE_ENV=production with
  * verified (pinned) TLS through a runtime-generated TLS terminator in front
- * of the test database (production refuses plaintext and unverified TLS).
+ * of the test database, logged in as the least-privilege runtime role
+ * (production refuses plaintext, unverified TLS and the owner login).
  */
 import { spawn } from "node:child_process";
 import { resolve } from "node:path";
@@ -17,10 +19,13 @@ import { createScratchDatabase, createTestDb, getTestDatabaseUrl } from "../help
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
 import { startProductionDb } from "../helpers/prod-db.js";
 import { makeCertificate } from "../helpers/tls.js";
+import { TEST_RUNTIME_PASSWORD, TEST_RUNTIME_ROLE } from "../helpers/runtime-role.js";
+import { createPool } from "../../src/db/pool.js";
 import type { Db } from "../../src/db/index.js";
 
 const ROOT = resolve(import.meta.dirname, "..", "..");
 const prodDb = await startProductionDb();
+await prodDb.provision();
 afterAll(() => prodDb.close());
 
 function baseEnv(over: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
@@ -69,7 +74,7 @@ function runService(env: NodeJS.ProcessEnv, opts: { stopAfterStart?: boolean } =
 }
 
 function expectNoSecrets(output: string, databaseUrl: string) {
-  for (const needle of [TEST_AUTH_TOKEN, TEST_HMAC_SECRET, databaseUrl, prodDb.url(), "resolver:resolver", "127.0.0.1:"]) expect(output).not.toContain(needle);
+  for (const needle of [TEST_AUTH_TOKEN, TEST_HMAC_SECRET, TEST_RUNTIME_PASSWORD, databaseUrl, prodDb.url(), "resolver:resolver", "127.0.0.1:"]) expect(output).not.toContain(needle);
 }
 
 describe("service startup refusals", () => {
@@ -106,7 +111,52 @@ describe("service startup refusals", () => {
     expect(r.code).toBe(0);
     expect(r.output).toContain('"event":"migration_check"');
     expect(r.output).toContain('"tls_mode":"verify-pinned"');
+    expect(r.output).toContain('"db_role":"runtime"');
+    expect(r.output).toContain('"event":"database_role_check"');
+    expect(r.output).toContain('"outcome":"least_privilege"');
     expect(r.output).not.toContain('"event":"config_override"');
+    expectNoSecrets(r.output, getTestDatabaseUrl());
+  });
+
+  it("production refuses to run as the owner (no DATABASE_RUNTIME_PASSWORD) unless ALLOW_OWNER_DATABASE_ROLE=true, and then warns by name", async () => {
+    const env = { DATABASE_RUNTIME_PASSWORD: undefined, DATABASE_RUNTIME_ROLE: undefined };
+    const refused = await runService(baseEnv(env));
+    expect(refused.code).toBe(1);
+    expect(refused.started).toBe(false);
+    expect(refused.output).toContain("NODE_ENV=production requires the separate runtime database role: set DATABASE_RUNTIME_PASSWORD");
+    const allowed = await runService(baseEnv({ ...env, ALLOW_OWNER_DATABASE_ROLE: "true" }), { stopAfterStart: true });
+    expect(allowed.started, allowed.output).toBe(true);
+    expect(allowed.output).toContain('"db_role":"owner"');
+    const override = allowed.output.split("\n").find((l) => l.includes('"event":"config_override"'));
+    expect(JSON.parse(override!)).toMatchObject({ level: "warn", variable: "ALLOW_OWNER_DATABASE_ROLE", outcome: "active" });
+    expectNoSecrets(refused.output + allowed.output, getTestDatabaseUrl());
+  });
+
+  it("refuses to start when the runtime login is not least-privilege, naming what is wrong", async () => {
+    const role = "idr_test_createdb";
+    const owner = createPool({ databaseUrl: getTestDatabaseUrl(), ssl: "disable", max: 1 });
+    try {
+      await owner.query(`DROP ROLE IF EXISTS ${role}`);
+      await owner.query(`CREATE ROLE ${role} LOGIN CREATEDB PASSWORD '${TEST_RUNTIME_PASSWORD}'`);
+      const r = await runService(baseEnv({ DATABASE_RUNTIME_ROLE: role }));
+      expect(r.code).toBe(1);
+      expect(r.started).toBe(false);
+      expect(r.output).toContain("the runtime database role is not least-privilege (createdb)");
+      expectNoSecrets(r.output, getTestDatabaseUrl());
+    } finally {
+      await owner.query(`DROP ROLE IF EXISTS ${role}`);
+      await owner.end();
+    }
+  });
+
+  it("a wrong runtime password fails with a hint naming the variables, never the value", async () => {
+    const wrong = "f".repeat(40);
+    const r = await runService(baseEnv({ DATABASE_RUNTIME_PASSWORD: wrong }));
+    expect(r.code).toBe(1);
+    expect(r.output).toContain("database authentication failed (28P01)");
+    expect(r.output).toContain("DATABASE_RUNTIME_PASSWORD");
+    expect(r.output).not.toContain(wrong);
+    expect(r.output).not.toContain(TEST_RUNTIME_ROLE + ":");
     expectNoSecrets(r.output, getTestDatabaseUrl());
   });
 
