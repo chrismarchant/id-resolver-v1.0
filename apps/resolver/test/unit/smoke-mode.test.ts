@@ -10,11 +10,14 @@ import { canonicaliseIp } from "../../src/ip/canonical.js";
 import { DEFAULT_MOCK_SCRIPT } from "../../src/provider/mock.js";
 import {
   documentationRangeMode,
+  eventsMode,
+  eventsPhasePlan,
   KILL_SWITCH_CONTROL_PREFIX,
   KILL_SWITCH_PROBE_PREFIX,
   killSwitchPhasePlan,
   killSwitchProbeAddress,
   PROBE_RANDOM_BYTES,
+  smokeSuite,
 } from "../../src/ops/smoke-mode.js";
 import type { SmokeTargetKind } from "../../src/ops/smoke-target.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
@@ -138,5 +141,68 @@ describe("smoke kill-switch probe address", () => {
     }
     expect(() => killSwitchProbeAddress(KILL_SWITCH_PROBE_PREFIX, Buffer.alloc(9))).toThrow();
     expect(() => killSwitchProbeAddress(KILL_SWITCH_PROBE_PREFIX, Buffer.alloc(11))).toThrow();
+  });
+});
+
+describe("smoke events mode (Gate 5)", () => {
+  it("maps EVENTS_ENABLED and EVENT_CONSENT_MODE to enums with the service's defaults (off; required)", () => {
+    expect(eventsMode({})).toEqual({ ok: true, mode: "events_disabled", consentMode: "required" });
+    expect(eventsMode({ EVENTS_ENABLED: "true" })).toEqual({ ok: true, mode: "events_enabled", consentMode: "required" });
+    expect(eventsMode({ EVENTS_ENABLED: "1", EVENT_CONSENT_MODE: "not_required" })).toEqual({ ok: true, mode: "events_enabled", consentMode: "not_required" });
+    expect(eventsMode({ EVENTS_ENABLED: "false", EVENT_CONSENT_MODE: "required" })).toEqual({ ok: true, mode: "events_disabled", consentMode: "required" });
+  });
+
+  it("refuses a value the service would refuse, naming the variable but never the value", () => {
+    for (const env of [{ EVENTS_ENABLED: "yes" }, { EVENTS_ENABLED: "" }, { EVENT_CONSENT_MODE: "optional" }, { EVENT_CONSENT_MODE: "REQUIRED" }]) {
+      const r = eventsMode(env);
+      expect(r.ok, JSON.stringify(env)).toBe(false);
+      if (!r.ok) {
+        const [name, value] = Object.entries(env)[0]!;
+        expect(r.reason).toContain(name);
+        if (value.length > 0) expect(r.reason).not.toContain(`${value} `);
+        expect(r.reason).not.toMatch(/yes|optional|REQUIRED/);
+      }
+    }
+  });
+
+  it("reads both variables exactly as the service does (same parser, same defaults)", () => {
+    for (const enabled of ["true", "false", "1", "0", undefined, "", "yes"]) {
+      for (const consent of ["required", "not_required", undefined, "x"]) {
+        const env: Record<string, string> = { ...SERVICE_REQUIRED };
+        if (enabled !== undefined) env["EVENTS_ENABLED"] = enabled;
+        if (consent !== undefined) env["EVENT_CONSENT_MODE"] = consent;
+        let service: string;
+        try {
+          const c = loadConfig(env);
+          service = `${String(c.EVENTS_ENABLED)}/${c.EVENT_CONSENT_MODE}`;
+        } catch {
+          service = "refused";
+        }
+        const smoke = eventsMode(env);
+        const smokeView = smoke.ok ? `${String(smoke.mode === "events_enabled")}/${smoke.consentMode}` : "refused";
+        expect(smokeView, JSON.stringify({ enabled, consent })).toBe(service);
+      }
+    }
+  });
+
+  it("plans the database checks only against this service or loopback, and the disabled check whenever events are off", () => {
+    expect(eventsPhasePlan("events_enabled", "railway_private_default")).toBe("run");
+    expect(eventsPhasePlan("events_enabled", "loopback")).toBe("run");
+    expect(eventsPhasePlan("events_enabled", "railway_internal")).toBe("run_without_database");
+    for (const k of ["railway_private_default", "loopback", "railway_internal"] as const) expect(eventsPhasePlan("events_disabled", k)).toBe("check_disabled");
+  });
+});
+
+describe("smoke suite argument", () => {
+  it("full by default; rollback-check on request; anything else refused without echoing it", () => {
+    expect(smokeSuite([])).toEqual({ ok: true, suite: "full" });
+    expect(smokeSuite(["--mode", "full"])).toEqual({ ok: true, suite: "full" });
+    expect(smokeSuite(["--mode", "rollback-check"])).toEqual({ ok: true, suite: "rollback_check" });
+    expect(smokeSuite(["--mode=rollback-check"])).toEqual({ ok: true, suite: "rollback_check" });
+    for (const argv of [["--mode"], ["--mode", "rollback"], ["rollback-check"], ["--mode", "rollback-check", "x"], ["--mode=secret-value"], ["--other"]]) {
+      const r = smokeSuite(argv);
+      expect(r.ok, argv.join(" ")).toBe(false);
+      if (!r.ok) expect(r.reason).not.toContain("secret-value");
+    }
   });
 });
