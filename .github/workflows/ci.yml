@@ -73,7 +73,12 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm audit --audit-level=high
-      - run: npm run verify --workspaces --if-present
+      - name: Install the TanStack probe app (bundle-safety test input; own lockfile, not a workspace)
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix packages/tanstack/verification/cf-lifecycle
+      - name: Verify all workspaces (resolver, TanStack adapter, Supabase Edge reference)
+        run: npm run verify --workspaces --if-present
+        env:
+          IDR_REQUIRE_PROBE: "1"
 
   image:
     name: production image

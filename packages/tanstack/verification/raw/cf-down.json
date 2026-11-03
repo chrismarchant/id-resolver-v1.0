@@ -1,0 +1,18 @@
+{
+  "sinkMode": "down",
+  "target": "cloudflare",
+  "node": "v22.23.4",
+  "lifecycle": [],
+  "idrPackage": {
+    "status": 200,
+    "ttfb_ms": 23,
+    "pageRendered": true,
+    "sinkGotEntrance": false,
+    "sinkUrl": null,
+    "sinkHasBearer": null,
+    "payload": null,
+    "hookResults": [
+      "{\"outcome\":\"dropped\",\"reason\":\"network\",\"mode\":\"wait_until\",\"attempts\":2,\"durationMs\":260}"
+    ]
+  }
+}
