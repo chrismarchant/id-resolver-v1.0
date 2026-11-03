@@ -3,6 +3,7 @@ import pg from "pg";
 import type { CacheKey } from "../../src/contracts/db.js";
 import { createDb, type Db } from "../../src/db/index.js";
 import { applyMigrations } from "../../src/db/migrate.js";
+import { collectResetLockDiagnostic, isResetTimeout, poolBackendPids, printResetLockDiagnostic, type ResetLockDiagnostic } from "./db-lock-diagnostic.js";
 
 export const DEFAULT_TEST_DATABASE_URL = "postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test";
 
@@ -30,9 +31,15 @@ export const RESET_TABLES_SQL =
  * role is one; the CI service container's POSTGRES_USER is one) and is an
  * out-of-band, test-only bypass: the service never uses it, and using it on a
  * live deployment requires every feed consumer to resynchronise.
+ *
+ * If the reset times out (a lock wait), a test-only diagnostic reports which
+ * backends hold or await locks on the reset tables (`db-lock-diagnostic.ts`)
+ * before the original error is rethrown unchanged. `onLockDiagnostic`
+ * replaces the default stderr sink (used by the diagnostic's own test).
  */
-export async function resetTestDb(db: Db): Promise<void> {
+export async function resetTestDb(db: Db, opts: { onLockDiagnostic?: (d: ResetLockDiagnostic) => void } = {}): Promise<void> {
   const client = await db.pool.connect();
+  const resetPid = (client as unknown as { processID?: number | null }).processID ?? null;
   let failed = false;
   try {
     await client.query("BEGIN");
@@ -42,6 +49,10 @@ export async function resetTestDb(db: Db): Promise<void> {
   } catch (err) {
     failed = true;
     await client.query("ROLLBACK").catch(() => undefined);
+    if (isResetTimeout(err)) {
+      const diagnostic = await collectResetLockDiagnostic({ connectionString: getTestDatabaseUrl(), resetPid, ownPoolPids: poolBackendPids(db.pool), error: err });
+      (opts.onLockDiagnostic ?? printResetLockDiagnostic)(diagnostic);
+    }
     throw err;
   } finally {
     client.release(failed);
