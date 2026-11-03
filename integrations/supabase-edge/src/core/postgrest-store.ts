@@ -106,8 +106,10 @@ export class PostgrestStore implements Store {
     const r = obj(
       await this.rpc("idr_record_sync_gap", { p_installation_id: this.o.installationId, p_kind: a.kind, p_expected_cursor: a.expectedCursor }),
     );
-    if (typeof r["recorded"] !== "boolean" || typeof r["new"] !== "boolean" || typeof r["superseded"] !== "boolean") throw new StoreError("bad_rpc_response");
-    return { recorded: r["recorded"], newGap: r["new"], superseded: r["superseded"] };
+    if (typeof r["recorded"] !== "boolean" || typeof r["new"] !== "boolean" || typeof r["superseded"] !== "boolean" || typeof r["needs_resync"] !== "boolean") {
+      throw new StoreError("bad_rpc_response");
+    }
+    return { recorded: r["recorded"], newGap: r["new"], superseded: r["superseded"], needsResync: r["needs_resync"] };
   }
 
   async resolveGaps(drainedCursor: string): Promise<number> {

@@ -66,7 +66,7 @@ describe("recording", () => {
 
   it("repeated records while the gap is open return the same row; a gap with no prior state still records", async () => {
     const first = await recordGap();
-    for (let i = 0; i < 3; i++) expect(await recordGap()).toEqual({ recorded: true, new: false, superseded: false, gap_id: first.gap_id });
+    for (let i = 0; i < 3; i++) expect(await recordGap()).toEqual({ recorded: true, new: false, superseded: false, needs_resync: true, gap_id: first.gap_id });
     expect(await gapRows(pool)).toHaveLength(1);
     expect((await gapRows(pool))[0]).toMatchObject({ expired_cursor: null, last_applied_at: null, last_observed_at: null });
   });
@@ -76,7 +76,7 @@ describe("recording", () => {
     const before = (await pool.query("select cursor, status, needs_resync, updated_at from public.idr_sync_state")).rows[0];
     for (const stale of ["c2", null]) {
       const r = (await svc<{ r: unknown }>("select public.idr_record_sync_gap($1, 'cursor_expired', $2) as r", [INSTALLATION, stale])).rows[0]!.r;
-      expect(r, String(stale)).toEqual({ recorded: false, new: false, superseded: true, gap_id: null });
+      expect(r, String(stale)).toEqual({ recorded: false, new: false, superseded: true, needs_resync: false, gap_id: null });
     }
     expect((await pool.query("select cursor, status, needs_resync, updated_at from public.idr_sync_state")).rows[0]).toEqual(before);
     expect(await gapRows(pool)).toHaveLength(0);
@@ -190,6 +190,21 @@ describe("R2-6: begin_resync never clears needs_resync without a gap on record",
     await replay("c1");
     expect((await svc<{ r: unknown }>("select public.idr_begin_resync($1) as r", [INSTALLATION])).rows[0]!.r).toEqual({ ok: true, gap_recorded: false });
     expect(await gapRows(pool)).toHaveLength(1);
+  });
+
+  it("a voluntary resync keeps the stored cursor (and its generation) for the re-check; one with needs_resync does not", async () => {
+    await svc("select public.idr_apply_feed_page($1, null, 'c4', '[]'::jsonb, null)", [INSTALLATION]);
+    await svc("select public.idr_begin_resync($1)", [INSTALLATION]);
+    const v = await pool.query("select cursor, reset_from_cursor, reset_from_generation::int as g, resync_generation::int as r from public.idr_sync_state");
+    expect(v.rows[0]).toEqual({ cursor: null, reset_from_cursor: "c4", g: 0, r: 1 });
+    // A second voluntary resync before any run keeps the same pending position and generation.
+    await svc("select public.idr_begin_resync($1)", [INSTALLATION]);
+    expect((await pool.query("select reset_from_cursor, reset_from_generation::int as g from public.idr_sync_state")).rows[0]).toEqual({ reset_from_cursor: "c4", g: 0 });
+    // Its 410 records the gap at generation 0 without halting (a resync was requested after it).
+    const r = (await svc<{ r: { recorded: boolean; needs_resync: boolean } }>("select public.idr_record_sync_gap($1, 'cursor_expired', 'c4') as r", [INSTALLATION])).rows[0]!.r;
+    expect(r).toMatchObject({ recorded: true, needs_resync: false });
+    expect((await gapRows(pool))[0]).toMatchObject({ expired_cursor: "c4", detected_generation: 0 });
+    expect((await pool.query("select needs_resync, reset_from_cursor from public.idr_sync_state")).rows[0]).toEqual({ needs_resync: false, reset_from_cursor: null });
   });
 
   it("idr_schema_version() reports the version the engine requires", async () => {

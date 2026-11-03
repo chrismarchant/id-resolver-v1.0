@@ -166,6 +166,18 @@ UTC days inside the retained window.
   from the start (or by the gap record). A failure anywhere between the reset
   and that first page therefore leaves it set and the next run checks again.
 
+  The same obligation holds for **any** restart from the start of the buffer
+  that discards a stored cursor, in particular a voluntary resynchronisation
+  that no `410` asked for: the old position may already lie behind the
+  watermark, and the replay never delivers, or reports, what was pruned after
+  it. The consumer must present the old position first: a `410` is a
+  potential continuity gap to record (the requested rebuild may then
+  continue, since it was already asked for), a `400` or `200` means nothing
+  after it was pruned. The reference adapter's `idr_begin_resync` keeps the
+  stored cursor in `reset_from_cursor` for exactly this re-check when
+  `needs_resync` is not set; when it is set, the gap is already on record and
+  the old position is not re-checked.
+
   In short: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
   is behind the retention watermark, and otherwise `400` followed by a safe
   replay. Known limit: the last `400` (or re-check) and the snapshot of the

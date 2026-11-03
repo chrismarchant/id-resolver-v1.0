@@ -86,6 +86,12 @@ alter table public.idr_sync_state add column if not exists replay_generation big
 -- still within retention and the replay may start. Cleared atomically with the
 -- first page applied from null (idr_apply_feed_page) or by the gap record.
 alter table public.idr_sync_state add column if not exists reset_from_cursor text null;
+-- resync_generation while reset_from_cursor was the stored position. A gap the
+-- re-check finds is dated to it: if a resync was requested after that (a
+-- voluntary idr_begin_resync), the requested replay already covers the
+-- rebuild, so the gap is recorded without halting and resolves after the
+-- replay drains; otherwise it halts with needs_resync.
+alter table public.idr_sync_state add column if not exists reset_from_generation bigint null;
 
 -- Re-runs on an existing installation: widen the status check (idempotent).
 alter table public.idr_sync_state drop constraint if exists idr_sync_state_status_check;
@@ -250,14 +256,15 @@ end $$;
 -- The projection schema this script installs. The Edge function refuses to
 -- run (status schema_mismatch, HTTP 500) unless it matches the version its
 -- code expects, so code/SQL skew can never silently drop gap evidence.
--- 3 = this release (gap log with compare-and-set, reset_from_cursor,
+-- 4 = this release (gap log with compare-and-set, reset_from_cursor re-check
+-- after a 400 and after a voluntary resync,
 -- generations); earlier releases had no version function.
 create or replace function public.idr_schema_version()
 returns integer
 language sql
 immutable
 set search_path = ''
-as $$ select 3 $$;
+as $$ select 4 $$;
 
 create or replace function public.idr_get_sync_state(p_installation_id text)
 returns jsonb
@@ -348,7 +355,7 @@ begin
   end loop;
 
   update public.idr_sync_state
-    set cursor = p_next_cursor, reset_from_cursor = null, last_applied_at = now(), updated_at = now(),
+    set cursor = p_next_cursor, reset_from_cursor = null, reset_from_generation = null, last_applied_at = now(), updated_at = now(),
         -- The first page from null starts a replay of the whole retained buffer.
         replay_generation = case when p_expected_cursor is null then resync_generation else replay_generation end
     where installation_id = p_installation_id;
@@ -396,7 +403,7 @@ declare
   v_rows int;
 begin
   update public.idr_sync_state
-     set cursor = null, reset_from_cursor = p_expected_cursor, updated_at = now()
+     set cursor = null, reset_from_cursor = p_expected_cursor, reset_from_generation = resync_generation, updated_at = now()
    where installation_id = p_installation_id
      and cursor is not distinct from p_expected_cursor
      and p_expected_cursor is not null
@@ -415,8 +422,15 @@ $$;
 -- record (the gap RPC failed and only the status write succeeded), the gap
 -- row is inserted here, in the same transaction, before the flag is cleared,
 -- bounded by the stored state. A pending re-check of a rejected cursor is
--- then fulfilled too (reset_from_cursor cleared); without needs_resync it is
--- kept, so the next run still re-checks it.
+-- then fulfilled too (reset_from_cursor cleared): re-checking an already
+-- known expired position would only loop.
+-- A VOLUNTARY resync (needs_resync not set) must not discard the old position
+-- unchecked either: it may already lie behind the resolver's retention
+-- watermark, and the replay from null would never deliver (or report) the
+-- items pruned after it. So the stored cursor is kept in reset_from_cursor
+-- (with the generation it belonged to), in the same transaction as the reset;
+-- the next run presents it first, exactly as after a 400-reset. A pending
+-- re-check that is already set is kept as it is.
 create or replace function public.idr_begin_resync(p_installation_id text)
 returns jsonb
 language plpgsql
@@ -444,7 +458,10 @@ begin
   end if;
   update public.idr_sync_state
      set cursor = null, needs_resync = false, status = 'resync_requested',
-         reset_from_cursor = case when v_needs then null else reset_from_cursor end,
+         reset_from_cursor = case when v_needs then null else coalesce(v_cursor, reset_from_cursor) end,
+         reset_from_generation = case when v_needs then null
+                                      when v_cursor is not null then v_generation
+                                      else reset_from_generation end,
          resync_generation = resync_generation + 1,
          resync_requested_at = clock_timestamp(), updated_at = now()
    where installation_id = p_installation_id;
@@ -461,10 +478,14 @@ $$;
 -- past that position, so nothing was missed there): the call writes nothing
 -- and returns {"superseded": true}. A recorded gap also ends a pending
 -- re-check (reset_from_cursor is cleared). Otherwise, in ONE
--- transaction, it marks needs_resync and the status and records the gap
--- unless an open gap of this kind already exists (the partial unique index
--- makes that race-free). expired_cursor is the cursor that got the 410; the
--- other bounds come from the stored state. Returns {recorded, new, gap_id}.
+-- transaction, it records the gap unless an open gap of this kind already
+-- exists (the partial unique index makes that race-free) and, unless a resync
+-- requested after that position already covers the rebuild, marks
+-- needs_resync and the status (halt). The gap is dated to the generation of
+-- the position: the current one, or reset_from_generation for a re-checked
+-- reset_from_cursor. expired_cursor is the cursor that got the 410; the other
+-- bounds come from the stored state.
+-- Returns {recorded, new, superseded, needs_resync, gap_id}.
 drop function if exists public.idr_record_sync_gap(text, text);
 create or replace function public.idr_record_sync_gap(p_installation_id text, p_kind text, p_expected_cursor text)
 returns jsonb
@@ -474,8 +495,13 @@ as $$
 declare
   v_cursor text;
   v_reset_from text;
+  v_reset_gen bigint;
+  v_needs boolean;
   v_last_applied timestamptz;
   v_generation bigint;
+  v_detected bigint;
+  v_halt boolean;
+  v_new boolean := false;
   v_id bigint;
 begin
   if p_installation_id is null or p_installation_id = '' or p_kind is distinct from 'cursor_expired' then
@@ -483,25 +509,33 @@ begin
   end if;
   insert into public.idr_sync_state (installation_id) values (p_installation_id)
     on conflict (installation_id) do nothing;
-  select s.cursor, s.reset_from_cursor, s.last_applied_at, s.resync_generation into v_cursor, v_reset_from, v_last_applied, v_generation
+  select s.cursor, s.reset_from_cursor, s.reset_from_generation, s.needs_resync, s.last_applied_at, s.resync_generation
+    into v_cursor, v_reset_from, v_reset_gen, v_needs, v_last_applied, v_generation
     from public.idr_sync_state s where s.installation_id = p_installation_id for update;
   if coalesce(v_cursor, v_reset_from) is distinct from p_expected_cursor then
-    return jsonb_build_object('recorded', false, 'new', false, 'superseded', true, 'gap_id', null);
+    return jsonb_build_object('recorded', false, 'new', false, 'superseded', true, 'needs_resync', false, 'gap_id', null);
   end if;
+  v_detected := case when v_cursor is null and v_reset_from is not null then coalesce(v_reset_gen, v_generation) else v_generation end;
+  -- Halt unless a resync requested after that position already covers the rebuild.
+  v_halt := v_needs or v_detected >= v_generation;
   update public.idr_sync_state
-     set status = 'needs_resync', needs_resync = true, reset_from_cursor = null, last_run_at = now(), updated_at = now()
+     set status = case when v_halt then 'needs_resync' else status end,
+         needs_resync = needs_resync or v_halt,
+         reset_from_cursor = null, reset_from_generation = null,
+         last_run_at = now(), updated_at = now()
    where installation_id = p_installation_id;
   insert into public.idr_sync_gaps (installation_id, kind, detected_at, detected_generation, expired_cursor, last_applied_at, last_observed_at)
-    values (p_installation_id, p_kind, clock_timestamp(), v_generation, p_expected_cursor, v_last_applied,
+    values (p_installation_id, p_kind, clock_timestamp(), v_detected, p_expected_cursor, v_last_applied,
             (select max(o.observed_at) from public.idr_observations o where o.installation_id = p_installation_id))
     on conflict (installation_id, kind) where resolved_at is null do nothing
     returning id into v_id;
   if v_id is not null then
-    return jsonb_build_object('recorded', true, 'new', true, 'superseded', false, 'gap_id', v_id);
+    v_new := true;
+  else
+    select g.id into v_id from public.idr_sync_gaps g
+     where g.installation_id = p_installation_id and g.kind = p_kind and g.resolved_at is null;
   end if;
-  select g.id into v_id from public.idr_sync_gaps g
-   where g.installation_id = p_installation_id and g.kind = p_kind and g.resolved_at is null;
-  return jsonb_build_object('recorded', v_id is not null, 'new', false, 'superseded', false, 'gap_id', v_id);
+  return jsonb_build_object('recorded', v_id is not null, 'new', v_new, 'superseded', false, 'needs_resync', v_halt, 'gap_id', v_id);
 end;
 $$;
 

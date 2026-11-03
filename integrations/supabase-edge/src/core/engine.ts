@@ -66,9 +66,12 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   /**
    * needs_resync: record the gap durably (idempotent while open), as a
    * compare-and-set on `expectedCursor`, the cursor that got the 410. If the
-   * stored cursor has moved on, an overlapping run already applied pages past
-   * it: nothing is written and this run ends cas_conflict (no false gap, no
-   * halt). If the record fails, still mark needs_resync and report
+   * stored position has moved on, an overlapping run already applied pages
+   * past it: nothing is written and this run ends cas_conflict (no false gap,
+   * no halt). If an operator requested a resync after that position (a run
+   * that overlapped a voluntary idr_begin_resync), the gap is recorded but the
+   * requested replay already covers the rebuild: no halt, cas_conflict for
+   * this stale run. If the record fails, still mark needs_resync and report
    * gap.recorded=false; the next run finds needs_resync set and retries.
    */
   async function finishGap(expectedCursor: string | null): Promise<SyncResult> {
@@ -80,8 +83,9 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         return result; // the stale run touches nothing
       }
       result.gap = g;
+      if (!g.needsResync) result.status = "cas_conflict";
     } catch {
-      result.gap = { recorded: false, newGap: false, superseded: false };
+      result.gap = { recorded: false, newGap: false, superseded: false, needsResync: true };
       try {
         await deps.store.recordStatus({ status: "needs_resync", needsResync: true });
       } catch {
@@ -181,22 +185,48 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   let cursor = state.cursor;
   /** What the store holds as reset_from_cursor (compare-and-set on every apply). */
   let resetFrom: string | null = state.resetFromCursor ?? null;
+  let gapOpen = state.gapOpen;
   let drained = false;
   let cursorReset = false;
 
-  // An earlier run reset a rejected cursor (400) but the replay never applied
-  // its first page. Retention may have passed the old position since, and a
-  // null cursor can never get a 410, so present the rejected cursor again
-  // first: 410 -> a continuity gap, recorded; 400 (or 200) -> nothing after it
-  // was pruned, replay from the start now. Any failure here leaves it set, so
-  // the next run checks again.
+  // The cursor was reset to null without the replay having applied its first
+  // page yet: after a 400 (rejected cursor), or by an operator's voluntary
+  // idr_begin_resync. Retention may have passed that old position, and a null
+  // cursor can never get a 410, so present it again first:
+  //  - 410: a continuity gap, recorded (compare-and-set on reset_from_cursor).
+  //    If a resync was requested after that position, the replay it asked for
+  //    continues in this run and the gap resolves once it drains; otherwise
+  //    halt with needs_resync.
+  //  - 400 or 200: nothing after it was pruned; replay from the start now.
+  // Any failure, including a failed record, leaves it set, so the next run
+  // checks again.
   if (cursor === null && resetFrom !== null) {
     const check = await getJson(`/v1/reporting/observations?limit=1&after=${encodeURIComponent(resetFrom)}`, true, true);
     if (check.kind === "stop") {
-      if (check.status === "needs_resync") return finishGap(resetFrom);
-      if (check.status !== "cursor_rejected") return finish(check.status);
+      if (check.status === "needs_resync") {
+        let g;
+        try {
+          g = await deps.store.recordGap({ kind: "cursor_expired", expectedCursor: resetFrom });
+        } catch {
+          return finish("store_error");
+        }
+        if (g.superseded) {
+          result.status = "cas_conflict";
+          return result;
+        }
+        result.gap = g;
+        if (g.needsResync) {
+          result.status = "needs_resync";
+          return result;
+        }
+        resetFrom = null; // the record ended the re-check, in its transaction
+        gapOpen = true;
+      } else if (check.status === "cursor_rejected") {
+        cursorReset = true;
+      } else {
+        return finish(check.status);
+      }
     }
-    cursorReset = true;
   }
 
   while (result.pages < cfg.maxPages) {
@@ -258,7 +288,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
   // the start of the retained buffer after idr_begin_resync(); the store
   // resolves only gaps detected before the resync whose replay this drain
   // completed, and only if no newer replay has started since (cursor CAS).
-  if (state.gapOpen && cursor !== null) {
+  if (gapOpen && cursor !== null) {
     try {
       result.gapsResolved = await deps.store.resolveGaps(cursor);
     } catch {

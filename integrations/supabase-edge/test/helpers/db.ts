@@ -143,14 +143,14 @@ export class PgStore implements Store {
 
   async recordGap(a: RecordGapArgs): Promise<RecordGapResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { recorded: boolean; new: boolean; superseded: boolean } }>("select public.idr_record_sync_gap($1,$2,$3) as r", [
+      c.query<{ r: { recorded: boolean; new: boolean; superseded: boolean; needs_resync: boolean } }>("select public.idr_record_sync_gap($1,$2,$3) as r", [
         this.installationId,
         a.kind,
         a.expectedCursor,
       ]),
     );
     const v = r.rows[0]!.r;
-    return { recorded: v.recorded, newGap: v.new, superseded: v.superseded };
+    return { recorded: v.recorded, newGap: v.new, superseded: v.superseded, needsResync: v.needs_resync };
   }
 
   async resolveGaps(drainedCursor: string): Promise<number> {

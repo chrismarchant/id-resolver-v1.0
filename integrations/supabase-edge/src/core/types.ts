@@ -33,7 +33,7 @@ export interface FeedPage {
  * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
  * this code requires. The engine refuses to run against any other.
  */
-export const PROJECTION_SCHEMA_VERSION = 3;
+export const PROJECTION_SCHEMA_VERSION = 4;
 
 export interface SyncState {
   /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
@@ -41,10 +41,12 @@ export interface SyncState {
   cursor: string | null;
   needsResync: boolean;
   /**
-   * The cursor the resolver rejected with 400, kept by Store.resetCursor until
-   * the first page from null is applied. While set (with cursor null), each
-   * run re-presents it before replaying, so a prune past it becomes a 410 and
-   * a recorded gap rather than a silent loss.
+   * The position the cursor held before it was reset to null: the cursor the
+   * resolver rejected with 400 (Store.resetCursor), or the cursor discarded by
+   * a voluntary idr_begin_resync. Kept until the first page from null is
+   * applied. While set (with cursor null), each run re-presents it before
+   * replaying, so a prune past it becomes a 410 and a recorded gap rather than
+   * a silent loss.
    */
   resetFromCursor: string | null;
   /** An unresolved continuity gap is recorded (see Store.recordGap). */
@@ -106,6 +108,12 @@ export interface RecordGapResult {
    * written; the run ends cas_conflict.
    */
   superseded: boolean;
+  /**
+   * The record halted sync (needs_resync set). False when a resync requested
+   * after that position already covers the rebuild (a voluntary resync): the
+   * gap is on record and the requested replay continues.
+   */
+  needsResync: boolean;
 }
 
 export interface LocalCounts {

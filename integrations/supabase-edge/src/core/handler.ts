@@ -107,6 +107,9 @@ export async function handleSyncRequest(req: Request, deps: HandlerDeps): Promis
     if (result.status === "schema_mismatch") {
       deps.log?.("schema mismatch: the projection SQL is not the version this function requires; re-run sql/0001_idr_projection.sql (nothing was fetched or written)");
     }
+    if (result.gap?.recorded === true && result.status !== "needs_resync") {
+      deps.log?.("continuity gap recorded in idr_sync_gaps (cursor_expired) for the position held before the requested resync; the resync continues");
+    }
     if (result.status === "needs_resync") {
       deps.log?.(
         result.gap?.recorded === true

@@ -615,7 +615,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     };
     const r = await runSync(cfg(afterUrl), deps(watching));
     expect(r.status).toBe("needs_resync");
-    expect(r.gap).toEqual({ recorded: true, newGap: true, superseded: false });
+    expect(r.gap).toEqual({ recorded: true, newGap: true, superseded: false, needsResync: true });
     expect(resets).toEqual([]); // never reset, never cursor_rejected
     expect(await syncState()).toEqual({ cursor: stalledAt, status: "needs_resync", needs_resync: true });
     expect(await projected()).toEqual([old[0]!.id, old[1]!.id]);
@@ -624,7 +624,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect(gaps[0]).toMatchObject({ installation_id: INSTALLATION, kind: "cursor_expired", expired_cursor: stalledAt, resolved_at: null, resolution: null });
 
     // It stays that way (one row) until an operator resynchronises.
-    expect((await runSync(cfg(afterUrl), deps(store))).gap).toEqual({ recorded: true, newGap: false, superseded: false });
+    expect((await runSync(cfg(afterUrl), deps(store))).gap).toEqual({ recorded: true, newGap: false, superseded: false, needsResync: true });
     expect(await gapRows(projection)).toHaveLength(1);
 
     // Operator resync: the drained run marks the gap resolved; obs 3 and 4 stay missing; the row stays.
@@ -666,6 +666,20 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect(gaps).toHaveLength(1);
     expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: p, resolved_at: null });
     expect(await projected()).toEqual([ids[0], ids[1]]); // obs 3 never arrived, and that is on record
+  });
+
+  it("voluntary resync from a position retention already passed: the next run re-checks it, records the gap, continues the replay and resolves it", async () => {
+    const { old, fresh } = await seed();
+    expect((await runSync(cfg(afterUrl, { maxPages: 1 }), deps(store))).status).toBe("partial"); // obs 1, 2
+    const p = (await syncState())!.cursor;
+    expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 30), { batch: 100 })).deleted).toBe(4); // obs 1-4: past P
+    await asRole(projection, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION])); // needs_resync was false
+    const r = await runSync(cfg(afterUrl), deps(store));
+    expect(r).toMatchObject({ status: "ok", gap: { recorded: true, newGap: true, needsResync: false }, gapsResolved: 1 });
+    const gaps = await gapRows(projection);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: p, resolution: "full_resync" });
+    expect(await projected()).toEqual([old[0]!.id, old[1]!.id, ...fresh.map((f) => f.id)]); // obs 3, 4 missing, on record
   });
 
   it("control: a rotation while the consumer is at or after the watermark still resets once and replays the retained buffer (cursor_rejected, no gap)", async () => {

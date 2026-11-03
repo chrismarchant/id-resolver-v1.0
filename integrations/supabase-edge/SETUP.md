@@ -118,7 +118,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. Only the milliseconds between that check and the first page remain unchecked | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
-| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 3 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 4 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 
@@ -176,3 +176,18 @@ Reconciliation compares observation and distinct-company counts for the last
 than the resolver's retention window, a company erasure applied on one side only (wait for the
 next run), or a manual change to the projection tables. If it persists with a healthy sync,
 follow the `needs_resync` steps to replay the buffer.
+
+### Voluntary resync (without `needs_resync`)
+
+`idr_begin_resync` may also be called when no gap was reported (for example after a
+`reconcile_mismatch`). The old cursor may already lie behind the resolver's retention buffer, and
+a replay from the start would never deliver, or report, what was pruned after it. So a voluntary
+resync **re-checks the old position first**: it keeps the stored cursor in
+`idr_sync_state.reset_from_cursor`, and the next run presents it to the resolver before replaying.
+A `410` records a gap row (`kind = 'cursor_expired'`, `expired_cursor` = the old position) and,
+because you already asked for the rebuild, the replay continues in the same run instead of
+stopping; the response says `"gap_recorded": true`, the log says `continuity gap recorded ...`,
+and the gap is resolved (`resolution = 'full_resync'`) once that replay drains. Alert on the row as
+for any other gap. A `400` or `200` means nothing was pruned after the old position and the replay
+proceeds without a gap. A resync with `needs_resync` set does not re-check (the gap is already on
+record) and cannot loop.
