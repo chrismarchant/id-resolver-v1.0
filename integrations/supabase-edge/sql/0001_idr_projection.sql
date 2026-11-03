@@ -13,6 +13,10 @@
 -- Roles: relies on the standard Supabase roles anon, authenticated and
 -- service_role. Writes happen only through the idr_* functions below, which
 -- only service_role may execute (the Edge Function uses the service key).
+-- Privileges are exact (CHR-66 G4-L4): Supabase's default privileges grant ALL
+-- on every new table, view, sequence and function in public to anon,
+-- authenticated and service_role, so each object is first stripped of every
+-- privilege of those roles and PUBLIC, then granted only what it needs.
 --
 -- The whole script is ONE transaction: every statement in it is
 -- transaction-safe (no CREATE INDEX CONCURRENTLY, VACUUM or similar), so a
@@ -232,16 +236,28 @@ alter table public.idr_tombstones   enable row level security;
 alter table public.idr_sync_state   enable row level security;
 alter table public.idr_sync_gaps    enable row level security;
 
+-- Exact table privileges (CHR-66 G4-L4). REVOKE ALL first: it removes what
+-- Supabase's default privileges granted (on PostgreSQL 17 that includes
+-- MAINTAIN), what an earlier release granted, and any column-level grant.
+-- No role but the owner gets TRUNCATE, REFERENCES, TRIGGER or MAINTAIN.
 revoke all on table public.idr_companies, public.idr_observations, public.idr_tombstones,
-  public.idr_sync_state, public.idr_sync_gaps, public.idr_daily_company_activity from public, anon, authenticated;
+  public.idr_sync_state, public.idr_sync_gaps, public.idr_daily_company_activity
+  from public, anon, authenticated, service_role;
 grant select on public.idr_companies, public.idr_observations, public.idr_tombstones,
   public.idr_sync_state, public.idr_sync_gaps, public.idr_daily_company_activity to authenticated;
 grant select, insert, update, delete on public.idr_companies, public.idr_observations,
   public.idr_tombstones, public.idr_sync_state to service_role;
 -- Append-only: no DELETE or TRUNCATE privilege for anyone but the owner (and the guard trigger).
-revoke all on table public.idr_sync_gaps from service_role;
 grant select, insert, update on public.idr_sync_gaps to service_role;
+-- A view is read-only for every role.
 grant select on public.idr_daily_company_activity to service_role;
+-- The gap id is an identity column (generated always): inserting needs no
+-- privilege on its sequence, so no role but the owner holds any.
+do $$
+begin
+  execute format('revoke all on sequence %s from public, anon, authenticated, service_role',
+                 pg_get_serial_sequence('public.idr_sync_gaps', 'id'));
+end $$;
 
 do $$
 declare t text;
@@ -587,15 +603,18 @@ as $$
     and (o.observed_at at time zone 'utc')::date between p_from and p_to;
 $$;
 
-revoke all on function public.idr_get_sync_state(text) from public, anon, authenticated;
-revoke all on function public.idr_apply_feed_page(text, text, text, jsonb, text) from public, anon, authenticated;
-revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated;
-revoke all on function public.idr_begin_resync(text) from public, anon, authenticated;
-revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated;
-revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated;
-revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated;
-revoke all on function public.idr_resolve_sync_gaps(text, text) from public, anon, authenticated;
-revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated;
+-- Exact function privileges (G4-L4): EXECUTE for service_role only.
+revoke all on function public.idr_get_sync_state(text) from public, anon, authenticated, service_role;
+revoke all on function public.idr_apply_feed_page(text, text, text, jsonb, text) from public, anon, authenticated, service_role;
+revoke all on function public.idr_record_sync_status(text, text, boolean) from public, anon, authenticated, service_role;
+revoke all on function public.idr_begin_resync(text) from public, anon, authenticated, service_role;
+revoke all on function public.idr_reset_cursor(text, text) from public, anon, authenticated, service_role;
+revoke all on function public.idr_reconcile_counts(text, date, date) from public, anon, authenticated, service_role;
+revoke all on function public.idr_record_sync_gap(text, text, text) from public, anon, authenticated, service_role;
+revoke all on function public.idr_resolve_sync_gaps(text, text) from public, anon, authenticated, service_role;
+-- A trigger function is never called directly, and nobody needs it to create
+-- a trigger: no role but the owner may execute it.
+revoke all on function public.idr_sync_gaps_guard() from public, anon, authenticated, service_role;
 grant execute on function public.idr_get_sync_state(text) to service_role;
 grant execute on function public.idr_apply_feed_page(text, text, text, jsonb, text) to service_role;
 grant execute on function public.idr_record_sync_status(text, text, boolean) to service_role;
@@ -604,25 +623,25 @@ grant execute on function public.idr_reset_cursor(text, text) to service_role;
 grant execute on function public.idr_reconcile_counts(text, date, date) to service_role;
 grant execute on function public.idr_record_sync_gap(text, text, text) to service_role;
 grant execute on function public.idr_resolve_sync_gaps(text, text) to service_role;
--- A trigger function cannot be called directly; the grant only mirrors the others.
-grant execute on function public.idr_sync_gaps_guard() to service_role;
 
 -- ---------------------------------------------------------------------------
 -- LAST: the projection schema this script installs. The Edge function refuses
 -- to run (status schema_mismatch, HTTP 500) unless it matches the version its
 -- code expects, so code/SQL skew can never silently drop gap evidence.
--- 4 = this release (gap log with compare-and-set, reset_from_cursor re-check
--- after a 400 and after a voluntary resync, generations); earlier releases had
--- no version function. Defined after everything else, inside the same
--- transaction, so it never reports 4 for a partially applied script.
+-- 5 = this release: exact privileges under Supabase's default privileges
+-- (CHR-66 G4-L4). 4 = the gap log with compare-and-set, the reset_from_cursor
+-- re-check after a 400 and after a voluntary resync, generations. Earlier
+-- releases had no version function. Defined after everything else, inside the
+-- same transaction, so it never reports a version for a partially applied
+-- script.
 -- ---------------------------------------------------------------------------
 create or replace function public.idr_schema_version()
 returns integer
 language sql
 immutable
 set search_path = ''
-as $$ select 4 $$;
-revoke all on function public.idr_schema_version() from public, anon, authenticated;
+as $$ select 5 $$;
+revoke all on function public.idr_schema_version() from public, anon, authenticated, service_role;
 grant execute on function public.idr_schema_version() to service_role;
 
 commit;

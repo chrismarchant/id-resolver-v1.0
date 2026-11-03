@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, columnGrants, functionGrants, relationGrants } from "./helpers/acl.ts";
 import { INSTALLATION, asRole, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
@@ -122,14 +123,15 @@ describe("row level security", () => {
       }
       await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).resolves.toBeDefined();
     }
-    // No other role (PUBLIC) holds EXECUTE.
+    // No other role (PUBLIC) holds EXECUTE, and nobody but the owner on the trigger function (G4-L4).
     const acl = await pool.query<{ proname: string; proacl: string[] }>(
       "select proname, proacl::text[] as proacl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
     );
     expect(acl.rows.length).toBe(FUNCS.length + TRIGGER_FUNCS.length);
     for (const row of acl.rows) {
       const grantees = row.proacl.map((a) => a.split("=")[0]);
-      expect(grantees.sort(), row.proname).toEqual(["resolver", "service_role"].sort());
+      const trigger = TRIGGER_FUNCS.includes(`${row.proname}()`);
+      expect(grantees.sort(), row.proname).toEqual(trigger ? ["resolver"] : ["resolver", "service_role"]);
     }
   });
 
@@ -141,5 +143,46 @@ describe("row level security", () => {
       expect(row.prosecdef, row.proname).toBe(false);
       expect(row.proconfig, row.proname).toContain('search_path=""');
     }
+  });
+});
+
+describe("G4-L4: exact privileges under Supabase's default privileges", () => {
+  it("control: the emulated defaults really grant ALL to anon, authenticated and service_role on new objects in public", async () => {
+    await pool.query("create table public.g4l4_control (id bigint generated always as identity, v text)");
+    try {
+      const r = await pool.query<{ role: string; t: boolean; s: boolean }>(
+        `select r as role, has_table_privilege(r, 'public.g4l4_control', 'TRUNCATE') as t,
+                has_sequence_privilege(r, pg_get_serial_sequence('public.g4l4_control', 'id'), 'UPDATE') as s
+           from unnest(array['anon','authenticated','service_role']) r`,
+      );
+      expect(r.rows).toEqual(["anon", "authenticated", "service_role"].map((role) => ({ role, t: true, s: true })));
+    } finally {
+      await pool.query("drop table public.g4l4_control");
+    }
+  });
+
+  it("every idr_* table, view and sequence has exactly the intended grants, and there is no column-level grant", async () => {
+    expect(await relationGrants(pool)).toEqual(EXPECTED_RELATION_GRANTS);
+    expect(await columnGrants(pool)).toEqual([]);
+  });
+
+  it("every idr_* function: EXECUTE for service_role only (nobody on the trigger function), nothing for PUBLIC, anon or authenticated", async () => {
+    expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
+  });
+
+  it("as service_role: no TRUNCATE and no CREATE TRIGGER on any table; anon and authenticated cannot use the gap id sequence", async () => {
+    for (const t of TABLES) {
+      await expect(asRole(pool, "service_role", (c) => c.query(`truncate public.${t}`)), `truncate ${t}`).rejects.toThrow(/permission denied/);
+      await expect(
+        asRole(pool, "service_role", (c) => c.query(`create trigger g4l4 before insert on public.${t} for each row execute function public.idr_sync_gaps_guard()`)),
+        `trigger on ${t}`,
+      ).rejects.toThrow(/permission denied/);
+    }
+    for (const role of ["anon", "authenticated", "service_role"]) {
+      for (const sql of ["select nextval('public.idr_sync_gaps_id_seq')", "select setval('public.idr_sync_gaps_id_seq', 1000)"]) {
+        await expect(asRole(pool, role, (c) => c.query(sql)), `${role}: ${sql}`).rejects.toThrow(/permission denied/);
+      }
+    }
+    expect((await pool.query("select count(*)::int as n from public.idr_tombstones")).rows[0].n).toBe(1);
   });
 });

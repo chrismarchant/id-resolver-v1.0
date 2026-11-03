@@ -2,7 +2,10 @@
  * Upgrade path of sql/0001_idr_projection.sql (CHR-66 round 3): the script
  * must stay re-runnable over installs of earlier releases, keeping every
  * existing row. Fixtures are verbatim copies of the script as released at
- * 6318ab2 (before the gap log) and f12b1ad (gap log, round 2).
+ * 6318ab2 (before the gap log), f12b1ad (gap log, round 2) and fced2ea
+ * (schema version 4, the Gate 3 release, unchanged until Gate 5). Every
+ * install is created under Supabase's default privileges (freshPublicSchema),
+ * so the upgrade must also take away what those defaults granted (G4-L4).
  */
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -12,9 +15,10 @@ import { fileURLToPath } from "node:url";
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { handleSyncRequest, PROJECTION_SCHEMA_VERSION, runSync } from "../src/core/index.ts";
+import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, columnGrants, functionGrants, relationGrants } from "./helpers/acl.ts";
 import { FakePostgrest, SERVICE_KEY } from "./helpers/fake-postgrest.ts";
 import { TOKEN } from "./helpers/mock-resolver.ts";
-import { INSTALLATION, PgStore, SQL_PATH, TEST_DB_URL, asRole, counts, ensureProjection, gapRows, newPool, resetDatabase, storedCursor } from "./helpers/db.ts";
+import { INSTALLATION, PgStore, SQL_PATH, TEST_DB_URL, asRole, counts, ensureProjection, freshPublicSchema, gapRows, newPool, resetDatabase, storedCursor } from "./helpers/db.ts";
 import { MockResolver, obs } from "./helpers/mock-resolver.ts";
 import { testConfig, testDeps } from "./helpers/setup.ts";
 
@@ -22,6 +26,7 @@ const fixture = (rel: string) => fileURLToPath(new URL(`./fixtures/${rel}`, impo
 const LEGACY = {
   "6318ab2": fixture("0001_idr_projection.6318ab2.sql"),
   f12b1ad: fixture("0001_idr_projection.f12b1ad.sql"),
+  fced2ea: fixture("0001_idr_projection.fced2ea.sql"),
 } as const;
 const D = "2026-11-02T12:00:00.000Z";
 
@@ -43,16 +48,20 @@ beforeEach(() => {
 });
 
 async function installLegacy(version: keyof typeof LEGACY): Promise<void> {
-  await pool.query("drop schema public cascade");
-  await pool.query("create schema public");
+  await freshPublicSchema(pool);
   await ensureProjection(pool, LEGACY[version]);
 }
 
 /** A consumer that applied obs 1-2 (cursor c2) through the legacy functions. */
 async function seedLegacyState(version: keyof typeof LEGACY): Promise<void> {
-  await asRole(pool, "service_role", (c) =>
-    c.query("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb)", [INSTALLATION, JSON.stringify([obs(1, 7, D), obs(2, 7, D)])]),
-  );
+  const items = JSON.stringify([obs(1, 7, D), obs(2, 7, D)]);
+  if (version === "fced2ea") {
+    // Schema 4: five-argument apply, three-argument gap record (an open gap with needs_resync).
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null)", [INSTALLATION, items]));
+    await asRole(pool, "service_role", (c) => c.query("select public.idr_record_sync_gap($1, 'cursor_expired', 'c2')", [INSTALLATION]));
+    return;
+  }
+  await asRole(pool, "service_role", (c) => c.query("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb)", [INSTALLATION, items]));
   if (version === "f12b1ad") {
     // Round-2 gap record (two-argument function of that release): an open gap with needs_resync.
     await asRole(pool, "service_role", (c) => c.query("select public.idr_record_sync_gap($1, 'cursor_expired')", [INSTALLATION]));
@@ -68,7 +77,7 @@ const idrFunctions = async () =>
     )
   ).rows;
 
-describe.each(["6318ab2", "f12b1ad"] as const)("upgrade from the %s release", (version) => {
+describe.each(["6318ab2", "f12b1ad", "fced2ea"] as const)("upgrade from the %s release", (version) => {
   it("R2-6: before the upgrade the current function refuses loudly (schema_mismatch, HTTP 500), fetches nothing and writes nothing", async () => {
     await installLegacy(version);
     await seedLegacyState(version);
@@ -112,7 +121,7 @@ describe.each(["6318ab2", "f12b1ad"] as const)("upgrade from the %s release", (v
     await installLegacy(version);
     await seedLegacyState(version);
     const before = { counts: await counts(pool), gaps: version === "6318ab2" ? [] : await gapRows(pool) };
-    if (version === "f12b1ad") expect(before.gaps).toHaveLength(1);
+    if (version !== "6318ab2") expect(before.gaps).toHaveLength(1);
     expect(before.counts.observations).toBe(2);
 
     await ensureProjection(pool);
@@ -135,9 +144,13 @@ describe.each(["6318ab2", "f12b1ad"] as const)("upgrade from the %s release", (v
     expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(PROJECTION_SCHEMA_VERSION);
     const gens = await pool.query("select resync_generation::int as resync, replay_generation::int as replay from public.idr_sync_state");
     expect(gens.rows[0]).toEqual({ resync: 0, replay: 0 });
-    // A gap of the earlier release has no generation (treated as 0: needs a resync after the upgrade).
-    expect((await gapRows(pool)).map((g) => g.detected_generation)).toEqual(before.gaps.map(() => null));
-    for (const f of fns) expect(f.acl.map((a) => a.split("=")[0]).sort(), f.sig).toEqual(["resolver", "service_role"]);
+    // A gap of a release before schema 4 has no generation (treated as 0: needs a resync after the upgrade).
+    expect((await gapRows(pool)).map((g) => g.detected_generation)).toEqual(before.gaps.map(() => (version === "fced2ea" ? 0 : null)));
+    // G4-L4: the grants converge to exactly the intended ones, whatever the earlier release and Supabase's defaults left.
+    expect(fns.map((f) => f.sig).sort()).toEqual(Object.keys(EXPECTED_FUNCTION_GRANTS).sort());
+    expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
+    expect(await relationGrants(pool)).toEqual(EXPECTED_RELATION_GRANTS);
+    expect(await columnGrants(pool)).toEqual([]);
   });
 
   it("the current engine then records (or keeps) exactly one gap, and resync + drain resolves it without losing the row", async () => {
@@ -209,7 +222,7 @@ describe("R3-D: the script is atomic and reports its version last", () => {
   });
 
   const hasPsql = spawnSync("psql", ["--version"], { encoding: "utf8" }).status === 0;
-  it.skipIf(!hasPsql)("with psql's default (continue after an error, autocommit), a failure in the middle still applies nothing: no version 4, no new function", async () => {
+  it.skipIf(!hasPsql)("with psql's default (continue after an error, autocommit), a failure in the middle still applies nothing: no version reported, no new function", async () => {
     await installLegacy("f12b1ad");
     await seedLegacyState("f12b1ad");
     const marker = "create or replace function public.idr_resolve_sync_gaps(";

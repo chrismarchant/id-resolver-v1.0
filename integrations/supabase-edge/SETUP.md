@@ -28,7 +28,22 @@ existing project, keeping every row: it adds `idr_sync_gaps` and the `idr_sync_s
 `idr_record_sync_gap` with new signatures, so re-run the SQL and redeploy the function together). It creates the
 projection tables, the append-only `idr_sync_gaps` log, the `idr_daily_company_activity` view and the `idr_*` functions, enables
 RLS on every table (no `anon` access; `authenticated` read-only and only with the `idr_reader` claim, see below) and grants function
-execution to `service_role` only. The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
+execution to `service_role` only. Privileges are exact (CHR-66 G4-L4): Supabase's default privileges grant
+`ALL` on every new table, view, sequence and function in `public` to `anon`, `authenticated` and
+`service_role`, so the script first revokes everything from those roles (and `PUBLIC`) on each `idr_*`
+object, then grants only this:
+
+| role | `idr_companies`, `idr_observations`, `idr_tombstones`, `idr_sync_state` | `idr_sync_gaps` | `idr_daily_company_activity` (view) | `idr_*` functions |
+| --- | --- | --- | --- | --- |
+| `anon` | nothing | nothing | nothing | nothing |
+| `authenticated` | `SELECT` (rows only with the `idr_reader` claim) | `SELECT` (claim) | `SELECT` | nothing |
+| `service_role` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` | `SELECT`, `INSERT`, `UPDATE` | `SELECT` | `EXECUTE` (not on the trigger function `idr_sync_gaps_guard`) |
+
+No role but the owner keeps `TRUNCATE`, `REFERENCES`, `TRIGGER` or `MAINTAIN` on any `idr_*` table, write
+access to the view, or any privilege on the `idr_sync_gaps` id sequence (an identity column needs none).
+Re-running the script on an existing project removes those privileges there too.
+
+The script is one transaction (`BEGIN` … `COMMIT`; every statement in it is
 transaction-safe): if any statement fails, nothing is applied and the previous version stays
 intact, even with `psql -f`, which by default continues after an error. `idr_schema_version()` is
 defined last, so it reports the new version only for a completely applied script. Apply it as one
@@ -143,7 +158,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. The first page after that check is sent at once and only once (no retry or backoff; any failure ends the run with the position kept, so the next run checks again); what remains unchecked is the interval between the resolver's check and that one request (plus, right after a 400, the one store write that keeps the position), each bounded by its timeout | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
-| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 4 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 5 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 

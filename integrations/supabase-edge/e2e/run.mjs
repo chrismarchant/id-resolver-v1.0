@@ -30,6 +30,12 @@ const INST = "idr-e2e";
 const DAY_MS = 86_400_000;
 const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "observations", "pages", "reconcile", "status", "tombstones"];
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
+/** idr_schema_version() of sql/0001_idr_projection.sql (PROJECTION_SCHEMA_VERSION in src/core/types.ts). */
+const SCHEMA_VERSION = 5;
+/** Trigger functions: no role but the owner holds EXECUTE (CHR-66 G4-L4). */
+const TRIGGER_FUNCTIONS = ["idr_sync_gaps_guard"];
+/** Expected grantees of an idr_* function's ACL. */
+const expectedFnGrantees = (proname, owner) => (TRIGGER_FUNCTIONS.includes(proname) ? [owner] : [owner, "service_role"].sort());
 const IDR_FUNCTIONS = [
   "idr_get_sync_state(text)",
   "idr_apply_feed_page(text,text,text,jsonb,text)",
@@ -265,10 +271,10 @@ async function upgradeChecks() {
   const gone = (await stack.q("select to_regprocedure('public.idr_apply_feed_page(text,text,text,jsonb)') is null as g")).rows[0].g;
   const owner = (await stack.q("select current_user as u")).rows[0].u;
   const acl = (await stack.q("select proname, proacl::text[] as acl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'")).rows;
-  const bad = acl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify([owner, "service_role"].sort()));
+  const bad = acl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify(expectedFnGrantees(x.proname, owner)));
   check(
-    "re-running the current SQL upgrades in place: row and cursor kept, schema_version 4, old signature dropped, ACLs exactly owner + service_role",
-    sv.json?.schema_version === 4 && sv.json.cursor === "legacy-c1" && (await obsCount()) === 1 && gone && acl.length === IDR_FUNCTIONS.length + 1 && bad.length === 0,
+    `re-running the current SQL upgrades in place: row and cursor kept, schema_version ${SCHEMA_VERSION}, old signature dropped, ACLs exactly owner + service_role (owner only on the trigger function)`,
+    sv.json?.schema_version === SCHEMA_VERSION && sv.json.cursor === "legacy-c1" && (await obsCount()) === 1 && gone && acl.length === IDR_FUNCTIONS.length + 1 && bad.length === 0,
     bad.map((x) => x.proname).join(",") || `${acl.length} functions`,
   );
 }
@@ -280,7 +286,7 @@ async function setup() {
   await resolver.start({ hmacSecret: secrets["E2E_IP_HMAC_SECRET"] });
   await stack.waitForFunction();
   const sv = await stack.rpcService("idr_get_sync_state", { p_installation_id: INST });
-  check("projection SQL applied; service_role RPC answers through PostgREST", sv.status === 200 && sv.json?.schema_version === 4, `HTTP ${sv.status}, schema_version ${sv.json?.schema_version}`);
+  check("projection SQL applied; service_role RPC answers through PostgREST", sv.status === 200 && sv.json?.schema_version === SCHEMA_VERSION, `HTTP ${sv.status}, schema_version ${sv.json?.schema_version}`);
 
   versions["supabase_db"] = (await stack.q("select version() as v")).rows[0].v;
   versions["resolver_db"] = (await resolver.db().query("select version() as v")).rows[0].v;
@@ -708,7 +714,7 @@ async function s7Rls() {
 
   // service_role and the ACLs the unit tests claim, read from the catalog of this stack
   const sr = await stack.rpcService("idr_get_sync_state", { p_installation_id: INST });
-  check("service_role RPC works", sr.status === 200 && sr.json?.schema_version === 4 && typeof sr.json.cursor === "string");
+  check("service_role RPC works", sr.status === 200 && sr.json?.schema_version === SCHEMA_VERSION && typeof sr.json.cursor === "string");
   const acl = (
     await stack.q(
       `select f, r, has_function_privilege(r, 'public.' || f, 'execute') as x
@@ -720,13 +726,13 @@ async function s7Rls() {
   check("only service_role may execute the idr_* functions (catalog)", badFn.length === 0, badFn.map((a) => `${a.r}:${a.f}`).join(" ") || `${acl.length} grants checked`);
   const owner = (await stack.q("select current_user as u")).rows[0].u;
   const proacl = (await stack.q("select proname, proacl::text[] as acl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'")).rows;
-  const badAcl = proacl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify([owner, "service_role"].sort()));
-  check("every idr_* function's ACL holds exactly its owner and service_role (as rls.test.ts claims)", proacl.length === IDR_FUNCTIONS.length + 1 && badAcl.length === 0, badAcl.map((x) => `${x.proname}: ${(x.acl ?? []).map((a) => a.split("=")[0]).join(",")}`).join("; ") || `${proacl.length} functions`);
+  const badAcl = proacl.filter((x) => JSON.stringify((x.acl ?? []).map((a) => a.split("=")[0]).sort()) !== JSON.stringify(expectedFnGrantees(x.proname, owner)));
+  check("every idr_* function's ACL holds exactly its owner and service_role, the trigger function its owner only (as rls.test.ts claims)", proacl.length === IDR_FUNCTIONS.length + 1 && badAcl.length === 0, badAcl.map((x) => `${x.proname}: ${(x.acl ?? []).map((a) => a.split("=")[0]).join(",")}`).join("; ") || `${proacl.length} functions`);
   const tp = (
     await stack.q(
       `select t, r, p, has_table_privilege(r, 'public.' || t, p) as x
          from unnest($1::text[]) t, unnest(array['anon','authenticated','service_role']) r,
-              unnest(array['SELECT','INSERT','UPDATE','DELETE','TRUNCATE']) p`,
+              unnest(array['SELECT','INSERT','UPDATE','DELETE','TRUNCATE','REFERENCES','TRIGGER']) p`,
       [[...TABLES, "idr_daily_company_activity"]],
     )
   ).rows;
@@ -742,8 +748,15 @@ async function s7Rls() {
   for (const t of TABLES.filter((x) => x !== "idr_sync_gaps")) for (const p of ["INSERT", "UPDATE", "DELETE"]) if (!has(t, "service_role", p)) viol.push(`service_role lacks ${p}:${t}`);
   for (const p of ["DELETE", "TRUNCATE"]) if (has("idr_sync_gaps", "service_role", p)) viol.push(`service_role:${p}:idr_sync_gaps`);
   check("table privileges: anon none; authenticated SELECT only; service_role writes, but no DELETE/TRUNCATE on idr_sync_gaps (catalog)", viol.length === 0, viol.join(" ") || `${tp.length} privileges checked`);
-  const extra = tp.filter((a) => a.r === "service_role" && a.x && (a.p === "TRUNCATE" || a.t === "idr_daily_company_activity") && a.p !== "SELECT").map((a) => `${a.p}:${a.t}`);
-  check("info: service_role privileges beyond what the SQL grants (Supabase default privileges)", true, extra.join(" ") || "none");
+  // CHR-66 G4-L4: nothing beyond what the SQL grants survives Supabase's default privileges.
+  const extra = tp.filter((a) => a.x && (["TRUNCATE", "REFERENCES", "TRIGGER"].includes(a.p) || (a.t === "idr_daily_company_activity" && a.p !== "SELECT"))).map((a) => `${a.r}:${a.p}:${a.t}`);
+  const seq = (
+    await stack.q(
+      `select r, has_sequence_privilege(r, pg_get_serial_sequence('public.idr_sync_gaps', 'id'), 'USAGE,SELECT,UPDATE') as x
+         from unnest(array['anon','authenticated','service_role']) r`,
+    )
+  ).rows.filter((a) => a.x).map((a) => `${a.r}:sequence`);
+  check("no TRUNCATE, REFERENCES or TRIGGER for any API role, no write on the view, no privilege on the gap id sequence, despite Supabase's default privileges (catalog)", extra.length + seq.length === 0, [...extra, ...seq].join(" ") || "none");
   const rls = (await stack.q("select relname, relrowsecurity from pg_class where relnamespace = 'public'::regnamespace and relname = any($1)", [TABLES])).rows;
   check("RLS enabled on every projection table", rls.length === TABLES.length && rls.every((x) => x.relrowsecurity));
   // keep the user ids out of the output

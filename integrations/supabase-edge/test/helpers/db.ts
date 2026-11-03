@@ -15,9 +15,36 @@ export function newPool(): pg.Pool {
 
 /** Recreates the public schema, the Supabase roles (if missing) and applies the SQL template. */
 export async function resetDatabase(pool: pg.Pool): Promise<void> {
+  await freshPublicSchema(pool);
+  await ensureProjection(pool);
+}
+
+async function ensureSupabaseRoles(c: pg.Pool | pg.PoolClient): Promise<void> {
+  for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
+    await c.query(
+      `do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} NOLOGIN ${extra}; end if; end $$`,
+    );
+  }
+}
+
+/**
+ * An empty public schema with Supabase's default privileges in force (CHR-66
+ * G4-L4). On Supabase, the platform's initial schema runs
+ *   alter default privileges in schema public grant all on tables|sequences|functions
+ *     to anon, authenticated, service_role
+ * for the role that applies migrations, so every table, view, sequence and
+ * function the projection SQL creates starts with ALL privileges for those
+ * three roles (on PostgreSQL 17, ALL on a table includes MAINTAIN). The
+ * emulation is for objects created by this test role. Default privileges
+ * belong to the schema, so they are set again after each re-creation.
+ */
+export async function freshPublicSchema(pool: pg.Pool): Promise<void> {
   await pool.query("drop schema public cascade");
   await pool.query("create schema public");
-  await ensureProjection(pool);
+  await ensureSupabaseRoles(pool);
+  for (const kind of ["tables", "sequences", "functions"]) {
+    await pool.query(`alter default privileges in schema public grant all on ${kind} to anon, authenticated, service_role`);
+  }
 }
 
 /**
@@ -28,11 +55,7 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
 export async function ensureProjection(pool: pg.Pool, sqlPath: string = SQL_PATH): Promise<void> {
   const c = await pool.connect();
   try {
-    for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
-      await c.query(
-        `do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} NOLOGIN ${extra}; end if; end $$`,
-      );
-    }
+    await ensureSupabaseRoles(c);
     // Emulate Supabase's auth.jwt() (only if missing, so a real Supabase schema is never touched).
     await c.query("create schema if not exists auth");
     await c.query(
