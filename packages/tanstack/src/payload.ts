@@ -9,7 +9,11 @@ const PAGE_KEY_VALID = /^\/[^?#\s\u0000-\u001f\u007f]*$/;
  */
 const SEGMENT_CLASSIFY_MAX = 128;
 
-/** Maps a normalised path to a route template (e.g. `/blog/my-post` to `/blog/:slug`). Return null to keep the path. */
+/**
+ * Maps a normalised path to a route template (e.g. `/blog/my-post` to `/blog/:slug`).
+ * Return null (or undefined) for no opinion: in the adapter the conservative
+ * default mapper then applies to the path (see `pageKeyDefaultMapper`).
+ */
 export type PageKeyMapper = (path: string) => string | null | undefined;
 
 /**
@@ -87,14 +91,15 @@ function mapSegment(segment: string): string {
 }
 
 /**
- * Conservative default `page_key` mapper, used unless the site supplies its own
- * `pageKeyMapper`. It replaces identifier-like path segments so that reset
- * tokens, e-mail addresses and order ids never reach the resolver or the
- * reporting feed: e-mail addresses become `:email`, UUIDs `:uuid`, digit runs
+ * Conservative default `page_key` mapper. The adapter always applies it, also
+ * after a site's own `pageKeyMapper`, unless `pageKeyDefaultMapper: false`
+ * (see `composePageKeyMapper`). It replaces identifier-like path segments so
+ * that reset tokens, e-mail addresses and order ids never reach the resolver or
+ * the reporting feed: e-mail addresses become `:email`, UUIDs `:uuid`, digit runs
  * of four or more `:n` (a plain year such as 2026 is kept), long hex/base64url
  * tokens and 12+ character letter-and-digit runs `:token`. Readable slugs
- * (`pricing`, `case-studies`) are kept. It is a heuristic: a site that knows its
- * routes should use `compileRouteTemplates` instead.
+ * (`pricing`, `case-studies`) and template placeholders (`:slug`) are kept. It
+ * is a heuristic: a site that knows its routes should add `compileRouteTemplates`.
  *
  * The work is bounded (CHR-66 N6): a segment over 128 characters becomes
  * `:token` without being classified, and mapping stops at the first segment
@@ -114,6 +119,31 @@ export const defaultPageKeyMapper: PageKeyMapper = (path) => {
   return out === path ? null : out;
 };
 
+/**
+ * The mapper the adapter applies (CHR-66 N3). Without a site mapper it is
+ * `defaultPageKeyMapper`, whatever `applyDefault` says (the adapter's config
+ * refuses an opt-out without a site mapper). With one, the default still runs afterwards: on the
+ * site mapper's output, or on the path when the site mapper returns
+ * null/undefined (no route matched), a non-string, or throws. Route-template
+ * output such as `/blog/:slug` passes through the default unchanged.
+ * `applyDefault: false` is the explicit opt-out: the site mapper alone applies.
+ */
+export function composePageKeyMapper(siteMapper: PageKeyMapper | undefined, applyDefault = true): PageKeyMapper {
+  if (!siteMapper) return defaultPageKeyMapper;
+  if (!applyDefault) return siteMapper;
+  return (path) => {
+    let base = path;
+    try {
+      const own = siteMapper(path);
+      if (typeof own === "string") base = own;
+    } catch {
+      // A throwing site mapper must never affect the page; the default still applies to the path.
+    }
+    return defaultPageKeyMapper(base) ?? base;
+  };
+}
+
+/** At most 256 characters, cut on a segment boundary (never inside a segment). */
 function cap(path: string): string {
   if (path.length <= PAGE_KEY_MAX) return path;
   const cut = path.slice(0, PAGE_KEY_MAX);
@@ -121,11 +151,23 @@ function cap(path: string): string {
   return i <= 0 ? "/" : cut.slice(0, i);
 }
 
+/** Caps a key; anything that is still not a valid `page_key` becomes the fixed safe value `/`. */
+function finalise(key: string): string {
+  const capped = cap(key);
+  return PAGE_KEY_VALID.test(capped) ? capped : "/";
+}
+
 /**
  * Normalises a request URL or path to the contract's `page_key`: path only
  * (never a query string or fragment), duplicate slashes collapsed, trailing
- * slash removed, at most 256 characters. An optional route-template mapper
- * lets sites avoid sending identifiers that appear in dynamic segments.
+ * slash removed, at most 256 characters. An optional mapper (the adapter
+ * passes `composePageKeyMapper(...)`) replaces identifiers in dynamic segments.
+ *
+ * When a mapper is given, the unmapped path is never sent in place of its
+ * output (CHR-66 N2): an output over 256 characters is cut back to a segment
+ * boundary, and an unusable output (invalid, not a string, or a throw) becomes
+ * `/`. Only a mapper that returns null/undefined keeps the path as is.
+ * This function applies exactly the mapper it is given.
  */
 export function normalisePageKey(input: string, mapper?: PageKeyMapper): string {
   let path: string;
@@ -140,16 +182,16 @@ export function normalisePageKey(input: string, mapper?: PageKeyMapper): string 
   path = path.replace(/\/{2,}/g, "/");
   if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
   if (!path.startsWith("/")) path = "/" + path;
-  if (mapper) {
-    try {
-      const mapped = mapper(path);
-      if (typeof mapped === "string" && mapped.length <= PAGE_KEY_MAX && PAGE_KEY_VALID.test(mapped)) return mapped;
-    } catch {
-      // A throwing mapper must never affect the page: fall back to the path.
-    }
+  if (!mapper) return finalise(path);
+  let mapped: unknown;
+  try {
+    mapped = mapper(path);
+  } catch {
+    // A throwing mapper must never affect the page, and never lets the raw path through.
+    return "/";
   }
-  path = cap(path);
-  return PAGE_KEY_VALID.test(path) ? path : "/";
+  if (mapped === null || mapped === undefined) return finalise(path);
+  return typeof mapped === "string" ? finalise(mapped) : "/";
 }
 
 const PAID_MEDIUMS = new Set(["cpc", "ppc", "paid", "paidsearch", "paid-search", "paid_search", "paidsocial", "paid-social", "paid_social", "cpm", "cpv", "cpa", "display", "banner", "retargeting", "remarketing", "sponsored", "ads", "ad"]);

@@ -1,5 +1,5 @@
 import type { EligibilityRules } from "./eligibility.js";
-import { defaultPageKeyMapper, type PageKeyMapper } from "./payload.js";
+import { composePageKeyMapper, type PageKeyMapper } from "./payload.js";
 import { validateTrustPolicy } from "./trust.js";
 import type { TrustPolicy } from "./types.js";
 
@@ -46,8 +46,18 @@ export interface IdrOptions {
   /** Only for `onUnsupportedBackground: "await"`. 50..1000, default 250: the maximum TTFB this package may add. */
   blockingBudgetMs?: number;
   eligibility?: EligibilityRules;
-  /** Replaces the conservative default `page_key` mapper (identifier-like segments become `:email`, `:uuid`, `:n`, `:token`), e.g. `compileRouteTemplates(["/blog/:slug"])`. */
+  /**
+   * Your own `page_key` mapper, e.g. `compileRouteTemplates(["/blog/:slug"])`. The conservative default mapper
+   * (identifier-like segments become `:email`, `:uuid`, `:n`, `:token`) still runs after it: on its output, or on
+   * the path when it returns null/undefined or throws. Template placeholders such as `:slug` pass through unchanged.
+   */
   pageKeyMapper?: PageKeyMapper;
+  /**
+   * Default `true`. `false` switches the default mapper off so that `pageKeyMapper` alone decides, and a path it
+   * returns null for is sent as is. Only for sites whose own mapper guarantees that no identifier (token, e-mail,
+   * order number, user name) reaches the resolver. Requires `pageKeyMapper`.
+   */
+  pageKeyDefaultMapper?: boolean;
   /** Host names of this site for the internal-navigation check. Default: the host of the request URL. */
   siteHosts?: readonly string[];
   /** Permit an http:// resolver URL. Local development only. */
@@ -72,6 +82,7 @@ export interface ResolvedConfig {
   onUnsupportedBackground: "drop" | "await";
   blockingBudgetMs: number;
   eligibility: EligibilityRules;
+  /** The mapper actually applied: the site's own mapper (if any) followed by the default, unless opted out. */
   pageKeyMapper: PageKeyMapper;
   siteHosts: readonly string[] | undefined;
   allowDocumentationRanges: boolean;
@@ -117,6 +128,16 @@ export function resolveConfig(options: IdrOptions): ResolvedConfig {
   const blockingBudgetMs = intIn("blockingBudgetMs", options.blockingBudgetMs, 50, 1_000, 250);
   const onUnsupportedBackground = options.onUnsupportedBackground ?? "drop";
   if (onUnsupportedBackground !== "drop" && onUnsupportedBackground !== "await") throw new Error("idr-tanstack: onUnsupportedBackground must be drop or await");
+  if (options.pageKeyMapper !== undefined && options.pageKeyMapper !== null && typeof options.pageKeyMapper !== "function") {
+    throw new Error("idr-tanstack: pageKeyMapper must be a function");
+  }
+  if (options.pageKeyDefaultMapper !== undefined && typeof options.pageKeyDefaultMapper !== "boolean") {
+    throw new Error("idr-tanstack: pageKeyDefaultMapper must be true or false");
+  }
+  const siteMapper = options.pageKeyMapper ?? undefined;
+  if (options.pageKeyDefaultMapper === false && siteMapper === undefined) {
+    throw new Error("idr-tanstack: pageKeyDefaultMapper: false requires your own pageKeyMapper");
+  }
   const base = url.pathname.replace(/\/+$/, "");
   return {
     endpoint: `${url.origin}${base}/v1/entrances`,
@@ -130,7 +151,7 @@ export function resolveConfig(options: IdrOptions): ResolvedConfig {
     onUnsupportedBackground,
     blockingBudgetMs,
     eligibility: options.eligibility ?? {},
-    pageKeyMapper: options.pageKeyMapper ?? defaultPageKeyMapper,
+    pageKeyMapper: composePageKeyMapper(siteMapper, options.pageKeyDefaultMapper !== false),
     siteHosts: options.siteHosts,
     allowDocumentationRanges: options.allowDocumentationRanges === true,
     onDeliveryResult: options.onDeliveryResult,

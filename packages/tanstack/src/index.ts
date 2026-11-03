@@ -2,7 +2,7 @@ export { createIdrServerMiddleware, type IdrMiddlewareArgs } from "./middleware.
 export { buildEntrance, type BuildResult } from "./build.js";
 export { selectClientIp } from "./trust.js";
 export { isEligible, type EligibilityRules, type EligibilityResult, type IneligibleReason, type PathPattern } from "./eligibility.js";
-export { classifyAcquisition, normalisePageKey, compileRouteTemplates, defaultPageKeyMapper, generateEntranceId, type AcquisitionInput, type PageKeyMapper } from "./payload.js";
+export { classifyAcquisition, normalisePageKey, compileRouteTemplates, composePageKeyMapper, defaultPageKeyMapper, generateEntranceId, type AcquisitionInput, type PageKeyMapper } from "./payload.js";
 export { parsePublicIp, type ParsedIp } from "./ip.js";
 export { checkConnectivity, type ConnectivityResult } from "./connectivity.js";
 export { resolveConfig, type IdrOptions, type DeliveryResult } from "./config.js";
