@@ -4,7 +4,9 @@
 # (or before a line carried the opt-out marker) cannot be fixed in place. Each
 # entry is an exact fingerprint `commit:path:rule:sha256` where sha256 is the
 # SHA-256 (hex) of the flagged value, and allows ONE value in ONE file of ONE
-# commit; nothing else. The gate prints the fingerprint next to each finding.
+# commit; nothing else. To print the fingerprint of each waivable finding, run
+# `node scripts/check-public-safety.mjs --history --fingerprints` locally (it is
+# refused in CI, whose public log never shows values or hashes).
 #
 # Rules (enforced by the gate, which also scans this file like any other):
 # - Never write a flagged value here, not even in a comment: describe it.

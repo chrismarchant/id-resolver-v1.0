@@ -57,16 +57,18 @@
  * rewriting and credential rotation, not a waiver. The allow-list is validated
  * in every mode.
  *
- * Output never contains a matched value: the repository and its CI logs are
- * public, so a real leak must not be republished there. A finding shows its
- * location, the rule and a redacted form (length and the first 12 hex
- * characters of the value's SHA-256); history fingerprints carry the full
- * SHA-256. `--show-values` prints the raw values, for local use only: it is
- * refused when the CI or GITHUB_ACTIONS environment variable is set, and CI
- * must never pass it.
+ * Output never contains a matched value, nor a hash of one: the repository
+ * and its CI logs are public, and a hash of a low-entropy value (an IPv4
+ * address, an e-mail address) is effectively the value. A finding or opt-out
+ * shows its location, the rule and `[redacted: <length> chars]` only.
+ * Two flags are for LOCAL use only; the gate refuses both (exit 2) when the
+ * CI or GITHUB_ACTIONS environment variable is set, and CI never passes them:
+ *   --fingerprints  with --history, also print each allow-list entry
+ *                   (`commit:path:rule:sha256`), for synthetic values only
+ *   --show-values   print the raw matched values (and full internal errors)
  *
- * Usage: node scripts/check-public-safety.mjs [--staged | --history] [--show-values]
- * Exit code 0 = clean, 1 = findings, 2 = internal error (or --show-values in CI).
+ * Usage: node scripts/check-public-safety.mjs [--staged | --history] [--fingerprints] [--show-values]
+ * Exit code 0 = clean, 1 = findings, 2 = internal error (or a local-only flag in CI).
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -74,6 +76,7 @@ import { readFileSync, statSync } from "node:fs";
 
 const MARKER = "public-safety: allow-synthetic";
 const SHOW_VALUES = process.argv.includes("--show-values");
+const SHOW_FINGERPRINTS = process.argv.includes("--fingerprints");
 const MAX_BYTES = 2 * 1024 * 1024;
 const HISTORY_ALLOW_FILE = ".public-safety-history-allow";
 
@@ -146,16 +149,19 @@ const RULES = [
 const NEVER_ALLOW = new Set(["forbidden-file", "private-key-block", "email", "railway-public-host", "railway-private-host"]);
 const KNOWN_RULES = new Set([...RULES.map((r) => r.id), "forbidden-file"]);
 const REMEDIATION =
-  "only a SYNTHETIC value may be allow-listed; if the value is real, rewrite history to remove it and rotate or revoke it (do not list it)";
+  "if the value is real, rewrite history to remove it and rotate or revoke it; only a SYNTHETIC value may be allow-listed (entry: run locally with --fingerprints)";
+const FINGERPRINT_HINT =
+  "public-safety: allow-list entries are not printed here (a hash of a low-entropy value reveals it). For SYNTHETIC values only, run " +
+  "`node scripts/check-public-safety.mjs --history --fingerprints` locally (refused in CI) to print them; a real value needs history rewriting and rotation instead.";
 const NO_WAIVER = "cannot be allow-listed: rewrite history to remove it, and rotate or revoke what it exposed (key, credential, host)";
 
 export function sha256Hex(value) {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-/** How a matched value is printed: redacted unless --show-values (local use only). */
+/** How a matched value is printed: its length only, unless --show-values (local use only). No hash: it would reveal a low-entropy value. */
 export function displayValue(value, showValues = SHOW_VALUES) {
-  return showValues ? value : `[redacted: ${value.length} chars, sha256 ${sha256Hex(value).slice(0, 12)}]`;
+  return showValues ? value : `[redacted: ${value.length} chars]`;
 }
 
 /** An error whose message is ours and never contains scanned content. */
@@ -551,6 +557,7 @@ function checkHistory(allow) {
   const ctx = {
     commits: 0,
     tags: 0,
+    waivable: 0,
     skippedBinary: [],
     emit(commit, path, rule, hit, optedOut) {
       const fp = `${commit}:${path}:${rule.id}:${sha256Hex(hit)}`;
@@ -562,7 +569,10 @@ function checkHistory(allow) {
       const what = rule.id === "forbidden-file" ? `${rule.id}: ${rule.why}` : `${rule.id}: ${rule.why}: ${displayValue(hit)}`;
       if (optedOut) optOuts.push(`${where}: ${rule.id} ${displayValue(hit)}`);
       else if (NEVER_ALLOW.has(rule.id)) findings.push(`${where}: ${what}\n      ${NO_WAIVER}`);
-      else findings.push(`${where}: ${what}\n      allow-list fingerprint: ${fp}\n      ${REMEDIATION}`);
+      else {
+        ctx.waivable++;
+        findings.push(`${where}: ${what}\n      ${REMEDIATION}${SHOW_FINGERPRINTS ? `\n      allow-list fingerprint: ${fp}` : ""}`);
+      }
     },
     scan(commit, path, text, skipRules = null) {
       scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut), skipRules);
@@ -576,8 +586,9 @@ function checkHistory(allow) {
   scanPatchLog(log, ctx);
   scanCommitMetadata(ctx);
   scanTags(ctx);
-  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k}`);
-  return { count: ctx.commits, tags: ctx.tags, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
+  // Unused entries are named by their line in the allow-list (whose hashes are public there anyway), not reprinted.
+  const unused = [...allow].filter(([, e]) => !e.used).map(([k, e]) => `line ${e.line}: ${k.slice(0, k.lastIndexOf(":"))}`);
+  return { count: ctx.commits, tags: ctx.tags, waivable: ctx.waivable, findings, optOuts, skippedBinary: ctx.skippedBinary, unused };
 }
 
 function splitBuffer(buf, sep) {
@@ -594,8 +605,10 @@ function splitBuffer(buf, sep) {
 }
 
 function main() {
-  if (SHOW_VALUES && ["CI", "GITHUB_ACTIONS"].some((k) => (process.env[k] ?? "") !== "" && process.env[k] !== "false")) {
-    throw new GateError("--show-values prints raw matched values and is for local use only; refusing it in CI (CI or GITHUB_ACTIONS is set)");
+  const localOnly = [SHOW_VALUES && "--show-values", SHOW_FINGERPRINTS && "--fingerprints"].filter(Boolean);
+  if (localOnly.length > 0 && ["CI", "GITHUB_ACTIONS"].some((k) => (process.env[k] ?? "") !== "" && process.env[k] !== "false")) {
+    const one = localOnly.length === 1;
+    throw new GateError(`${localOnly.join(" and ")} ${one ? "prints" : "print"} raw values or their hashes and ${one ? "is" : "are"} for local use only; refusing in CI (CI or GITHUB_ACTIONS is set)`);
   }
   const history = process.argv.includes("--history");
   const allow = loadHistoryAllow();
@@ -620,6 +633,7 @@ function main() {
   if (r.findings.length > 0) {
     console.error(`public-safety${history ? " (history)" : ""}: ${r.findings.length} finding(s) in ${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""}:`);
     for (const f of r.findings) console.error(`  ${f}`);
+    if (r.waivable > 0 && !SHOW_FINGERPRINTS) console.error(FINGERPRINT_HINT);
   }
   if (allow.errors.length > 0 || r.findings.length > 0) process.exit(1);
   console.log(`public-safety${history ? " (history)" : ""}: OK (${r.count} ${unit}${history ? ` and ${r.tags} annotated tag(s)` : ""} scanned)`);

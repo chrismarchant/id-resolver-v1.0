@@ -245,7 +245,9 @@ test("--history finds a value that was added and later removed; the working tree
     assert.match(r.out, /old\.ts/);
     assert.match(r.out, /public-ipv4/);
     assert.match(r.out, /public-ipv6/);
-    assert.match(r.out, /allow-list fingerprint: [0-9a-f]{40}:old\.ts:public-ipv4:[0-9a-f]{64}\n/);
+    assert.doesNotMatch(r.out, /allow-list fingerprint/);
+    assert.match(r.out, /run `node scripts\/check-public-safety\.mjs --history --fingerprints` locally/);
+    assert.match(runGate(dir, "--history", "--fingerprints").out, /allow-list fingerprint: [0-9a-f]{40}:old\.ts:public-ipv4:[0-9a-f]{64}\n/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -287,7 +289,7 @@ test("--history sees an added UTF-16 file, a deleted .env, and ignores removed l
 
 const sha256 = (v) => createHash("sha256").update(v, "utf8").digest("hex");
 /** The redacted form the gate prints for a value by default. */
-const red = (v) => `[redacted: ${v.length} chars, sha256 ${sha256(v).slice(0, 12)}]`;
+const red = (v) => `[redacted: ${v.length} chars]`;
 const esc = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const ALLOW = ".public-safety-history-allow";
 const otherIp = [9, 9, 9, 8].join(".");
@@ -316,15 +318,17 @@ test("--history honours exact commit:path:rule:sha256 fingerprints and nothing b
   }
 });
 
-test("a printed fingerprint holds the hash, not the value, next to the remediation", () => {
+test("a fingerprint (local --fingerprints only) holds the hash, not the value, after the remediation", () => {
   const { dir, sha } = historyRepo("old.ts", `ip = "${publicIp}"\n`);
   try {
-    const r = runGate(dir, "--history");
+    const r = runGate(dir, "--history", "--fingerprints");
     assert.equal(r.code, 1, r.out);
     const fpLine = r.out.split("\n").find((l) => l.includes("allow-list fingerprint:"));
     assert.equal(fpLine.trim(), `allow-list fingerprint: ${sha}:old.ts:public-ipv4:${sha256(publicIp)}`);
     assert.ok(!fpLine.includes(publicIp));
-    assert.match(r.out, /only a SYNTHETIC value may be allow-listed; if the value is real, rewrite history to remove it and rotate or revoke it/);
+    assert.ok(!r.out.includes(publicIp));
+    assert.match(r.out, /if the value is real, rewrite history to remove it and rotate or revoke it; only a SYNTHETIC value may be allow-listed/);
+    assert.doesNotMatch(r.out, /allow-list entries are not printed here/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -342,12 +346,13 @@ test("a hashed entry waives exactly one hit", () => {
     git(dir, "rm", "-q", "a.ts", "b.ts");
     git(dir, "commit", "-q", "-m", "remove");
     writeFileSync(join(dir, ALLOW), `# reviewed: synthetic parser input\n${sha}:a.ts:public-ipv4:${sha256(publicIp)}\n`);
-    const r = runGate(dir, "--history");
+    // --show-values (local) tells the two 7-character values apart.
+    const r = runGate(dir, "--history", "--show-values");
     assert.equal(r.code, 1, r.out);
     const findings = r.out.split("\n").filter((l) => / public-ipv4: public IPv4 literal/.test(l));
     assert.deepEqual(findings.map((l) => l.trim().replace(/^[0-9a-f]{12}:/, "")).sort(), [
-      `a.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${red(otherIp)}`,
-      `b.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${red(publicIp)}`,
+      `a.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${otherIp}`,
+      `b.ts: public-ipv4: public IPv4 literal (use RFC 5737 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24): ${publicIp}`,
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -509,7 +514,7 @@ test("--history scans commit messages: a public IPv4 (and a host, a UUID) in a m
     gitEnv(dir, {}, "commit", "-q", "--allow-empty", "-m", `deploy to ${publicIp}`, "-m", `via ${host}, project ${uuid}`);
     const sha = gitEnv(dir, {}, "rev-parse", "HEAD").trim();
     assert.equal(runGate(dir).code, 0);
-    const r = runGate(dir, "--history");
+    const r = runGate(dir, "--history", "--fingerprints");
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, new RegExp(`${sha.slice(0, 12)}:<commit message>: public-ipv4: .*${esc(red(publicIp))}`));
     assert.match(r.out, /<commit message>: railway-public-host/);
@@ -576,10 +581,10 @@ test("--history: a value from a merged branch is reported once, for the commit t
 test("--history: an added line whose content starts with \"++ \" is content, not a file header", () => {
   const { dir } = historyRepo("plus.txt", `a\n++ ${publicIp} diff-header lookalike\n+++ b/${otherIp}\n`);
   try {
-    const r = runGate(dir, "--history");
+    const r = runGate(dir, "--history", "--show-values");
     assert.equal(r.code, 1, r.out);
-    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(red(publicIp))}`));
-    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(red(otherIp))}`));
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(publicIp)}`));
+    assert.match(r.out, new RegExp(`plus\\.txt: public-ipv4: .*${esc(otherIp)}`));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -682,16 +687,20 @@ function plantedRepo() {
   return { dir, sha: gitEnv(dir, {}, "rev-parse", "HEAD").trim() };
 }
 
-test("by default no matched value is printed, in tree and history mode (findings and opt-outs)", () => {
+test("by default neither a matched value nor any part of its hash is printed, in tree and history mode", () => {
   const { dir } = plantedRepo();
   try {
     for (const mode of [[], ["--history"]]) {
       const r = runGate(dir, ...mode);
+      const label = mode.join(" ") || "tree";
       assert.equal(r.code, 1, r.out);
       for (const v of [publicIp, email, host, otherIp]) {
-        assert.ok(!r.out.includes(v), `${mode.join(" ") || "tree"} output contains ${v}:\n${r.out}`);
-        assert.ok(r.out.includes(red(v)), `${mode.join(" ") || "tree"} output lacks the redacted form of ${v}:\n${r.out}`);
+        assert.ok(!r.out.includes(v), `${label} output contains ${v}:\n${r.out}`);
+        assert.ok(r.out.includes(red(v)), `${label} output lacks the redacted form of ${v}:\n${r.out}`);
+        const h = sha256(v);
+        for (let i = 0; i + 12 <= h.length; i++) assert.ok(!r.out.includes(h.slice(i, i + 12)), `${label} output contains part of sha256(${v}):\n${r.out}`);
       }
+      assert.doesNotMatch(r.out, /allow-list fingerprint|sha256 [0-9a-f]/);
       for (const rule of ["public-ipv4", "email", "railway-public-host"]) assert.match(r.out, new RegExp(`x\\.txt(:1|:2|:3)?: ${rule}`));
       assert.match(r.out, /opt-out/);
     }
@@ -711,7 +720,7 @@ test("--show-values prints the raw values, and is refused in CI", () => {
     for (const env of [{ CI: "true" }, { GITHUB_ACTIONS: "true" }]) {
       const r = runGateEnv(dir, env, "--history", "--show-values");
       assert.equal(r.code, 2, r.out);
-      assert.match(r.out, /refusing it in CI/);
+      assert.match(r.out, /--show-values prints raw values or their hashes and is for local use only; refusing in CI/);
       for (const v of [publicIp, email, host]) assert.ok(!r.out.includes(v));
     }
   } finally {
@@ -719,15 +728,34 @@ test("--show-values prints the raw values, and is refused in CI", () => {
   }
 });
 
-test("redaction leaves the fingerprints unchanged", () => {
+test("--fingerprints (local only) prints the exact entry, which waives exactly one hit; refused in CI", () => {
   const { dir, sha } = plantedRepo();
   try {
-    const fps = (out) => out.split("\n").filter((l) => l.includes("allow-list fingerprint:")).map((l) => l.trim());
-    const quiet = fps(runGate(dir, "--history").out);
-    const shown = fps(runGate(dir, "--history", "--show-values").out);
-    assert.deepEqual(quiet, shown);
-    assert.ok(quiet.includes(`allow-list fingerprint: ${sha}:x.txt:public-ipv4:${sha256(publicIp)}`), quiet.join("\n"));
-    assert.ok(quiet.includes(`allow-list fingerprint: ${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`), quiet.join("\n"));
+    const fps = (out) => out.split("\n").filter((l) => l.includes("allow-list fingerprint:")).map((l) => l.trim().slice("allow-list fingerprint: ".length));
+    const r = runGate(dir, "--history", "--fingerprints");
+    assert.equal(r.code, 1, r.out);
+    assert.ok(!r.out.includes(publicIp));
+    const entries = fps(r.out);
+    const fileEntry = `${sha}:x.txt:public-ipv4:${sha256(publicIp)}`;
+    assert.ok(entries.includes(fileEntry), entries.join("\n"));
+    assert.ok(entries.includes(`${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`), entries.join("\n"));
+    // No fingerprint for the never-waivable e-mail and host hits.
+    assert.equal(entries.filter((e) => /:(email|railway-public-host):/.test(e)).length, 0);
+    // The printed entry, pasted with a justification, waives exactly that one hit:
+    // the same value in the commit message is still reported.
+    writeFileSync(join(dir, ALLOW), `# reviewed: synthetic test input\n${fileEntry}\n`);
+    const after = runGate(dir, "--history", "--fingerprints");
+    assert.equal(after.code, 1, after.out);
+    assert.ok(!fps(after.out).includes(fileEntry), after.out);
+    assert.ok(fps(after.out).includes(`${sha}:<commit message>:public-ipv4:${sha256(publicIp)}`), after.out);
+    assert.doesNotMatch(after.out, /x\.txt: public-ipv4: public IPv4 literal/);
+    assert.match(after.out, /<commit message>: public-ipv4: public IPv4 literal/);
+    for (const env of [{ CI: "true" }, { GITHUB_ACTIONS: "true" }, { CI: "1", GITHUB_ACTIONS: "true" }]) {
+      const c = runGateEnv(dir, env, "--history", "--fingerprints");
+      assert.equal(c.code, 2, c.out);
+      assert.match(c.out, /--fingerprints prints raw values or their hashes and is for local use only; refusing in CI/);
+      assert.doesNotMatch(c.out, /allow-list fingerprint/);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -748,8 +776,8 @@ test("an internal error does not echo git's message unless --show-values", () =>
   }
 });
 
-test("CI never passes --show-values", () => {
+test("CI never passes the local-only flags --show-values or --fingerprints", () => {
   const ci = readFileSync(resolve(import.meta.dirname, "..", ".github", "workflows", "ci.yml"), "utf8");
   assert.match(ci, /check-public-safety\.mjs --history/);
-  assert.ok(!ci.includes("--show-values"));
+  for (const flag of ["--show-values", "--fingerprints"]) assert.ok(!ci.includes(flag), `ci.yml passes ${flag}`);
 });
