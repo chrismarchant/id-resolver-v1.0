@@ -112,7 +112,7 @@ used.
 | `rate_limited` / `upstream_error` | resolver 429/5xx/network within the time budget | retries next run; check resolver health if persistent |
 | `auth_failed` | resolver returned 401/403 | check `IDR_REPORTING_TOKEN` (reporting token, not website token) |
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
-| `cursor_rejected` | resolver answered 400 to the stored cursor (its cursor key rotated); the engine reset the cursor and replayed from the buffer start | none; informational, the next run is `ok`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
+| `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start | none: the replay is idempotent and the projection is complete. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync`, so data loss is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired` | see below |

@@ -97,7 +97,8 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
         return { kind: "stop", status: "contract_error" };
       }
       // 400 to a request that carried a cursor: the resolver no longer accepts it
-      // (its cursor key rotated). Recoverable by restarting from the buffer start.
+      // (its cursor key rotated). Recoverable by restarting from the buffer start:
+      // a stale cursor already behind the retention watermark gets 410 instead.
       if (status === 400 && carriedCursor) return { kind: "stop", status: "cursor_rejected" };
       if (status !== null && status !== 429 && status < 500) return { kind: "stop", status: "contract_error" };
 

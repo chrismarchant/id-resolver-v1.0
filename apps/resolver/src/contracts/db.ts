@@ -283,6 +283,13 @@ export interface ReportingRepository {
    * watermark check, the horizon and the rows come from ONE snapshot.
    */
   feed(scope: ObservationScope, page: { after: FeedPosition | null; limit: number }): Promise<FeedPage>;
+  /**
+   * The scope's retention watermark (the highest position deleted other than
+   * by an erasure), or null when nothing was ever pruned. A plain read, not
+   * tied to any feed snapshot: only for deciding between 400 and 410 for a
+   * cursor whose tag does not verify, where nothing is served.
+   */
+  feedWatermark(scope: ObservationScope): Promise<FeedPosition | null>;
 }
 
 export function usagePeriodKey(period: "day" | "month", now: Date): string {

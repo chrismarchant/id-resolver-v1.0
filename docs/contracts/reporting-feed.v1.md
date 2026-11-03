@@ -102,14 +102,39 @@ UTC days inside the retained window.
   HMAC-SHA-256 tag bound to the deployment scope. The tag key is derived from
   the resolver's server-only `IP_HMAC_SECRET` with a dedicated label (the
   reporting token is not used because the consumer holds it). **Addition:**
-  rotating that secret invalidates outstanding cursors (`400`). A consumer
-  that receives `400` to a request **that carried a cursor** must automatically
-  restart from the start of the buffer (reset its stored cursor, using the same
-  compare-and-set as any cursor change, and request without `after`); this is
-  safe because it applies idempotently. A `400` to a request **without** a cursor
-  is a contract error and must not trigger a reset. This differs from `410
-  cursor_expired`, which means data was missed and requires operator action. The
-  reference engine records the status `cursor_rejected` for such a run.
+  rotating that secret invalidates every outstanding cursor: its tag no longer
+  verifies.
+* **Clarification (CHR-66 N1): a cursor whose tag does not verify.** Such a
+  cursor never selects or serves items. The answer depends only on whether
+  it is well-formed (46 canonical base64url characters, known format, valid
+  kind and id) and on the position it claims, read **without** verification:
+  * well-formed and the claimed position lies **strictly before** the scope's
+    retention watermark: `410 cursor_expired`, exactly what the same cursor
+    received before the rotation. Data was missed; guarantee 6 applies
+    (alert, operator-driven resynchronisation).
+  * any other case (malformed, or claiming a position at or after the
+    watermark, or no watermark yet): `400 invalid_request`.
+  * the watermark cannot be read: `500 internal`, never a `400`.
+
+  A consumer that receives `400` to a request **that carried a cursor** must
+  automatically restart from the start of the buffer (reset its stored cursor,
+  using the same compare-and-set as any cursor change, and request without
+  `after`). That replay is safe: the resolver has pruned nothing after the
+  cursor's position (otherwise the answer would have been `410`), and the
+  consumer applies idempotently. A `400` to a request **without** a cursor is
+  a contract error and must not trigger a reset. The reference engine records
+  the status `cursor_rejected` for a run that restarted after a `400`, and
+  `needs_resync` after a `410`.
+
+  Precisely: rotating `IP_HMAC_SECRET` gives `410` to a consumer whose cursor
+  is behind the retention watermark, and otherwise `400` followed by a safe
+  replay. Limits: (a) the tag cannot tell a stale cursor from a forged one or
+  one issued for another scope, so such a cursor that claims a position
+  before the watermark also gets `410`; this refines guarantee 3 (a tampered
+  cursor gets `400`) and serves nothing. (b) The watermark check and the
+  consumer's restarted request are two reads: a retention run that passes the
+  consumer's position in the moment between them is not reported. Positions
+  are not secret, so answering from the claimed position leaks nothing.
 
 ### Erasure and re-observation
 
@@ -143,8 +168,9 @@ UTC days inside the retained window.
   in the same statement as the delete, whatever the deletion path (retention,
   the inherited prune, a cascade or a manual delete), so no item can leave the
   feed silently. A cursor **strictly before** the watermark gets `410
-  cursor_expired`; a cursor at or after it continues normally. Omitting
-  `after` always works and starts from the oldest retained item.
+  cursor_expired`; a cursor at or after it continues normally. This holds for
+  a cursor whose tag no longer verifies as well (see "Positions and cursors").
+  Omitting `after` always works and starts from the oldest retained item.
 * **Addition:** tombstones are never pruned by retention, so a consumer that
   resynchronises from the start still receives every erasure.
 

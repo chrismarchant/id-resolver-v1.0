@@ -357,6 +357,25 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
     expect(await storedCursor(pool)).toBe("c2");
   });
 
+  it("a rotation does not mask a 410: a stale cursor behind the retention floor -> needs_resync, no reset", async () => {
+    mock.items = [1, 2, 3, 4, 5, 6].map((i) => obs(i, 7, D));
+    // One page (obs 1, 2), then the consumer stalls.
+    expect((await runSync(testConfig(mock, { pageLimit: 2, maxPages: 1 }), testDeps(store))).status).toBe("partial");
+    expect(await storedCursor(pool)).toBe("c2");
+    const before = await counts(pool);
+    mock.retentionFloor = 4; // obs 3, 4 pruned before they were pulled
+    mock.cursorPrefix = "k2"; // and the key rotated
+    mock.requests = [];
+    const r = await runSync(cfg(), testDeps(store));
+
+    expect(r.status).toBe("needs_resync");
+    expect(mock.requests.map((q) => q.query.get("after"))).toEqual(["c2"]);
+    expect(await storedCursor(pool)).toBe("c2");
+    expect(await counts(pool)).toEqual(before);
+    const st = await pool.query("select status, needs_resync from public.idr_sync_state");
+    expect(st.rows[0]).toEqual({ status: "needs_resync", needs_resync: true });
+  });
+
   it("400 to a request WITHOUT a cursor stays contract_error", async () => {
     mock.items = [obs(1, 7, D)];
     mock.overrides = [{ status: 400 }];

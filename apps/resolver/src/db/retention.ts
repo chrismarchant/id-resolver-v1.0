@@ -46,6 +46,18 @@ SELECT pruned_through_txid::text AS txid, pruned_through_id::text AS id
 FROM feed_retention_watermarks
 WHERE installation_id = $1::text AND website_id = $2::text`;
 
+/**
+ * The scope's retention watermark (always an observation position), or null
+ * when nothing was ever pruned. A plain read in its own statement: callers
+ * that serve items must instead read it in the same snapshot as the rows
+ * (FEED_SQL in reporting-repo.ts). Callers wrap it in `guarded`.
+ */
+export async function queryFeedWatermark(pool: Pool, scope: ObservationScope): Promise<FeedPosition | null> {
+  const res = await pool.query<{ txid: string; id: string }>(WATERMARK_SQL, [scope.installationId, scope.websiteId]);
+  const r = res.rows[0];
+  return r ? { txid: BigInt(r.txid), kind: FEED_KIND_OBSERVATION, id: BigInt(r.id) } : null;
+}
+
 export interface FeedRetention {
   /** One bounded batch: deletes at most `limit` observations observed before `cutoff`. Returns rows deleted. */
   pruneBefore(cutoff: Date, limit: number): Promise<number>;
@@ -88,11 +100,7 @@ export function createFeedRetention(pool: Pool, logger?: Logger): FeedRetention 
       return r;
     },
     async watermark(scope) {
-      return guarded(logger, async () => {
-        const res = await pool.query<{ txid: string; id: string }>(WATERMARK_SQL, [scope.installationId, scope.websiteId]);
-        const r = res.rows[0];
-        return r ? { txid: BigInt(r.txid), kind: FEED_KIND_OBSERVATION, id: BigInt(r.id) } : null;
-      });
+      return guarded(logger, () => queryFeedWatermark(pool, scope));
     },
   };
 }
