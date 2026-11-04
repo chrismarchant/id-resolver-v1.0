@@ -10,8 +10,11 @@
  *   - the service has no in-process copy of the switch: a change applies to
  *     the very next cache miss with no wait (KILL_SWITCH_CACHE_TTL_MS = 0).
  *   - the phase itself (src/ops/smoke-kill-switch.ts) against the real
- *     controls repository: restores a released switch, never writes an
- *     engaged one (its reason survives), and probes while engaged.
+ *     database through its conditional statements (src/ops/smoke-controls.ts):
+ *     restores a released switch, never writes an engaged one (its reason
+ *     survives), probes while engaged, never releases an engagement made by
+ *     someone else during the run (compare-and-set, Gate 4 review G4-L3), and
+ *     never touches a switch left engaged by an earlier smoke run (G4-L2).
  * Synthetic RFC 3849 addresses only.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -22,7 +25,8 @@ import type { Db } from "../../src/db/index.js";
 import { canonicaliseIp } from "../../src/ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../../src/ip/fingerprint.js";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { ENGAGE_REASON, KILL_SWITCH_CACHE_TTL_MS, RESTORE_REASON, runKillSwitchPhase } from "../../src/ops/smoke-kill-switch.js";
+import { createSmokeKillSwitchControls } from "../../src/ops/smoke-controls.js";
+import { engageReason, KILL_SWITCH_CACHE_TTL_MS, restoreReason, runKillSwitchPhase, smokeExitCode } from "../../src/ops/smoke-kill-switch.js";
 import { KILL_SWITCH_PROBE_PREFIX, killSwitchProbeAddress, PROBE_RANDOM_BYTES } from "../../src/ops/smoke-mode.js";
 import { createMockProvider, type MockProvider } from "../../src/provider/mock.js";
 import { runJob } from "../../src/resolution/pipeline.js";
@@ -31,6 +35,7 @@ import { createTestDb, resetTestDb } from "../helpers/db.js";
 const SECRET = "0123456789abcdef".repeat(4);
 const INSTALLATION = "inst-test";
 const WEBSITE = "site-test";
+const RUN = "5eed000001";
 
 const config: PipelineConfig = {
   installation_id: INSTALLATION,
@@ -144,13 +149,11 @@ describe("smoke kill-switch phase against PostgreSQL", () => {
     expect(await control()).toEqual([]);
     const ip = address(6);
     const r = await runKillSwitchPhase({
-      controls: {
-        isEnrichmentEnabled: () => db.controls.isEnrichmentEnabled(INSTALLATION),
-        setEnrichmentEnabled: (enabled, reason) => db.controls.setEnrichmentEnabled(INSTALLATION, enabled, reason),
-      },
+      controls: createSmokeKillSwitchControls(db.pool, INSTALLATION),
+      run: RUN,
       probe: async () => {
-        // The probe runs while the switch is engaged by the smoke.
-        expect(await control()).toEqual([{ enrichment_enabled: false, reason: ENGAGE_REASON }]);
+        // The probe runs while the switch is engaged by the smoke, with this run's reason.
+        expect(await control()).toEqual([{ enrichment_enabled: false, reason: engageReason(RUN) }]);
         return run(ip);
       },
     });
@@ -162,7 +165,7 @@ describe("smoke kill-switch phase against PostgreSQL", () => {
       final: "released",
     });
     // Absent row == released; the restore leaves an explicit released row with the smoke's reason.
-    expect(await control()).toEqual([{ enrichment_enabled: true, reason: RESTORE_REASON }]);
+    expect(await control()).toEqual([{ enrichment_enabled: true, reason: restoreReason(RUN) }]);
     expect(await db.controls.isEnrichmentEnabled(INSTALLATION)).toBe(true);
     expect(provider.calls).toBe(0);
     expect((await run(address(7))).status).toBe("no_match");
@@ -172,15 +175,116 @@ describe("smoke kill-switch phase against PostgreSQL", () => {
     await db.controls.setEnrichmentEnabled(INSTALLATION, false, "operator: budget spike");
     const before = (await db.pool.query<{ updated_at: Date }>("SELECT updated_at FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows[0]!.updated_at;
     const r = await runKillSwitchPhase({
-      controls: {
-        isEnrichmentEnabled: () => db.controls.isEnrichmentEnabled(INSTALLATION),
-        setEnrichmentEnabled: (enabled, reason) => db.controls.setEnrichmentEnabled(INSTALLATION, enabled, reason),
-      },
+      controls: createSmokeKillSwitchControls(db.pool, INSTALLATION),
+      run: RUN,
       probe: () => run(address(8)),
     });
     expect(r).toMatchObject({ prior: "engaged", engage: "already_engaged", probe: { kind: "result", value: { status: "disabled", reason: "kill_switch" } }, restore: "left_engaged_as_found", final: "engaged" });
     expect(await control()).toEqual([{ enrichment_enabled: false, reason: "operator: budget spike" }]);
     const after = (await db.pool.query<{ updated_at: Date }>("SELECT updated_at FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows[0]!.updated_at;
     expect(after.getTime()).toBe(before.getTime());
+  });
+
+  it("G4-L3: an operator engages the switch while the smoke holds it: the compare-and-set restore leaves the operator's engagement untouched (exit 2)", async () => {
+    const r = await runKillSwitchPhase({
+      controls: createSmokeKillSwitchControls(db.pool, INSTALLATION),
+      run: RUN,
+      probe: async () => {
+        const answer = await run(address(9));
+        // ops:kill-switch on: the operator's unconditional upsert, while the smoke holds the switch.
+        await db.controls.setEnrichmentEnabled(INSTALLATION, false, "operator: incident");
+        return answer;
+      },
+    });
+    expect(r).toMatchObject({ prior: "released", engage: "engaged_by_smoke", probe: { kind: "result", value: { status: "disabled" } }, restore: "changed_during_run", final: "engaged" });
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: "operator: incident" }]);
+    expect(smokeExitCode(0, r.restore)).toBe(2);
+  });
+
+  it("G4-L2: a switch left engaged by an earlier smoke run (Gate 4 reason or this build's) is neither probed nor written (exit 2)", async () => {
+    for (const reason of ["smoke test (CHR-72): engaged temporarily to verify the disabled outcome", engageReason("0ddba11")]) {
+      await db.controls.setEnrichmentEnabled(INSTALLATION, false, reason);
+      const before = (await db.pool.query<{ updated_at: Date }>("SELECT updated_at FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows[0]!.updated_at;
+      let probed = false;
+      const r = await runKillSwitchPhase({
+        controls: createSmokeKillSwitchControls(db.pool, INSTALLATION),
+        run: RUN,
+        probe: async () => {
+          probed = true;
+          return run(address(10));
+        },
+      });
+      expect(r, reason).toEqual({ prior: "engaged", engage: "smoke_orphan", probe: { kind: "not_run" }, restore: "orphan_left_engaged", final: "engaged" });
+      expect(probed).toBe(false);
+      expect(await control()).toEqual([{ enrichment_enabled: false, reason }]);
+      const after = (await db.pool.query<{ updated_at: Date }>("SELECT updated_at FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows[0]!.updated_at;
+      expect(after.getTime()).toBe(before.getTime());
+      expect(smokeExitCode(0, r.restore)).toBe(2);
+    }
+  });
+});
+
+describe("smoke kill-switch statements (src/ops/smoke-controls.ts)", () => {
+  let db: Db;
+  const control = async () =>
+    (await db.pool.query<{ enrichment_enabled: boolean; reason: string | null }>("SELECT enrichment_enabled, reason FROM deployment_controls WHERE installation_id = $1", [INSTALLATION])).rows;
+
+  beforeAll(async () => {
+    db = await createTestDb({ max: 2 });
+  });
+  afterAll(async () => {
+    await db.close();
+  });
+  beforeEach(async () => {
+    await resetTestDb(db);
+  });
+
+  it("read: an absent row reads released with no reason; a row reads its state and reason", async () => {
+    const c = createSmokeKillSwitchControls(db.pool, INSTALLATION);
+    expect(await c.read()).toEqual({ state: "released", reason: null });
+    await db.controls.setEnrichmentEnabled(INSTALLATION, false, "operator: x");
+    expect(await c.read()).toEqual({ state: "engaged", reason: "operator: x" });
+    // Scoped to this installation only.
+    expect(await createSmokeKillSwitchControls(db.pool, "other-inst").read()).toEqual({ state: "released", reason: null });
+  });
+
+  it("engageIfReleased engages an absent or released row, and never overwrites an engagement", async () => {
+    const c = createSmokeKillSwitchControls(db.pool, INSTALLATION);
+    expect(await c.engageIfReleased(engageReason(RUN))).toBe(true);
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: engageReason(RUN) }]);
+    expect(await c.engageIfReleased(engageReason("abc"))).toBe(false);
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: engageReason(RUN) }]);
+    await db.controls.setEnrichmentEnabled(INSTALLATION, false, "operator: incident");
+    expect(await c.engageIfReleased(engageReason(RUN))).toBe(false);
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: "operator: incident" }]);
+    await db.controls.setEnrichmentEnabled(INSTALLATION, true, "operator: over");
+    expect(await c.engageIfReleased(engageReason(RUN))).toBe(true);
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: engageReason(RUN) }]);
+  });
+
+  it("releaseIfHeld releases only an engagement with exactly the given reason", async () => {
+    const c = createSmokeKillSwitchControls(db.pool, INSTALLATION);
+    expect(await c.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).toBe(false); // no row
+    expect(await control()).toEqual([]);
+    await db.controls.setEnrichmentEnabled(INSTALLATION, false, "operator: incident");
+    expect(await c.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).toBe(false);
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: "operator: incident" }]);
+    await db.controls.setEnrichmentEnabled(INSTALLATION, false, engageReason("abc"));
+    expect(await c.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).toBe(false); // another run's engagement
+    expect(await control()).toEqual([{ enrichment_enabled: false, reason: engageReason("abc") }]);
+    await db.controls.setEnrichmentEnabled(INSTALLATION, false, engageReason(RUN));
+    expect(await c.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).toBe(true);
+    expect(await control()).toEqual([{ enrichment_enabled: true, reason: restoreReason(RUN) }]);
+    expect(await c.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).toBe(false); // already released
+  });
+
+  it("database errors surface as a sanitised DbError, without statement text or values", async () => {
+    const broken = createSmokeKillSwitchControls(
+      { query: (async () => Promise.reject(Object.assign(new Error(`failed for ${engageReason(RUN)}`), { code: "57014" }))) as never },
+      INSTALLATION,
+    );
+    await expect(broken.read()).rejects.toMatchObject({ name: "DbError", code: "57014", message: "database error (57014)" });
+    await expect(broken.engageIfReleased(engageReason(RUN))).rejects.toMatchObject({ name: "DbError" });
+    await expect(broken.releaseIfHeld(engageReason(RUN), restoreReason(RUN))).rejects.toMatchObject({ name: "DbError" });
   });
 });

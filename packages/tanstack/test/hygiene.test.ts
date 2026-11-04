@@ -1,9 +1,12 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import http from "node:http";
 import { createRequire } from "node:module";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isCollectorPath } from "../src/collector-path.js";
 import { TEST_TOKEN } from "./helpers.js";
 
 const pkgDir = resolve(import.meta.dirname, "..");
@@ -127,4 +130,148 @@ describe("bundle safety (TanStack Start probe build)", () => {
       else (globalThis as { window?: unknown }).window = prev;
     }
   });
+});
+
+describe("real stack: the probe app under local workerd (G5-D-F1)", () => {
+  // The probe registers the middleware exactly as documented (src/start.ts, no collectorPath and no exclusion of
+  // /idr/e) and the collector route at /idr/e with only POST (src/routes/idr.e.ts). Its resolver URL is the fixed
+  // local sink http://127.0.0.1:4599. Same gating as the bundle-safety test.
+  const haveProbe = existsSync(join(probeDir, "node_modules", ".bin", "wrangler"));
+  const requireProbe = process.env["IDR_REQUIRE_PROBE"] === "1";
+  const SINK_PORT = 4599;
+  // What a browser sends for an address-bar navigation. CF-Connecting-IP is passed through by local workerd, and
+  // the probe allows documentation ranges, so an eligible page is delivered.
+  const NAVIGATION = {
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en",
+    "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "cf-connecting-ip": "198.51.100.23",
+  };
+
+  /** node:http, because fetch (undici) rewrites Sec-Fetch-Mode and normalises the path. */
+  function send(port: number, method: string, path: string, headers: Record<string, string> = NAVIGATION): Promise<{ status: number; type: string; body: string; cacheControl: string }> {
+    return new Promise((resolve, reject) => {
+      const r = http.request({ host: "127.0.0.1", port, method, path, headers, agent: false }, (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, type: String(res.headers["content-type"] ?? ""), body, cacheControl: String(res.headers["cache-control"] ?? "") }));
+      });
+      r.on("error", reject);
+      r.end();
+    });
+  }
+  const freePort = () =>
+    new Promise<number>((resolve) => {
+      const s = http.createServer();
+      s.listen(0, "127.0.0.1", () => {
+        const port = (s.address() as AddressInfo).port;
+        s.close(() => resolve(port));
+      });
+    });
+
+  it.skipIf(!haveProbe && !requireProbe)("a GET/HEAD navigation to /idr/e through the real router creates no entrance; an ordinary page still does", async () => {
+    rmSync(join(probeDir, ".output"), { recursive: true, force: true });
+    // NODE_ENV=production: under vitest it is "test", which makes Vite emit the development JSX runtime.
+    execFileSync("npm", ["run", "build"], { cwd: probeDir, stdio: "pipe", timeout: 240_000, env: { ...process.env, NITRO_PRESET: "", CI: "1", NODE_ENV: "production" } });
+
+    const entrances: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const sink = http.createServer((req, res) => {
+      let b = "";
+      req.on("data", (c) => (b += c));
+      req.on("end", () => {
+        if (req.url === "/v1/entrances") entrances.push({ url: req.url, body: JSON.parse(b || "{}") as Record<string, unknown> });
+        res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ version: "1", status: "ineligible", source: "none", recorded: false }));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      sink.once("error", (e) => reject(new Error(`the probe's fixed sink port ${SINK_PORT} is in use (${(e as Error).message})`)));
+      sink.listen(SINK_PORT, "127.0.0.1", () => resolve());
+    });
+    const port = await freePort();
+    const wrangler = spawn(join(probeDir, "node_modules", ".bin", "wrangler"), ["dev", "-c", ".output/server/wrangler.json", "--port", String(port), "--ip", "127.0.0.1", "--local"], {
+      cwd: probeDir,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+      env: { ...process.env, WRANGLER_SEND_METRICS: "false", CI: "1" },
+    });
+    let log = "";
+    wrangler.stdout.on("data", (d) => (log += d));
+    wrangler.stderr.on("data", (d) => (log += d));
+    try {
+      let ready = false;
+      for (let i = 0; i < 120 && !ready; i++) {
+        try {
+          ready = (await send(port, "GET", "/m/none/warm")).status === 200;
+        } catch {
+          ready = false;
+        }
+        if (!ready) await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(ready, `wrangler dev did not start:\n${log.slice(-2000)}`).toBe(true);
+      const hookCount = (JSON.parse((await send(port, "GET", "/diag/idr")).body) as string[]).length;
+      entrances.length = 0;
+
+      const collectorRequests: Array<[string, string]> = [
+        ["GET", "/idr/e"], ["HEAD", "/idr/e"], ["GET", "/IDR/E"], ["GET", "/idr/e/"], ["GET", "/idr/%65"], ["GET", "/%69dr/e"], ["GET", "//idr/e"], ["GET", "/idr//e"],
+        // G5R2-L1: a trailing encoded space reaches the route (decoded, then stripped by the router's second URL parse).
+        ["GET", "/idr/e%20"], ["GET", "/idr/e%20%20"], ["GET", "/IDR/E%20"], ["GET", "/IDR/E%20%20"], ["GET", "/idr/%65%20"], ["HEAD", "/idr/e%20"],
+        // A stray "%" plus decoded "2e" forms an encoded dot segment that the router's second URL parse resolves.
+        ["GET", "/x/%2%65%2%65/idr/e"],
+      ];
+      const answers = [];
+      for (const [method, path] of collectorRequests) answers.push({ method, path, ...(await send(port, method, path)) });
+
+      // Differential on the real stack: which spellings does the router really dispatch to the collector route? A
+      // POST without Origin that reaches createCollectorRoute gets its bare 403 (no body, Cache-Control: no-store).
+      // Each spelling is also loaded as a browser navigation (GET).
+      const grid: string[] = [];
+      for (const a of ["idr", "IDR", "%69dr"])
+        for (const sep of ["/", "//"])
+          for (const b of ["e", "E", "%65"])
+            for (const tail of ["", "/", "%20", "%20%20", "/%20", "%20/", "%09", "%C2%A0", "?q=1", "%20?q=1"]) grid.push(`/${a}${sep}${b}${tail}`);
+      const dispatched: string[] = [];
+      for (const path of grid) {
+        const post = await send(port, "POST", path, { "content-type": "text/plain;charset=UTF-8", "content-length": "0", "user-agent": NAVIGATION["user-agent"] });
+        if (post.status === 403 && post.body === "" && post.cacheControl === "no-store") dispatched.push(path);
+        answers.push({ method: "GET", path, ...(await send(port, "GET", path)) });
+      }
+      const control = `/landing/control${Date.now().toString(36).replace(/[0-9]/g, "")}`;
+      const controlAnswer = await send(port, "GET", control);
+      await new Promise((r) => setTimeout(r, 1500));
+      const hooks = (JSON.parse((await send(port, "GET", "/diag/idr")).body) as string[]).slice(hookCount).map((x) => JSON.parse(x) as { route?: string; outcome: string; reason: string });
+
+      // The precondition of G5-D-F1: with only POST registered, the framework itself serves GET /idr/e as a page.
+      expect(answers[0]).toMatchObject({ status: 200 });
+      expect(answers[0]!.type).toContain("text/html");
+      // The resolver (the sink) received exactly one entrance: the ordinary page. None for the collector path.
+      // (Before the fix it received /idr/e, /IDR/E, /idr/%65 and /%69dr/e as well.)
+      expect(controlAnswer.status).toBe(200);
+      expect(entrances.map((e) => e.body["page_key"])).toEqual([control]);
+      // Every request to the collector path that the framework answered with a 2xx reached the middleware and was
+      // skipped as collector_path. (Verified with TanStack Start 1.168: GET, HEAD, /IDR/E, /idr/%65 and /%69dr/e are
+      // served 200 text/html; the router redirects /idr/e/ and /idr//e (307) and //idr/e (308) to /idr/e.)
+      const reportable = answers.filter((a) => a.status >= 200 && a.status <= 299);
+      expect(reportable.length).toBeGreaterThanOrEqual(10);
+      const middlewareHooks = hooks.filter((h) => h.route === undefined);
+      expect(middlewareHooks.filter((h) => h.reason === "eligibility:collector_path")).toHaveLength(reportable.length);
+      expect(middlewareHooks.filter((h) => h.outcome === "delivered")).toHaveLength(1);
+      // Every spelling the real router dispatched to the collector route is one the exclusion matches, and the route
+      // never saw a path that the middleware would not exclude (no collector:path_mismatch).
+      console.log(`real-stack differential: ${JSON.stringify({ spellings: grid.length, dispatchedToCollectorRoute: dispatched.length, getAnswered2xx: reportable.length, collectorPathSkips: middlewareHooks.filter((h) => h.reason === "eligibility:collector_path").length, entrances: entrances.length })}`);
+      expect(dispatched.length).toBeGreaterThanOrEqual(50);
+      expect(dispatched).toContain("/idr/e%20");
+      expect(dispatched.filter((p) => !isCollectorPath(new URL(`http://127.0.0.1${p}`).pathname, "/idr/e"))).toEqual([]);
+      expect(hooks.filter((h) => h.route === "collector" && h.reason === "collector:path_mismatch")).toEqual([]);
+    } finally {
+      try {
+        process.kill(-wrangler.pid!, "SIGTERM");
+      } catch {
+        // already gone
+      }
+      await new Promise<void>((r) => sink.close(() => r()));
+    }
+  }, 300_000);
 });

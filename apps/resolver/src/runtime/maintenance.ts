@@ -7,9 +7,18 @@
  * A run DRAINS: it repeats bounded batches (CACHE_PRUNE_BATCH rows, one
  * statement each) until a batch comes back short, within a per-run time
  * budget (CACHE_PRUNE_BUDGET_MS). In order: expired cache rows may use up to
- * half of the budget; browser events may then use up to a quarter of it;
- * observation retention gets the rest (at least a quarter, and all of what
- * the others leave unused), so none of the three can starve another.
+ * half of the budget; browser events may then use up to a quarter of it, and
+ * never past three quarters of the budget; observation retention gets the
+ * rest (the last quarter at least, and all of what the others leave unused),
+ * so none of the three can starve another.
+ *
+ * A deadline only stops a phase from STARTING another batch. A single batch
+ * already running can overrun it (CHR-66 G4-L1): if the last cache batch
+ * returns after the half, the event phase still ends at three quarters, so
+ * the observations' last quarter is kept whole as long as that batch returns
+ * by then. A single batch that itself runs past three quarters of the budget
+ * leaves observation retention only what remains of it; the run then reports
+ * the backlog, and the next run continues.
  * Observations are deleted through createFeedRetention().pruneAllBefore,
  * whose statement-level trigger advances the feed's retention watermark
  * atomically with each batch (migration 0006). Browser events are deleted by
@@ -127,7 +136,9 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
           eventRows += n;
           return n;
         },
-        { batch: opts.batch, deadlineAtMs: Math.min(retentionStartedAt + Math.floor(opts.budgetMs / 4), startedAt + opts.budgetMs), now, signal },
+        // Up to a quarter of the budget, but never into the last quarter, which
+        // belongs to observation retention (CHR-66 G4-L1).
+        { batch: opts.batch, deadlineAtMs: Math.min(retentionStartedAt + Math.floor(opts.budgetMs / 4), startedAt + opts.budgetMs - Math.floor(opts.budgetMs / 4)), now, signal },
       );
       eventBacklog = r.backlog;
       if (r.deleted > 0) logger.info("event_prune", { rows: r.deleted, count: r.batches });

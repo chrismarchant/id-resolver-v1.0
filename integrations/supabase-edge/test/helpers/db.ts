@@ -15,9 +15,68 @@ export function newPool(): pg.Pool {
 
 /** Recreates the public schema, the Supabase roles (if missing) and applies the SQL template. */
 export async function resetDatabase(pool: pg.Pool): Promise<void> {
+  await freshPublicSchema(pool);
+  await ensureProjection(pool);
+}
+
+async function ensureSupabaseRoles(c: pg.Pool | pg.PoolClient): Promise<void> {
+  for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
+    await c.query(
+      `do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} NOLOGIN ${extra}; end if; end $$`,
+    );
+  }
+}
+
+/**
+ * An empty public schema with Supabase's default privileges in force (CHR-66
+ * G4-L4). On Supabase, the platform's initial schema runs
+ *   alter default privileges in schema public grant all on tables|sequences|functions
+ *     to anon, authenticated, service_role
+ * for the role that applies migrations, so every table, view, sequence and
+ * function the projection SQL creates starts with ALL privileges for those
+ * three roles (on PostgreSQL 17, ALL on a table includes MAINTAIN). The
+ * emulation is for objects created by this test role. Default privileges
+ * belong to the schema, so they are set again after each re-creation.
+ */
+export async function freshPublicSchema(pool: pg.Pool): Promise<void> {
   await pool.query("drop schema public cascade");
   await pool.query("create schema public");
-  await ensureProjection(pool);
+  await ensureSupabaseRoles(pool);
+  await pool.query("grant usage on schema public to anon, authenticated, service_role");
+  for (const kind of ["tables", "sequences", "functions"]) {
+    await pool.query(`alter default privileges in schema public grant all on ${kind} to anon, authenticated, service_role`);
+  }
+}
+
+/**
+ * A fresh public schema with the projection applied by `owner`, a role that is
+ * neither superuser nor BYPASSRLS (as `postgres` is on hosted Supabase), with
+ * Supabase's default privileges for the objects it creates. Requires
+ * auth.jwt() to exist (ensureProjection creates it). Undo with dropOwner().
+ */
+export async function installAsOwner(pool: pg.Pool, owner: string, sqlPath: string = SQL_PATH): Promise<void> {
+  await freshPublicSchema(pool);
+  await pool.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${owner}') then create role ${owner} nologin nosuperuser nobypassrls; end if; end $$`);
+  await pool.query(`grant usage, create on schema public to ${owner}`);
+  await pool.query(`grant usage on schema auth to ${owner}`);
+  for (const kind of ["tables", "sequences", "functions"]) {
+    await pool.query(`alter default privileges for role ${owner} in schema public grant all on ${kind} to anon, authenticated, service_role`);
+  }
+  const c = await pool.connect();
+  try {
+    await c.query(`set role ${owner}`);
+    await c.query(readFileSync(sqlPath, "utf8"));
+  } finally {
+    await c.query("reset role").catch(() => undefined);
+    c.release();
+  }
+}
+
+/** Restores the default projection (owned by the test role) and removes `owner`. */
+export async function dropOwner(pool: pg.Pool, owner: string): Promise<void> {
+  await resetDatabase(pool);
+  await pool.query(`drop owned by ${owner}`);
+  await pool.query(`drop role ${owner}`);
 }
 
 /**
@@ -28,11 +87,7 @@ export async function resetDatabase(pool: pg.Pool): Promise<void> {
 export async function ensureProjection(pool: pg.Pool, sqlPath: string = SQL_PATH): Promise<void> {
   const c = await pool.connect();
   try {
-    for (const [role, extra] of [["anon", ""], ["authenticated", ""], ["service_role", "BYPASSRLS"]] as const) {
-      await c.query(
-        `do $$ begin if not exists (select 1 from pg_roles where rolname = '${role}') then create role ${role} NOLOGIN ${extra}; end if; end $$`,
-      );
-    }
+    await ensureSupabaseRoles(c);
     // Emulate Supabase's auth.jwt() (only if missing, so a real Supabase schema is never touched).
     await c.query("create schema if not exists auth");
     await c.query(
@@ -167,8 +222,8 @@ export class PgStore implements Store {
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
       c.query<{ r: { applied: boolean; observations?: number; tombstones?: number } }>(
-        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5) as r",
-        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom],
+        "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5,$6) as r",
+        [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom, a.drained],
       ),
     );
     const v = r.rows[0]!.r;

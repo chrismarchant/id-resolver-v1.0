@@ -13,7 +13,7 @@ import { createCacheRepository } from "./cache-repo.js";
 import { createCompanyRepository } from "./company-repo.js";
 import { createControlsRepository } from "./controls-repo.js";
 import { createEventRepository } from "./event-repo.js";
-import { createPool, type Pool, type SslMode } from "./pool.js";
+import { createPool, type DbCredentials, type DbTlsInput, type Pool } from "./pool.js";
 import { createReportingRepository } from "./reporting-repo.js";
 import { createUsageRepository } from "./usage-repo.js";
 
@@ -34,10 +34,11 @@ export interface Db {
   close(): Promise<void>;
 }
 
-export function createDb(opts: { databaseUrl: string; ssl: SslMode; max?: number; logger?: Logger }): Db {
+export function createDb(opts: { databaseUrl: string; ssl: DbTlsInput; credentials?: DbCredentials; max?: number; logger?: Logger }): Db {
   const pool = createPool({
     databaseUrl: opts.databaseUrl,
     ssl: opts.ssl,
+    ...(opts.credentials ? { credentials: opts.credentials } : {}),
     ...(opts.max !== undefined ? { max: opts.max } : {}),
   });
   const logger = opts.logger;
@@ -74,4 +75,4 @@ export function createDb(opts: { databaseUrl: string; ssl: SslMode; max?: number
 
 export { applyMigrations } from "./migrate.js";
 export { DbError, createPool } from "./pool.js";
-export type { Pool, SslMode } from "./pool.js";
+export type { DbCredentials, DbTlsConfig, DbTlsInput, Pool, SslMode } from "./pool.js";

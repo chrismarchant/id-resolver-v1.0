@@ -36,6 +36,21 @@ Each event is exactly this, and has no other field:
   "type": "conversion_intent", "name": "cta_click", "path": "/pricing", "consent": "granted" }
 ```
 
+## Browser events are forgeable telemetry
+
+Treat what this collector produces as **indicative, aggregate telemetry, never as evidence**
+(`docs/contracts/event.v1.md`, clarification CHR-66 G4-I1; no wire change):
+
+* The route's `Origin` and `Sec-Fetch-Site` checks stop other websites' pages, not scripts. Anyone can post
+  plausible events to your first-party route, with any allowlisted name, any path and `consent: "granted"`.
+* That is inherent to owner decision D4: there is no visitor identity, session, cookie or IP to authenticate a sender
+  by, and there must not be.
+* It is bounded by the closed vocabulary and your allowlist, the consent policy (`Sec-GPC: 1` is always refused), the
+  time window, the replay cache, the 1 KiB limit and the route's and the resolver's rate limits. The route's budget is
+  per instance, not per client, so one sender can also use it up.
+* **Never use browser events for security or billing decisions**: not for access control, fraud or abuse detection,
+  rate limiting, invoicing, contractual metrics, or any decision about a person or a company.
+
 ## Install
 
 Until the package is published, install the packed tarball (`npm pack -w @salescrusader/idr-collector`) or use a
@@ -73,7 +88,7 @@ nothing the collector does throws into the page.
 
 | option | meaning |
 |---|---|
-| `endpoint` | required. A **same-origin path** such as `/idr/e`. Absolute URLs, `//host`, `/\host`, other schemes, a query or a fragment are refused at init |
+| `endpoint` | required. A **same-origin path** such as `/idr/e`. Absolute URLs, `//host`, `/\host`, other schemes, a query or a fragment are refused at init. Use the same value as the server adapter's `collectorPath` (default `/idr/e`): the full request path, including any router `basepath`, so that a navigation to it is never reported as an entrance (`packages/tanstack/README.md`) |
 | `allow` | required. The names this site collects, a subset of the vocabulary. Any other name is dropped silently, and an unknown name in `allow` throws |
 | `consent` | required. `"required"`, `"not_required"` or `"off"` (see below) |
 | `hasConsent()` | consent platform hook: returns `true` once the visitor has consented |

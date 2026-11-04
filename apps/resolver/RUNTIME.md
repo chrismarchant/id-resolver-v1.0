@@ -70,7 +70,10 @@ name variables, never values. See `.env.example` for every variable.
   and the pruned observations are not recoverable from the resolver. Shorter is better for privacy; longer is safer for sync. The owner
   has not accepted any fixed default, so the service refuses to start until
   one is set. Pruning is not erasure and produces no tombstones; companies
-  and per-company scope statistics are never pruned.
+  and per-company scope statistics are never pruned. How to choose the value,
+  what pruning does and does not remove, and erasure:
+  [docs/RETENTION.md](../../docs/RETENTION.md) (operational justification,
+  not legal advice, pending owner/legal confirmation).
 * **Maintenance run** (`src/runtime/maintenance.ts`). Deletes expired cache
   rows (IP fingerprints past their TTL), and observations and browser events
   older than the retention window. It runs once at startup (after the server
@@ -78,8 +81,12 @@ name variables, never values. See `.env.example` for every variable.
   600 s); runs never overlap. A run drains: it repeats batches of
   `CACHE_PRUNE_BATCH` rows (one statement each) until a batch comes back
   short, within `CACHE_PRUNE_BUDGET_MS` (default 20 s; expired cache rows may
-  use half of it, browser events then up to a quarter, observation retention
-  gets the rest). Each run logs `maintenance_run{cache_rows,
+  use half of it, browser events then up to a quarter but never past three
+  quarters of it, observation retention gets the rest, at least the last
+  quarter). A deadline stops a phase from starting another batch; a single
+  batch already running can overrun it. Only one that runs past three
+  quarters of the budget eats into the observations' quarter, and the run
+  then reports the backlog. Each run logs `maintenance_run{cache_rows,
   observation_rows, event_rows, backlog, duration_ms}`; a run that stops with
   rows still due (budget spent, shutdown or a database error) also logs the
   warning `maintenance_backlog{reason, category}`, where `category` names the
@@ -94,6 +101,248 @@ name variables, never values. See `.env.example` for every variable.
 * Removed variables are refused rather than silently ignored:
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
+
+## Database TLS
+
+`DATABASE_SSL` governs **every** database connection: the service pool,
+`node dist/db/migrate.js` and every `ops:*` command (all go through
+`createPool`, `src/db/pool.ts`; the policy is `resolveDatabaseTls` in
+`src/config/index.ts`, the mechanics are in `src/db/tls.ts`). TLS parameters
+inside `DATABASE_URL` (`sslmode`, `ssl`, `sslrootcert`, `sslcert`, `sslkey`,
+`sslnegotiation`, `uselibpqcompat`, ...) are stripped, so the URL can neither
+weaken nor redirect TLS.
+
+| `DATABASE_SSL` | Encrypted | Verified | Production (`NODE_ENV=production`, the default) |
+|---|---|---|---|
+| `verify-pinned` | yes | the server's leaf certificate has a SHA-256 fingerprint listed in `DATABASE_TLS_PIN_SHA256` (one, or two during a rotation); with `DATABASE_CA_CERT` also the chain and the validity period. The host name is not checked. | allowed (the target for the Railway PostgreSQL template) |
+| `require` (default) | yes | chain to the system CAs, or to `DATABASE_CA_CERT` when set, **and** the host name | allowed |
+| `no-verify` | yes | nothing (encrypted, not authenticated) | **refused** unless `ALLOW_UNVERIFIED_DATABASE_TLS=true` (development deployment only; a `config_override` warning is logged at every start) |
+| `disable` | no | — | **refused**, also with the override; local development and tests only (`NODE_ENV=development` or `test`) |
+
+`DATABASE_TLS_PIN_SHA256` with a mode other than `verify-pinned`, and
+`DATABASE_CA_CERT` with `no-verify` or `disable`, are refused rather than
+ignored. Errors name variables only.
+
+**Why a pin.** The Railway `postgres-ssl` template creates its own root CA
+(`CN=root-ca`) and a server certificate (`CN=localhost`, SAN `DNS:localhost`
+and, in recent template versions, the private host name) on the data volume
+at first start. It chains to nothing public, so `require` fails without the
+template's CA, and the host name may not be in it. Pinning the exact leaf
+certificate needs neither: only a server holding that certificate's private
+key can complete the handshake. The cost: the pin changes whenever the
+certificate is regenerated (rotation, below). If the certificate's SANs
+include the private host name, `require` with `DATABASE_CA_CERT` set to the
+template's `root.crt` is an equivalent alternative (full host-name check);
+the template regenerates that CA together with the leaf, so it needs the same
+rotation.
+
+**How the pin is enforced.** Node calls a `checkServerIdentity` override only
+after the chain verified, so for a self-signed certificate it is never
+called, even with `rejectUnauthorized: false`: a pin check there would accept
+any certificate. Instead the service hands node-postgres its own socket
+(`PinnedTlsSocket`, node-postgres's `stream` option, node-postgres TLS off):
+it sends the SSLRequest, completes the handshake, compares the leaf
+fingerprint with the pins (constant-time) and only then lets node-postgres
+start. On a mismatch not one protocol byte (no startup message, user name or
+password) is sent; the connection fails with `DB_TLS_PIN_MISMATCH`. A server
+that answers the SSLRequest with anything but a single `S` is refused
+(`DB_TLS_REFUSED` / `DB_TLS_PROTOCOL`). With `DATABASE_CA_CERT`, OpenSSL also
+verifies the chain and validity (`DB_TLS_VERIFY_FAILED`). In pin-only mode
+the validity period is not enforced: an expired but pinned certificate still
+proves possession of the pinned key; renew it before it expires (the template
+regenerates it at a restart within 30 days of expiry, which changes the pin).
+
+At startup a failed verification exits 1 with `database TLS verification
+failed (<code>): check DATABASE_SSL, DATABASE_TLS_PIN_SHA256 and
+DATABASE_CA_CERT`. While running, existing connections stay up and new ones
+fail closed: requests answer `unavailable` and `/readyz` turns 503 until the
+pin is corrected.
+
+### Discovering the fingerprint
+
+```
+node dist/ops/db-tls-fingerprint.js      # in the service (Railway: railway ssh into id-resolver)
+npm run ops:db-tls-fingerprint           # locally
+```
+
+It reads only the host and port of `DATABASE_URL`, performs the SSLRequest
+and an **unverified** TLS handshake, and closes: it never sends the startup
+message, so no user name, password or database name leaves the process and
+nothing is read from the database. It prints one JSON object: `sha256` (the
+value for `DATABASE_TLS_PIN_SHA256`), `subject_cn`, `subject_alt_names`,
+`valid_from`, `valid_to`, and `matches_configured_pin` when
+`DATABASE_TLS_PIN_SHA256` is set. Errors print a fixed code only.
+`subject_alt_names` may contain the private host name: keep the output in
+private notes, never in this repository.
+
+**Trust on first use.** The first reading is only as trustworthy as the path
+it was read over. Run it inside the service, over the private network (which
+Railway encrypts between services), never through a public TCP proxy, and
+confirm it with a second, independent reading taken on the database's own
+volume (Railway shell of the PostgreSQL service):
+`openssl x509 -noout -fingerprint -sha256 -in /var/lib/postgresql/data/certs/server.crt`
+(the colon-separated value after `=` is accepted as a pin as is).
+
+### Rotation (two pins)
+
+`DATABASE_TLS_PIN_SHA256` takes `current,next` for the window in which the
+server may present either certificate:
+
+1. Obtain the next certificate's fingerprint (planned renewal: from the new
+   `server.crt` on the volume before it is activated; unplanned: the
+   template already switched, see below).
+2. Set `DATABASE_TLS_PIN_SHA256=<current>,<next>` on the service (this
+   redeploys; migrate and the service accept either certificate).
+3. Activate the next certificate (`SELECT pg_reload_conf()` as the owner
+   after the files were replaced, or a restart of the PostgreSQL service).
+4. Confirm with the helper (`matches_configured_pin: true`, new `sha256`),
+   then set `DATABASE_TLS_PIN_SHA256=<next>`.
+
+Unplanned regeneration (the template restarted within 30 days of expiry, or
+the volume was replaced): new connections fail closed. Take both readings
+above, set the new pin, redeploy. Put `valid_to` minus 45 days in the
+operations calendar to keep renewals planned.
+
+## Database roles
+
+Two PostgreSQL roles (Gate 5; `src/db/runtime-role.ts`):
+
+| Role | Credentials | Used by | Can |
+|---|---|---|---|
+| **owner** | `DATABASE_URL` | `node dist/db/migrate.js` (the pre-deploy step) and every `ops:*` command | everything: owns every object, runs DDL |
+| **runtime** (`DATABASE_RUNTIME_ROLE`, default `idr_runtime`) | `DATABASE_URL` host and database, `DATABASE_RUNTIME_ROLE`, `DATABASE_RUNTIME_PASSWORD` | the service process only | exactly the grants below |
+
+The feed guards of migrations 0006/0007 are triggers. Only the table owner
+(`ALTER TABLE ... DISABLE TRIGGER`) or a superuser (`SET
+session_replication_role = replica`) can bypass them, and `TRUNCATE` skips
+row triggers. The runtime role has none of that, so a leaked runtime
+credential cannot rewrite, silently delete or truncate feed items, write the
+retention watermark (INSERT, UPDATE and DELETE on it are refused) or remove a
+tombstone.
+
+What a leaked runtime credential **can** still do to the feed (G5R2-L4): it
+holds DELETE and INSERT on `company_observations`, because retention and the
+entrance path need them. Deleting observations, including the newest ones,
+advances the scope's watermark through the 0006 trigger (which runs as its
+owner since migration 0009): every consumer whose cursor is below it then
+gets `410 cursor_expired` and must resynchronise, and the deleted buffer
+contents are gone from the resolver. Inserting adds observations that the
+feed serves. Both are visible to consumers (a watermark move, feed items);
+neither is silent.
+
+**Runtime grants** (`RUNTIME_GRANTS`; every other privilege in the schema is
+revoked on every migrate run):
+
+| Table | Runtime privileges | Why |
+|---|---|---|
+| `ip_resolution_cache` | SELECT, INSERT, UPDATE, DELETE | leases, fenced commits, expiry pruning |
+| `usage_periods` | SELECT, INSERT, UPDATE | cap reservation, counters |
+| `companies` | SELECT, INSERT, UPDATE (`organisation_name`, `last_seen_at`) | resolution upsert, activity timestamp, the per-company lock |
+| `company_observations` | SELECT, INSERT, DELETE, UPDATE (`id`) | entrances, the feed, retention; UPDATE on `id` only because `SELECT ... FOR UPDATE SKIP LOCKED` needs an UPDATE privilege, and the 0006 trigger rejects any change of `id` |
+| `company_observation_refs` | SELECT, INSERT | idempotency records |
+| `company_scope_stats` | SELECT, INSERT, UPDATE | activity summary |
+| `browser_events` | SELECT, INSERT, DELETE, UPDATE (`id`) | events and their retention (same `FOR UPDATE` reason) |
+| `feed_tombstones`, `feed_retention_watermarks`, `deployment_controls`, `schema_migrations` | SELECT | the feed, the kill-switch read, the startup schema check |
+| sequences of `companies`, `company_observations`, `browser_events` | USAGE | inserts |
+
+Not granted: TRUNCATE, TRIGGER, REFERENCES on anything; DELETE on
+`companies`, `company_observation_refs`, `company_scope_stats`; any write to
+`feed_tombstones`, `feed_retention_watermarks` or `deployment_controls`; CREATE
+on the schema or the database; ownership; role memberships (so no `SET ROLE`
+to the owner); SUPERUSER, CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS; SET on
+`session_replication_role`. Temporary tables remain possible through PostgreSQL's
+default PUBLIC privilege; they are private to the session and cannot touch
+the guarded tables. Retention still advances the watermark because the 0006
+trigger function runs as its owner (migration 0009, `SECURITY DEFINER` with a
+pinned `search_path`).
+
+**Owner-only operations.** `ops:erase-company` (writes tombstones, deletes
+the company and its history) and `ops:kill-switch` (writes
+`deployment_controls`) need privileges the runtime role deliberately lacks;
+every ops command connects with `DATABASE_URL`. `ops:usage` and `ops:prune`
+also run as the owner (one rule for every ops command); `ops:prune` deletes
+through the same triggers.
+
+**Scope of the separation.** The owner `DATABASE_URL` (on Railway the
+template's superuser) is in the service's own environment, because the
+pre-deploy migrate shares the service's variables; `process.env` is scrubbed
+at startup but `/proc/<pid>/environ` keeps it. Role separation therefore
+contains SQL-level abuse and a leaked runtime password, not a compromise of
+the service process (a separate migrator service would be the structural
+answer).
+
+**Provisioning** (`node dist/db/migrate.js`, after the migrations, under the
+migration advisory lock, one transaction, on every run, only when
+`DATABASE_RUNTIME_PASSWORD` is set):
+
+1. creates the role (`LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+   NOREPLICATION NOBYPASSRLS NOINHERIT`), or updates it when it exists;
+   refuses (the deploy fails, nothing changes) if a role of that name exists
+   with an elevated attribute, a membership or owned objects: it never
+   demotes a role it did not create. An existing role of that name without
+   any of these is taken over (password reset, grants replaced), so
+   `DATABASE_RUNTIME_ROLE` must name a role nothing else uses;
+2. sets its password as a SCRAM-SHA-256 verifier computed in the migrate
+   process, so the plaintext never appears in SQL text, server logs or
+   `pg_stat_activity` (the verifier itself is in the statement text, so it can
+   reach server logs with `log_statement = ddl`, or `pg_stat_statements`; it
+   does not reveal the password);
+3. revokes every privilege it holds in the schema and grants exactly the
+   table above. Objects created by future migrations get their grants from
+   this map, re-applied on every run (no `ALTER DEFAULT PRIVILEGES`). An
+   object without an entry gets no privilege and is named in a warning;
+   `test/integration/runtime-role.test.ts` fails while any object the
+   migrations create has no entry;
+4. removes every session default stored on the role (`ALTER ROLE ...
+   RESET ALL`, for all databases and `IN DATABASE` this one). A role can set
+   its own defaults, so a leaked runtime credential could otherwise make every
+   later service session read-only (`default_transaction_read_only`) or
+   change its timeouts or durability (G5R2-L3); the service's session settings
+   live in code (`src/db/pool.ts`), never on the role;
+5. checks the result is least privilege (fails otherwise, e.g. CREATE on
+   `public` granted to PUBLIC on PostgreSQL 14 and older).
+
+The owner needs CREATEROLE (or superuser, as on Railway) for step 1.
+Changing `DATABASE_RUNTIME_PASSWORD` rotates the password at the next deploy:
+the pre-deploy migrate sets it before the new service instance starts.
+Connections the old instance already holds stay open until it stops; any new
+connection it opens after the migrate fails authentication.
+
+**Startup.** With `DATABASE_RUNTIME_PASSWORD` set the service logs in as the
+runtime role and checks its own login (`database_role_check`): it refuses to
+start (exit 1, naming the excess, e.g. `owns_objects`, `superuser`) if the
+login can do anything listed under "Not granted", or if the role carries
+session defaults for all databases or this one (`role_settings`, set after
+the last migrate run, e.g. with a leaked credential; a redeploy runs the
+migrate step, which resets them). The runtime role can also change its own
+password: new connections then fail authentication until the next migrate
+run sets it again. A wrong password exits 1
+with `database authentication failed (28P01)` and a hint that the pre-deploy
+migrate must have run with the same value. Without `DATABASE_RUNTIME_PASSWORD`
+the service logs in as the owner: refused when `NODE_ENV=production` unless
+the dev-only `ALLOW_OWNER_DATABASE_ROLE=true` is set (a `config_override`
+warning on every start). `config_loaded` reports `db_role: runtime|owner`.
+
+**Configuration matrix.**
+
+| Deployment | `DATABASE_SSL` | TLS variables | Role variables | Overrides |
+|---|---|---|---|---|
+| Production | `verify-pinned` (or `require` with a CA-issued certificate) | `DATABASE_TLS_PIN_SHA256` (optional `DATABASE_CA_CERT`) | `DATABASE_RUNTIME_PASSWORD` (sealed), optional `DATABASE_RUNTIME_ROLE` | none |
+| Development (Railway), target | `verify-pinned` | `DATABASE_TLS_PIN_SHA256` | `DATABASE_RUNTIME_PASSWORD` (sealed) | `ALLOW_MOCK_PROVIDER` only |
+| Development (Railway), transitional | `no-verify` | — | none | `ALLOW_UNVERIFIED_DATABASE_TLS=true`, `ALLOW_OWNER_DATABASE_ROLE=true` (both logged on every start; remove them; steps in `docs/RAILWAY_IAC.md`) |
+| Local development / tests | `disable` with `NODE_ENV=development` or `test` | — | optional | — |
+
+`NODE_ENV` must stay `production` (the image's default) on every deployed
+service: `development` or `test` silently switches off all three production
+refusals (`disable`, unverified TLS, the owner login), and `config_loaded`
+does not report `NODE_ENV`.
+
+**Rollback.** The previous build (no role separation) connects as the owner
+with `DATABASE_URL`, which still works: migration 0009 changes no table,
+the owner keeps every privilege, and a build that does not know 0009 reports
+the database as ahead (`migration_check`) instead of refusing. Leaving the
+runtime role in place is harmless; to remove it, as the owner: `DROP OWNED BY
+idr_runtime; DROP ROLE idr_runtime;` (after no build uses it).
 
 ## Browser events (CHR-64)
 
@@ -144,18 +393,27 @@ browser events are **never** associated with companies.
   duration_ms}` and `request_rejected{route, error_code, http_status,
   reason}`; never the `event_id`, `page_key`, type, name, body or headers.
   `config_loaded` reports `events_enabled` and `event_consent_mode`.
-* **Not covered by the smoke run** (`src/ops/smoke.ts`), which checks
-  entrances and the feed only.
+* **Smoke run** (`src/ops/smoke.ts`, operator guide `docs/DEV_SMOKE.md`).
+  With `EVENTS_ENABLED=true` it checks ingestion, idempotency, the
+  rejections, the consent policy, that responses carry no address, and,
+  read-only in the database, that only the run's `browser_events` rows were
+  written and nothing on the company side. With events off it checks that
+  `POST /v1/events` is byte-identical to an unknown route.
 
 ## Migrations
 
 Migrations never run on application start. They run as the deploy
-pre-step (`railway.json` `preDeployCommand: node dist/db/migrate.js`,
-advisory-locked, forward-only; locally `npm run migrate`). At startup the
+pre-step (`node dist/db/migrate.js`, the service's pre-deploy command in
+`.railway/railway.ts`; advisory-locked, forward-only; locally `npm run
+migrate`), as the owner (`DATABASE_URL`), and then provision the runtime role
+(see "Database roles"). At startup the
 service compares `migrations/*.sql` with `schema_migrations` and **refuses to
 start** while any migration of this build is not applied, naming the missing
 files. A database that is ahead of the build (a rollback) is reported in the
-`migration_check` log line but not refused.
+`migration_check` log line but not refused. Rolling the development
+deployment back to a build before migration 0008 is verified from its logs and
+the public edge, optionally with the current smoke's `--mode rollback-check`
+(`docs/DEV_SMOKE.md`).
 
 Feed immutability (migration 0007, CHR-66 F5): the database refuses any
 UPDATE of a served observation column, any UPDATE or DELETE of an erasure
@@ -166,7 +424,8 @@ cascades, manual statements), which the watermark or a tombstone always
 makes visible to consumers. The only bypass is
 `SET session_replication_role = replica` (superuser-only, or an explicit
 `GRANT SET` on that parameter) or disabling triggers as the table owner:
-these are out-of-band operations, used by the test reset only. Never use
+these are out-of-band operations, used by the test reset only, and the
+runtime role the service uses can do neither (see "Database roles"). Never use
 them on a live deployment except as documented break-glass maintenance, and
 then make every feed consumer resynchronise.
 

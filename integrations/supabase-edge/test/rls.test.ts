@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { EXPECTED_FUNCTION_GRANTS, EXPECTED_RELATION_GRANTS, columnGrants, functionGrants, relationGrants } from "./helpers/acl.ts";
 import { INSTALLATION, asRole, newPool, resetDatabase, truncateAll } from "./helpers/db.ts";
 
 let pool: pg.Pool;
@@ -7,7 +8,7 @@ const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync
 const FUNCS = [
   "idr_schema_version()",
   "idr_get_sync_state(text)",
-  "idr_apply_feed_page(text,text,text,jsonb,text)",
+  "idr_apply_feed_page(text,text,text,jsonb,text,boolean)",
   "idr_record_sync_status(text,text,boolean)",
   "idr_begin_resync(text)",
   "idr_reset_cursor(text,text)",
@@ -17,6 +18,8 @@ const FUNCS = [
 ];
 /** Trigger functions cannot be called directly; only their ACL is checked. */
 const TRIGGER_FUNCS = ["idr_sync_gaps_guard()"];
+/** The operator's action: executable by the owner only, not by service_role (CHR-66 G5R1-L3). */
+const OWNER_ONLY = ["idr_begin_resync(text)"];
 
 beforeAll(async () => {
   pool = newPool();
@@ -103,11 +106,11 @@ describe("row level security", () => {
     }
   });
 
-  it("only service_role can execute the functions", async () => {
+  it("only service_role can execute the functions; idr_begin_resync only the owner (G5R1-L3)", async () => {
     const calls: Record<string, [string, unknown[]]> = {
       "idr_schema_version()": ["select public.idr_schema_version()", []],
       "idr_get_sync_state(text)": ["select public.idr_get_sync_state($1)", [INSTALLATION]],
-      "idr_apply_feed_page(text,text,text,jsonb,text)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null)", [INSTALLATION]],
+      "idr_apply_feed_page(text,text,text,jsonb,text,boolean)": ["select public.idr_apply_feed_page($1, null, 'c1', '[]'::jsonb, null, false)", [INSTALLATION]],
       "idr_record_sync_status(text,text,boolean)": ["select public.idr_record_sync_status($1, 'ok', null)", [INSTALLATION]],
       "idr_begin_resync(text)": ["select public.idr_begin_resync($1)", [INSTALLATION]],
       "idr_reset_cursor(text,text)": ["select public.idr_reset_cursor($1, 'c9')", [INSTALLATION]],
@@ -120,26 +123,80 @@ describe("row level security", () => {
       for (const role of ["anon", "authenticated"]) {
         await expect(asRole(pool, role, (c) => c.query(sql, args)), `${role} ${f}`).rejects.toThrow(/permission denied/);
       }
-      await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).resolves.toBeDefined();
+      if (OWNER_ONLY.includes(f)) {
+        await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).rejects.toThrow(/permission denied/);
+        await expect(pool.query(sql, args), `owner ${f}`).resolves.toBeDefined();
+      } else {
+        await expect(asRole(pool, "service_role", (c) => c.query(sql, args)), `service_role ${f}`).resolves.toBeDefined();
+      }
     }
-    // No other role (PUBLIC) holds EXECUTE.
+    // No other role (PUBLIC) holds EXECUTE, and nobody but the owner on the trigger function (G4-L4) or on idr_begin_resync (G5R1-L3).
     const acl = await pool.query<{ proname: string; proacl: string[] }>(
       "select proname, proacl::text[] as proacl from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
     );
     expect(acl.rows.length).toBe(FUNCS.length + TRIGGER_FUNCS.length);
     for (const row of acl.rows) {
       const grantees = row.proacl.map((a) => a.split("=")[0]);
-      expect(grantees.sort(), row.proname).toEqual(["resolver", "service_role"].sort());
+      const ownerOnly = [...TRIGGER_FUNCS, ...OWNER_ONLY].some((f) => f.startsWith(`${row.proname}(`));
+      expect(grantees.sort(), row.proname).toEqual(ownerOnly ? ["resolver"] : ["resolver", "service_role"]);
     }
   });
 
-  it("functions are SECURITY INVOKER with an empty search_path", async () => {
-    const r = await pool.query<{ proname: string; prosecdef: boolean; proconfig: string[] | null }>(
-      "select proname, prosecdef, proconfig from pg_proc where pronamespace = 'public'::regnamespace and proname like 'idr\\_%'",
+  it("R2-8: the six writing functions are SECURITY DEFINER, owned by the tables' owner; the readers and the trigger stay SECURITY INVOKER; all have search_path = pg_catalog, pg_temp (G5R1-M1)", async () => {
+    const DEFINER = ["idr_apply_feed_page", "idr_begin_resync", "idr_record_sync_gap", "idr_record_sync_status", "idr_reset_cursor", "idr_resolve_sync_gaps"];
+    const r = await pool.query<{ proname: string; prosecdef: boolean; proconfig: string[] | null; same_owner: boolean }>(
+      `select p.proname, p.prosecdef, p.proconfig,
+              p.proowner = (select c.relowner from pg_class c where c.oid = 'public.idr_sync_gaps'::regclass) as same_owner
+         from pg_proc p where p.pronamespace = 'public'::regnamespace and p.proname like 'idr\\_%'`,
     );
+    expect(r.rows.filter((x) => x.prosecdef).map((x) => x.proname).sort()).toEqual(DEFINER);
     for (const row of r.rows) {
-      expect(row.prosecdef, row.proname).toBe(false);
-      expect(row.proconfig, row.proname).toContain('search_path=""');
+      expect(row.proconfig, row.proname).toEqual(["search_path=pg_catalog, pg_temp"]);
+      expect(row.same_owner, row.proname).toBe(true);
     }
+    // Every table, the view and the functions have one owner (the role that applied the script).
+    const owners = await pool.query("select distinct relowner from pg_class where relnamespace = 'public'::regnamespace and relname like 'idr\\_%'");
+    expect(owners.rowCount).toBe(1);
+  });
+});
+
+describe("G4-L4: exact privileges under Supabase's default privileges", () => {
+  it("control: the emulated defaults really grant ALL to anon, authenticated and service_role on new objects in public", async () => {
+    await pool.query("create table public.g4l4_control (id bigint generated always as identity, v text)");
+    try {
+      const r = await pool.query<{ role: string; t: boolean; s: boolean }>(
+        `select r as role, has_table_privilege(r, 'public.g4l4_control', 'TRUNCATE') as t,
+                has_sequence_privilege(r, pg_get_serial_sequence('public.g4l4_control', 'id'), 'UPDATE') as s
+           from unnest(array['anon','authenticated','service_role']) r`,
+      );
+      expect(r.rows).toEqual(["anon", "authenticated", "service_role"].map((role) => ({ role, t: true, s: true })));
+    } finally {
+      await pool.query("drop table public.g4l4_control");
+    }
+  });
+
+  it("every idr_* table, view and sequence has exactly the intended grants, and there is no column-level grant", async () => {
+    expect(await relationGrants(pool)).toEqual(EXPECTED_RELATION_GRANTS);
+    expect(await columnGrants(pool)).toEqual([]);
+  });
+
+  it("every idr_* function: EXECUTE for service_role only (nobody on the trigger function or idr_begin_resync), nothing for PUBLIC, anon or authenticated", async () => {
+    expect(await functionGrants(pool)).toEqual(EXPECTED_FUNCTION_GRANTS);
+  });
+
+  it("as service_role: no TRUNCATE and no CREATE TRIGGER on any table; anon and authenticated cannot use the gap id sequence", async () => {
+    for (const t of TABLES) {
+      await expect(asRole(pool, "service_role", (c) => c.query(`truncate public.${t}`)), `truncate ${t}`).rejects.toThrow(/permission denied/);
+      await expect(
+        asRole(pool, "service_role", (c) => c.query(`create trigger g4l4 before insert on public.${t} for each row execute function public.idr_sync_gaps_guard()`)),
+        `trigger on ${t}`,
+      ).rejects.toThrow(/permission denied/);
+    }
+    for (const role of ["anon", "authenticated", "service_role"]) {
+      for (const sql of ["select nextval('public.idr_sync_gaps_id_seq')", "select setval('public.idr_sync_gaps_id_seq', 1000)"]) {
+        await expect(asRole(pool, role, (c) => c.query(sql)), `${role}: ${sql}`).rejects.toThrow(/permission denied/);
+      }
+    }
+    expect((await pool.query("select count(*)::int as n from public.idr_tombstones")).rows[0].n).toBe(1);
   });
 });

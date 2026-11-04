@@ -4,6 +4,11 @@
 //
 //   npm run build && node harness.mjs                       # Cloudflare build under workerd
 //   NITRO_PRESET=node-server npm run build && PROBE_TARGET=node node harness.mjs
+//
+// Limit (G4-I8): local workerd / miniflare and the Node target show only the headers the adapter sets on its
+// outbound requests. They cannot show what the Cloudflare production edge adds to a Worker subrequest (for example
+// CF-Connecting-IP or X-Real-IP carrying the visitor's IP). Nothing here supports a D4 transport-isolation claim;
+// the staging test T5 on the real edge decides (docs/staging/CLOUDFLARE_TEST_SITE.md, section 4).
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

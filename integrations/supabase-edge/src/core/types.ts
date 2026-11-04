@@ -33,7 +33,7 @@ export interface FeedPage {
  * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
  * this code requires. The engine refuses to run against any other.
  */
-export const PROJECTION_SCHEMA_VERSION = 4;
+export const PROJECTION_SCHEMA_VERSION = 7;
 
 export interface SyncState {
   /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
@@ -59,6 +59,12 @@ export interface ApplyPageArgs {
   expectedResetFrom: string | null;
   nextCursor: string;
   items: FeedItem[];
+  /**
+   * This is the feed's final page (has_more = false). The store records, in the
+   * same transaction as the page, that the current replay has drained: the
+   * proof resolveGaps requires (CHR-66 R2-8).
+   */
+  drained: boolean;
 }
 
 export interface ApplyPageResult {
@@ -153,8 +159,10 @@ export interface Store {
    * After a run that drained the resolver's buffer up to drainedCursor: mark
    * open gaps resolved whose detection precedes the resync request that
    * started the replay now drained (ordered by generation under the state row
-   * lock), only while the stored cursor is still drainedCursor. Rebuilt from
-   * the retained buffer, NOT recovered. Returns how many were resolved.
+   * lock), only once applyPage has recorded that replay's final page
+   * (drained), and only while the stored cursor is still drainedCursor.
+   * Rebuilt from the retained buffer, NOT recovered. Returns how many were
+   * resolved.
    */
   resolveGaps(drainedCursor: string): Promise<number>;
 }

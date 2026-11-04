@@ -1,3 +1,4 @@
+import { DEFAULT_COLLECTOR_PATH, isCollectorPath, resolveCollectorPath } from "./collector-path.js";
 import { ELIGIBILITY_RULE_SET_ID } from "./types.js";
 
 /** A path pattern: a RegExp, an exact path, or a prefix ending in `*` (e.g. `/admin/*`). */
@@ -13,6 +14,7 @@ export interface EligibilityRules {
 }
 
 export type IneligibleReason =
+  | "collector_path"
   | "method"
   | "bad_url"
   | "upgrade"
@@ -72,11 +74,17 @@ function pathOf(request: Request): string | null {
  * Rule set `tsa-1`: decides whether a request is a human-style document
  * navigation worth reporting. Only request metadata is read; nothing is stored.
  * Fails closed (ineligible) on anything unexpected.
+ *
+ * `collectorPath` (default `/idr/e`, the documented collector route) is never
+ * eligible, for any method (G5-D-F1). It is checked first, on its own, so it does
+ * not depend on the method rule. An invalid `collectorPath` throws.
  */
-export function isEligible(request: Request, rules: EligibilityRules = {}): EligibilityResult {
+export function isEligible(request: Request, rules: EligibilityRules = {}, collectorPath: string = DEFAULT_COLLECTOR_PATH): EligibilityResult {
   const no = (reason: IneligibleReason): EligibilityResult => ({ eligible: false, reason });
-  if (request.method !== "GET") return no("method");
+  const collectorKey = resolveCollectorPath(collectorPath);
   const path = pathOf(request);
+  if (path !== null && isCollectorPath(path, collectorKey)) return no("collector_path");
+  if (request.method !== "GET") return no("method");
   if (path === null) return no("bad_url");
   const h = request.headers;
   if (h.has("upgrade")) return no("upgrade");

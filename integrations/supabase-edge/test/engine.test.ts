@@ -61,7 +61,7 @@ describe("idempotency", () => {
     expect(r.observations).toBe(4); // distinct observation ids only
     expect(await counts(pool)).toEqual({ companies: 2, observations: 4, tombstones: 0 });
     // Operator resync replays the whole stream: still 4 rows.
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const replay = await runSync(testConfig(mock), testDeps(store));
     expect(replay).toMatchObject({ status: "ok", observations: 0 });
     expect((await counts(pool)).observations).toBe(4);
@@ -108,11 +108,11 @@ describe("crash and atomicity", () => {
   });
 
   it("a stale expected cursor changes nothing (CAS)", async () => {
-    const a = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(1, 3, D)] as never });
+    const a = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(1, 3, D)] as never, drained: false });
     expect(a.applied).toBe(true);
-    const stale = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(2, 3, D)] as never });
+    const stale = await store.applyPage({ expectedCursor: null, expectedResetFrom: null, nextCursor: "c1", items: [obs(2, 3, D)] as never, drained: false });
     expect(stale.applied).toBe(false);
-    const wrong = await store.applyPage({ expectedCursor: "c9", expectedResetFrom: null, nextCursor: "c10", items: [obs(3, 3, D)] as never });
+    const wrong = await store.applyPage({ expectedCursor: "c9", expectedResetFrom: null, nextCursor: "c10", items: [obs(3, 3, D)] as never, drained: false });
     expect(wrong.applied).toBe(false);
     expect((await counts(pool)).observations).toBe(1);
     expect(await storedCursor(pool)).toBe("c1");
@@ -155,7 +155,7 @@ describe("tombstones", () => {
     const left = await pool.query("select distinct company_id from public.idr_observations");
     expect(left.rows).toEqual([{ company_id: "8" }]);
     // Replaying the whole stream re-applies the tombstone: same end state.
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     await runSync(testConfig(mock), testDeps(store));
     expect(await counts(pool)).toEqual({ companies: 1, observations: 2, tombstones: 1 });
   });
@@ -255,7 +255,7 @@ describe("terminal statuses never advance the cursor", () => {
     expect(again.status).toBe("needs_resync");
     expect(mock.requests.length).toBe(0);
     // Operator resync restarts from the start of the buffer.
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const ok = await runSync(testConfig(mock), testDeps(store));
     expect(ok.status).toBe("ok");
     expect(ok.gapsResolved).toBe(1);
@@ -338,10 +338,13 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     await setupStalled(store);
     expect((await runSync(testConfig(mock), testDeps(store))).status).toBe("needs_resync");
     mock.items.push(obs(7, 3, D), obs(8, 3, D)); // retained: 5-8, two pages
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     // The replay needs several runs: not drained yet -> still open.
     const part = await runSync(testConfig(mock, { maxPages: 1 }), testDeps(store));
     expect(part).toMatchObject({ status: "partial", gapsResolved: 0 });
+    expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
+    // R2-8: that replay has not drained, so a resolve called anyway (by service_role directly) resolves nothing.
+    expect(await store.resolveGaps((await storedCursor(pool))!)).toBe(0);
     expect((await gapRows(pool))[0]!.resolved_at).toBeNull();
     const done = await runSync(testConfig(mock), testDeps(store));
     expect(done).toMatchObject({ status: "ok", gapsResolved: 1 });
@@ -446,7 +449,7 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
     const r1 = await runSync(testConfig(mock), testDeps(flaky));
     expect(r1).toMatchObject({ status: "needs_resync", gap: { recorded: false } });
     expect(await gapRows(pool)).toHaveLength(0); // only the needs_resync flag is durable
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION])); // the operator acts first
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]); // the operator acts first
     const gaps = await gapRows(pool);
     expect(gaps).toHaveLength(1);
     expect(gaps[0]).toMatchObject({ kind: "cursor_expired", expired_cursor: "c2" });
@@ -473,7 +476,7 @@ describe("continuity gaps (410 cursor_expired is a potential gap, never a recove
 });
 
 describe("voluntary resync (idr_begin_resync without needs_resync) re-checks the old position first", () => {
-  const begin = () => asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+  const begin = () => pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
   const st = async () =>
     (
       await pool.query<{ cursor: string | null; reset_from_cursor: string | null; needs_resync: boolean }>(
@@ -683,7 +686,7 @@ describe("rejected cursor (resolver cursor-key rotation)", () => {
     const st = await pool.query("select status, needs_resync, cursor from public.idr_sync_state");
     expect(st.rows[0]).toEqual({ status: "needs_resync", needs_resync: true, cursor: null });
     // The operator's resync rebuilds from what is retained; obs 3 stays missing, and is on record.
-    await asRole(pool, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const ok = await runSync(cfg(), testDeps(store));
     expect(ok).toMatchObject({ status: "ok", gapsResolved: 1 });
     const ids = await pool.query<{ id: string }>("select observation_id::text as id from public.idr_observations order by observation_id");

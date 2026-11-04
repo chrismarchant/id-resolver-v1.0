@@ -27,9 +27,16 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "../../src/db/index.js";
-import { ENGAGE_REASON, RESTORE_REASON } from "../../src/ops/smoke-kill-switch.js";
+import { SMOKE_ENGAGE_REASON_PREFIX, SMOKE_RESTORE_REASON_PREFIX } from "../../src/ops/smoke-kill-switch.js";
 import { KILL_SWITCH_PROBE_PREFIX } from "../../src/ops/smoke-mode.js";
 import { createTestDb, getTestDatabaseUrl, resetTestDb } from "../helpers/db.js";
+import { startProductionDb } from "../helpers/prod-db.js";
+import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
+
+// Production posture for the service and the smoke runner: verified (pinned) TLS through the test terminator.
+const prodDb = await startProductionDb();
+await prodDb.provision();
+afterAll(() => prodDb.close());
 
 const ROOT = resolve(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
 const INSTALLATION = "inst-test";
@@ -67,8 +74,7 @@ function serviceEnv(port: number, documentationRanges: "true" | "false"): Record
     RESOLVER_AUTH_TOKEN: WEBSITE_TOKEN,
     REPORTING_AUTH_TOKEN: REPORTING_TOKEN,
     IP_HMAC_SECRET: HMAC_SECRET,
-    DATABASE_URL: getTestDatabaseUrl(),
-    DATABASE_SSL: "disable",
+    ...prodDb.env(),
     PROVIDER_MODE: "mock",
     ALLOW_MOCK_PROVIDER: "true",
     ALLOW_DOCUMENTATION_RANGES: documentationRanges,
@@ -116,7 +122,7 @@ function runSmoke(env: Record<string, string>, onChild?: (child: ChildProcess) =
 /** Nothing secret, no configuration value and no address in anything the smoke writes. */
 function expectSecretFree(r: SmokeRun, base: string): void {
   const out = `${r.stdout}${r.stderr}`;
-  for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), base, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://"]) {
+  for (const needle of [WEBSITE_TOKEN, REPORTING_TOKEN, HMAC_SECRET, getTestDatabaseUrl(), prodDb.url(), prodDb.cert.sha256, TEST_RUNTIME_PASSWORD, base, "203.0.113.", "2001:db8", "10.0.0.1", "127.0.0.1", "postgres://"]) {
     expect(out.includes(needle), "smoke output leaked a value").toBe(false);
   }
   // JSON lines only on stdout.
@@ -185,8 +191,9 @@ describe("smoke suite against the real service: documentation ranges enabled", (
     const r = await runSmoke(smokeEnv);
     expect(r.code, r.stdout + r.stderr).toBe(0);
     expect(r.checks.filter((c) => !c.pass)).toEqual([]);
-    expect(r.checks).toHaveLength(26); // 24 existing - 4 public-edge checks folded into one skip + 6 kill-switch checks
-    expect(r.summary).toMatchObject({ target: "loopback", mode: "documentation_ranges_enabled", kill_switch_phase: "run", kill_switch_prior: "released", kill_switch_restore: "restored", checks: 26, failed: 0 });
+    // 26 at Gate 4, plus (Gate 5) the orphan check, the feed shape check and the two events-disabled checks.
+    expect(r.checks).toHaveLength(30);
+    expect(r.summary).toMatchObject({ target: "loopback", mode: "documentation_ranges_enabled", kill_switch_phase: "run", kill_switch_prior: "released", kill_switch_restore: "restored", checks: 30, passed: 29, failed: 0, skipped: 1 });
     for (const name of KS_CHECKS) expect(check(r, name)?.pass, name).toBe(true);
     expect(check(r, KS_CHECKS[2]!)?.detail).toBe("status 200 result disabled/none/recorded=false");
     expect(check(r, KS_CHECKS[3]!)?.detail).toBe("restore restored, reads released");
@@ -194,7 +201,7 @@ describe("smoke suite against the real service: documentation ranges enabled", (
     expect(check(r, KS_CHECKS[5]!)?.detail).toBe("status 200 result no_match/provider/recorded=false");
     expect(r.checks.filter((c) => c.detail.startsWith("skipped")).map((c) => c.check)).toEqual(["public edge checks"]);
     const rows = await controlRows();
-    expect(rows.map(({ enrichment_enabled, reason }) => ({ enrichment_enabled, reason }))).toEqual([{ enrichment_enabled: true, reason: RESTORE_REASON }]);
+    expect(rows.map(({ enrichment_enabled, reason }) => ({ enrichment_enabled, reason }))).toEqual([{ enrichment_enabled: true, reason: `${SMOKE_RESTORE_REASON_PREFIX} [run ${String(r.summary?.["run"])}]` }]);
     // The service logged the kill-switch outcome for the probe.
     expect(service.output()).toContain('"reason":"kill_switch"');
     expectSecretFree(r, base);
@@ -222,10 +229,10 @@ describe("smoke suite against the real service: documentation ranges enabled", (
 
   it("a restore the database refuses: exit 2 with a loud secret-free message; the switch is left engaged, not silently", async () => {
     await db.controls.setEnrichmentEnabled(INSTALLATION, true, "test: released");
-    expect(RESTORE_REASON).not.toContain("'");
+    expect(SMOKE_RESTORE_REASON_PREFIX).not.toMatch(/['%_]/);
     await db.pool.query(`CREATE OR REPLACE FUNCTION g4a_smoke_block_restore() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
-        IF NEW.reason = '${RESTORE_REASON}' THEN RAISE EXCEPTION 'restore blocked by test'; END IF;
+        IF starts_with(NEW.reason, '${SMOKE_RESTORE_REASON_PREFIX}') THEN RAISE EXCEPTION 'restore blocked by test'; END IF;
         RETURN NEW;
       END $$`);
     await db.pool.query("CREATE TRIGGER g4a_smoke_block_restore BEFORE INSERT OR UPDATE ON deployment_controls FOR EACH ROW EXECUTE FUNCTION g4a_smoke_block_restore()");
@@ -239,7 +246,7 @@ describe("smoke suite against the real service: documentation ranges enabled", (
       expect(r.stderr).toContain("node dist/ops/kill-switch.js off");
       // Printed right after the phase and again as the very last line.
       expect(r.stderr.trim().split("\n").at(-1)).toContain("KILL SWITCH RESTORE FAILED");
-      expect((await controlRows()).map(({ enrichment_enabled, reason }) => ({ enrichment_enabled, reason }))).toEqual([{ enrichment_enabled: false, reason: ENGAGE_REASON }]);
+      expect((await controlRows()).map(({ enrichment_enabled, reason }) => ({ enrichment_enabled, reason }))).toEqual([{ enrichment_enabled: false, reason: `${SMOKE_ENGAGE_REASON_PREFIX} [run ${String(r.summary?.["run"])}]` }]);
       expectSecretFree(r, base);
     } finally {
       await db.pool.query("DROP TRIGGER IF EXISTS g4a_smoke_block_restore ON deployment_controls");
@@ -265,7 +272,7 @@ describe("smoke suite against the real service: documentation ranges enabled", (
       child!.kill("SIGTERM");
       const r = await running;
       expect(r.code, r.stdout + r.stderr).toBe(2);
-      expect(r.stderr).toContain("interrupted by a signal during the kill-switch phase; the restore ran first (restore restored)");
+      expect(r.stderr).toContain("interrupted by SIGTERM during the kill-switch phase; the restore ran first (restore restored)");
       expect(r.summary).toMatchObject({ kill_switch_prior: "released", kill_switch_restore: "restored" });
       expect(check(r, KS_CHECKS[2]!)?.pass).toBe(true);
       expect(check(r, KS_CHECKS[3]!)?.pass).toBe(true);
@@ -345,8 +352,11 @@ describe("smoke suite against the real service: documentation ranges disabled", 
       kill_switch_phase: "skipped_documentation_ranges_disabled",
       kill_switch_prior: "not_read",
       kill_switch_restore: "not_run",
-      checks: 28,
+      // 28 at Gate 4 (13 of them skip-passes, G4-I7), plus the orphan, feed-shape and two events-disabled checks.
+      checks: 32,
+      passed: 19,
       failed: 0,
+      skipped: 13,
       first_source: "none",
     });
     expect(check(r, "documentation-range address (IPv4) -> ineligible, nothing recorded")).toEqual({

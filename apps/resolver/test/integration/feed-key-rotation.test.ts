@@ -60,7 +60,7 @@ import {
 // their own workspace so this suite drives the exact code a client deploys.
 import { runSync } from "../../../../integrations/supabase-edge/src/core/engine.ts";
 import type { Store, SyncConfig } from "../../../../integrations/supabase-edge/src/core/types.ts";
-import { asRole, ensureProjection, gapRows, newPool, PgStore, truncateAll } from "../../../../integrations/supabase-edge/test/helpers/db.ts";
+import { ensureProjection, gapRows, newPool, PgStore, truncateAll } from "../../../../integrations/supabase-edge/test/helpers/db.ts";
 import type pg from "pg";
 
 const DAY = 86_400_000;
@@ -628,7 +628,8 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect(await gapRows(projection)).toHaveLength(1);
 
     // Operator resync: the drained run marks the gap resolved; obs 3 and 4 stay missing; the row stays.
-    await asRole(projection, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));
+    // (as the projection's owner: service_role may not call idr_begin_resync, CHR-66 G5R1-L3)
+    await projection.query("select public.idr_begin_resync($1)", [INSTALLATION]);
     const resynced = await runSync(cfg(afterUrl), deps(store));
     expect(resynced).toMatchObject({ status: "ok", gapsResolved: 1 });
     expect(await projected()).toEqual([old[0]!.id, old[1]!.id, ...fresh.map((f) => f.id)]);
@@ -714,7 +715,7 @@ describe("end to end: Supabase Edge engine across a cursor-key rotation (N1)", (
     expect((await runSync(cfg(afterUrl, { maxPages: 1 }), deps(store))).status).toBe("partial"); // obs 1, 2
     const p = (await syncState())!.cursor;
     expect((await retention.pruneAllBefore(retentionCutoff(new Date(now), 30), { batch: 100 })).deleted).toBe(4); // obs 1-4: past P
-    await asRole(projection, "service_role", (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION])); // needs_resync was false
+    await projection.query("select public.idr_begin_resync($1)", [INSTALLATION]); // as the owner; needs_resync was false
     const r = await runSync(cfg(afterUrl), deps(store));
     expect(r).toMatchObject({ status: "ok", gap: { recorded: true, newGap: true, needsResync: false }, gapsResolved: 1 });
     const gaps = await gapRows(projection);

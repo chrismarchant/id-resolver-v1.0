@@ -11,7 +11,8 @@ import { readFileSync } from "node:fs";
 import { connect } from "node:net";
 import { resolve } from "node:path";
 import { startMockEnrichServer, SPECIAL_IPS, type MockServerHandle } from "../../src/provider/mock-server.js";
-import { createTestDb, resetTestDb, getTestDatabaseUrl } from "../helpers/db.js";
+import { createTestDb, getTestDatabaseUrl, resetTestDb } from "../helpers/db.js";
+import { startProductionDb, type ProductionDb } from "../helpers/prod-db.js";
 import { TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
 import { dumpDatabaseText, entranceResponseProblems, findLeaks, FORBIDDEN_PROVIDER_FIELDS, ipVariants } from "../helpers/leak-scan.js";
 import type { Db } from "../../src/db/index.js";
@@ -53,6 +54,7 @@ describe("black-box service process", () => {
   let proc: ChildProcess;
   let mock: MockServerHandle;
   let db: Db;
+  let prodDb: ProductionDb;
   let output = "";
   let exitCode: number | null = null;
   let exitSignal: string | null = null;
@@ -86,6 +88,8 @@ describe("black-box service process", () => {
        FROM generate_series(1, 25) g`,
     );
     mock = await startMockEnrichServer({ slowMs: 4_000 });
+    prodDb = await startProductionDb();
+    await prodDb.provision();
     const env: NodeJS.ProcessEnv = {
       PATH: process.env["PATH"] ?? "",
       NODE_ENV: "production",
@@ -97,8 +101,8 @@ describe("black-box service process", () => {
       RESOLVER_AUTH_TOKEN: TEST_AUTH_TOKEN,
       IP_HMAC_SECRET: TEST_HMAC_SECRET,
       ENRICH_API_KEY: "sk_test_placeholder_key",
-      DATABASE_URL: getTestDatabaseUrl(),
-      DATABASE_SSL: "disable",
+      // Production posture: verified (pinned) TLS through the test terminator.
+      ...prodDb.env(),
       PROVIDER_MODE: "live",
       ENRICH_API_BASE_URL: mock.url,
       ENRICH_TIMEOUT_MS: "700",
@@ -130,6 +134,7 @@ describe("black-box service process", () => {
     if (exitCode === null) proc.kill("SIGKILL");
     await mock.close();
     await db.close();
+    await prodDb.close();
   });
 
   it("answers liveness and readiness", async () => {
@@ -227,7 +232,7 @@ describe("black-box service process", () => {
 
   it("carries no IP or secret in its command line", () => {
     const cmdline = readFileSync(`/proc/${proc.pid}/cmdline`, "utf8");
-    for (const needle of [QUALIFIED_IP, TEST_AUTH_TOKEN, TEST_HMAC_SECRET, "sk_test_placeholder_key", getTestDatabaseUrl()]) expect(cmdline).not.toContain(needle);
+    for (const needle of [QUALIFIED_IP, TEST_AUTH_TOKEN, TEST_HMAC_SECRET, "sk_test_placeholder_key", getTestDatabaseUrl(), prodDb.url()]) expect(cmdline).not.toContain(needle);
   });
 
   it("shuts down gracefully on SIGTERM, draining the in-flight job", async () => {
@@ -256,6 +261,7 @@ describe("black-box service process", () => {
       TEST_HMAC_SECRET,
       "sk_test_placeholder_key",
       getTestDatabaseUrl(),
+      prodDb.url(),
       "Example Transit Networks",
       "203.0.113.0/24",
       ...FORBIDDEN_PROVIDER_FIELDS,

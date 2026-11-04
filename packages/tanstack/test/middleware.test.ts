@@ -378,3 +378,132 @@ describe("middleware: construction and configuration", () => {
     expect(await throwing({ request: reqWithIp(), next: nextOf(page) })).toBe(page);
   });
 });
+
+describe("middleware: a navigation to the collector path is never an entrance (G5-D-F1)", () => {
+  // What a browser sends when someone opens /idr/e in the address bar (or follows a link to it).
+  const NAVIGATION: Record<string, string> = {
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-language": "en-GB,en;q=0.9",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-site": "none",
+    "sec-fetch-user": "?1",
+    "upgrade-insecure-requests": "1",
+  };
+  const navigation = (path: string, method = "GET") => new Request(`https://www.example.com${path}`, { method, headers: { ...NAVIGATION, "x-client-ip": PUBLIC_IP } });
+  /** What TanStack Start answers for GET /idr/e when only POST is registered: an empty route page, 200 text/html. */
+  const emptyRoutePage = () => new Response("<!DOCTYPE html><html><head></head><body></body></html>", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+
+  /** Runs one request; returns the result, the hook results and the resolver calls made through the adapter's fetch. */
+  async function run<P extends Response | { response: Response }>(over: Partial<IdrOptions>, request: Request, page: P = emptyRoutePage() as P) {
+    const results: DeliveryResult[] = [];
+    const calls: string[] = [];
+    const counting = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push(String(url));
+      return fetch(url, init);
+    }) as typeof fetch;
+    const mw = createIdrServerMiddleware(opts({ fetch: counting, onDeliveryResult: (r) => void results.push(r), ...over }));
+    const { pending } = withWaitUntil(request);
+    const out = await mw({ request, next: async () => page });
+    await Promise.all(pending);
+    return { out, results, calls };
+  }
+
+  it.each(["GET", "HEAD"])("%s /idr/e answered 200 text/html: zero calls to /v1/entrances, the same object, skipped/eligibility:collector_path", async (method) => {
+    const page = emptyRoutePage();
+    const headersBefore = [...page.headers];
+    const { out, results, calls } = await run({}, navigation("/idr/e", method), page);
+    expect(out).toBe(page);
+    expect([...page.headers]).toEqual(headersBefore);
+    expect(page.status).toBe(200);
+    expect(page.bodyUsed).toBe(false);
+    expect(calls).toEqual([]);
+    expect(fx.captured).toHaveLength(0);
+    expect(results).toEqual([expect.objectContaining({ outcome: "skipped", reason: "eligibility:collector_path", mode: "none", attempts: 0 })]);
+  });
+
+  it("control: the same navigation to an ordinary page is reported (one call, delivered)", async () => {
+    const { out, results, calls } = await run({}, navigation("/pricing"), emptyRoutePage());
+    expect(out.status).toBe(200);
+    expect(calls).toEqual([`${fx.url}/v1/entrances`]);
+    expect(fx.captured).toHaveLength(1);
+    expect(JSON.parse(fx.captured[0]!.body).page_key).toBe("/pricing");
+    expect(results).toEqual([expect.objectContaining({ outcome: "delivered", reason: "ok" })]);
+  });
+
+  it.each(["/IDR/E", "/idr/e/", "/Idr/E//", "/idr/%65", "/%69dr/e", "//idr/e", "/idr/e?utm_medium=email", "/idr/e%20", "/IDR/E%20%20", "/idr/%65%20"])("variant %s: nothing sent", async (path) => {
+    const { results, calls } = await run({}, navigation(path));
+    expect(calls).toEqual([]);
+    expect(fx.captured).toHaveLength(0);
+    expect(results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+  });
+
+  it("holds with no collector route anywhere and no collector option (the default needs no configuration)", async () => {
+    const results: DeliveryResult[] = [];
+    // Exactly the README's minimal registration: no eligibility rules, no collectorPath, no createCollectorRoute.
+    const mw = createIdrServerMiddleware({ resolverUrl: fx.url, allowInsecureHttp: true, token: TEST_TOKEN, websiteId: "example-site", trustPolicy: { mode: "header", name: "x-client-ip" }, allowDocumentationRanges: true, onDeliveryResult: (r) => void results.push(r) });
+    const request = navigation("/idr/e");
+    const { pending } = withWaitUntil(request);
+    const page = emptyRoutePage();
+    expect(await mw({ request, next: async () => page })).toBe(page);
+    await Promise.all(pending);
+    expect(fx.captured).toHaveLength(0);
+    expect(results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+  });
+
+  it("holds for a TanStack-style context result ({ response }) and with lazily resolved options", async () => {
+    const results: DeliveryResult[] = [];
+    const mw = createIdrServerMiddleware(() => opts({ onDeliveryResult: (r) => void results.push(r) }));
+    const request = navigation("/idr/e");
+    const { pending } = withWaitUntil(request);
+    const ctx = { request, pathname: "/idr/e", context: {}, response: emptyRoutePage() };
+    expect(await mw({ request, next: async () => ctx })).toBe(ctx);
+    await Promise.all(pending);
+    expect(fx.captured).toHaveLength(0);
+    expect(results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+  });
+
+  it("a custom collectorPath is excluded instead, and /idr/e becomes an ordinary page", async () => {
+    const custom = await run({ collectorPath: "/t/collect" }, navigation("/t/collect"));
+    expect(custom.calls).toEqual([]);
+    expect(custom.results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+    const variant = await run({ collectorPath: "/t/collect" }, navigation("/T/Collect/"));
+    expect(variant.calls).toEqual([]);
+    expect(fx.captured).toHaveLength(0);
+    const old = await run({ collectorPath: "/t/collect" }, navigation("/idr/e"));
+    expect(old.calls).toHaveLength(1);
+    expect(fx.captured).toHaveLength(1);
+    expect(JSON.parse(fx.captured[0]!.body).page_key).toBe("/idr/e");
+  });
+
+  it("does not depend on the site's collector route options: one shared object with any allowlist or consent mode", async () => {
+    for (const routeOptions of [{ allow: ["page_view"], consent: "required" }, { allow: ["cta_click", "form_submit"], consent: "not_required" }, { allow: [], consent: "off" }]) {
+      fx.captured.length = 0;
+      const shared = { ...opts(), ...routeOptions } as IdrOptions;
+      const { calls, results } = await run(shared, navigation("/idr/e"));
+      expect(calls).toEqual([]);
+      expect(fx.captured).toHaveLength(0);
+      expect(results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+    }
+  });
+
+  it("the collector route's own POST answer (204) passes through untouched and is not reported", async () => {
+    const answer = new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    const request = new Request("https://www.example.com/idr/e", { method: "POST", headers: { origin: "https://www.example.com", "content-type": "text/plain;charset=UTF-8", "user-agent": NAVIGATION["user-agent"]!, "x-client-ip": PUBLIC_IP }, body: "{}" });
+    const { out, calls, results } = await run({}, request, answer);
+    expect(out).toBe(answer);
+    expect(calls).toEqual([]);
+    expect(results.map((r) => r.reason)).toEqual(["eligibility:collector_path"]);
+  });
+
+  it("an invalid collectorPath throws at creation (eager) and disables reporting with config_invalid (lazy)", async () => {
+    expect(() => createIdrServerMiddleware(opts({ collectorPath: "/idr/*" }))).toThrow(/collectorPath/);
+    const results: DeliveryResult[] = [];
+    const mw = createIdrServerMiddleware(() => opts({ collectorPath: "idr/e", onDeliveryResult: (r) => void results.push(r) }));
+    const page = html();
+    expect(await mw({ request: navigation("/pricing"), next: nextOf(page) })).toBe(page);
+    expect(results.map((r) => r.reason)).toEqual(["config_invalid"]);
+    expect(fx.captured).toHaveLength(0);
+  });
+});
