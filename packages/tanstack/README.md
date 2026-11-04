@@ -1,6 +1,6 @@
 # @salescrusader/idr-tanstack
 
-ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.0`, not published).
+ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.1`, not published).
 
 For each eligible **document request** the website's **server** reports one small, anonymous "entrance" to the
 resolver (`entrance.v1`). It never touches the page response, sets no cookie, adds no script and sends nothing from the
@@ -69,7 +69,7 @@ exactly what `next()` returned, so it composes with any other middleware.
 
 | option | default | meaning |
 |---|---|---|
-| `resolverUrl`, `token`, `websiteId` | required | see above; https required unless `allowInsecureHttp` (local development only) |
+| `resolverUrl`, `token`, `websiteId` | required | see above; https required unless `allowInsecureHttp` (local development only); a host under `supabase.co`, `supabase.in` or `supabase.com` is refused as invalid configuration: the website reaches only the resolver and holds no Supabase URL or key of the private Insights project (`docs/GUARDRAILS.md` G3b) |
 | `trustPolicy` | **required** | `cloudflare`, `xff`, `header` or `none` |
 | `timeoutMs` | 5000 (250 to 10000) | per attempt, `AbortSignal.timeout`; above the resolver's 4000 ms request deadline |
 | `retry`, `retryDelayMs` | `true`, 250 | one retry, only with `waitUntil` (see below) |

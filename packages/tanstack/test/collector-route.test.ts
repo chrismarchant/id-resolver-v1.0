@@ -773,6 +773,8 @@ describe("collector route: configuration", () => {
     ["cache too small", { replayCacheSize: 1 }],
     ["rate zero", { rateLimit: { events: 0 } }],
     ["http resolver", { resolverUrl: "http://resolver.example.com" }],
+    ["Supabase resolver host (G3b)", { resolverUrl: "https://example-project.supabase.co" }],
+    ["Supabase pooler domain (G3b)", { resolverUrl: "https://pooler.supabase.com" }],
     ["short token", { token: "short" }],
   ])("%s: throws at creation without echoing secrets", (_n, over) => {
     const opts = { resolverUrl: RESOLVER, token: TEST_TOKEN, websiteId: "example-site", allow: ["page_view"], ...over } as unknown as CollectorRouteOptions;
