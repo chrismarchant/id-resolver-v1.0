@@ -132,6 +132,12 @@ are reported as `page_keys_cleared` in the run result, the function's response a
 Only a `page_key` that is not a string at all is a contract violation (`contract_error`), as before. Every page
 the resolver serves passes, so a resolver-valid page never halts the sync on its `page_key`.
 
+**Stored values (upgrade).** The schema 8 script also clears, in the same single idempotent statement, every
+`page_key` already in `idr_observations` that fails the same rule (an earlier release stored whatever it was
+sent), keeping the observation. Only those rows are written, and a re-run writes nothing. So, once the script has
+run, `idr_observations` holds no `page_key` that fails the rule: new values are checked before they are stored,
+and old ones were cleared. (The table owner can still write rows directly; the service role cannot.)
+
 **A null `page_key` is ambiguous** (documentation only, nothing records which): it means either that the resolver
 sent none (an observation recorded through an older contract, which the contract allows) or that G5 cleared a
 value that failed the rule. `page_keys_cleared` counts the second case per run; the projection does not mark
@@ -141,7 +147,7 @@ Tests: `integrations/supabase-edge/test/apply-guards.test.ts` (every valid form 
 form cleared, at the function and through the engine; astral-plane keys at the 256/257 code-point boundary
 through the engine; the validator's rule compared with the resolver's own `isValidPageKey` over valid, boundary
 and invalid keys; a page of resolver-valid keys never halts), `test/upgrade.test.ts` (after upgrading from every
-release).
+release, including the clean-up of stored values: only failing rows written, a re-run writes nothing).
 
 ## G6: reporting-feed wire allowlist (resolver)
 
@@ -161,12 +167,17 @@ installation in `idr_tombstones` (the contract's recommendation, `docs/contracts
 and re-observation": company ids are never reused). A re-applied or replayed page can therefore never resurrect
 an erased company; the result counts such items as `ignored_erased`, and the count (never a value) reaches the
 Edge function's run result, its response (`"ignored_erased"`) and, when not zero, its log line (`PostgrestStore`,
-`engine.ts`, `handler.ts`; tests in `test/handler.test.ts`).
+`engine.ts`, `handler.ts`; tests in `test/handler.test.ts`). The check is one lookup per observation by
+`(installation_id, company_id)`; schema 8 adds the index `idr_tombstones_company_idx` on exactly those columns
+(idempotently), so it never scans `idr_tombstones`.
 
 **Tests.** `integrations/supabase-edge/test/apply-guards.test.ts`: a stale page after the tombstone, an
 observation after its tombstone in the same page, a replay through the engine after a resync (positive); a
 re-observation under a new company id and another installation's tombstone are applied normally (negative
-controls). `test/upgrade.test.ts`: a tombstone recorded by each earlier release is honoured after the upgrade.
+controls). `test/upgrade.test.ts`: a tombstone recorded by each earlier release is honoured after the upgrade, and the
+upgrade creates the index once. `test/exposure.test.ts`: the exact index catalogue after a fresh install and after
+an upgrade from every release (a deliberate snapshot), and the tombstone lookup's plan uses the index (and cannot
+without it).
 
 Schema 8 is required by the engine of this release (`PROJECTION_SCHEMA_VERSION`); an older install gets
 `schema_mismatch` before any fetch until the idempotent script is re-run (`integrations/supabase-edge/SETUP.md`).

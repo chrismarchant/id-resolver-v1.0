@@ -68,8 +68,9 @@ stays in `public` for now; moving it to a dedicated schema is a separate, review
 
 ### Schema 8 (guardrails)
 
-Schema 8 changes `idr_apply_feed_page` only (`docs/GUARDRAILS.md` G5 and G7); no table, grant or cursor rule
-changes, and the sync never halts because of either:
+Schema 8 changes `idr_apply_feed_page`, adds one index and clears invalid stored `page_key` values once
+(`docs/GUARDRAILS.md` G5 and G7); no table, column, grant or cursor rule changes, and the sync never halts
+because of either:
 
 * **Erasure propagation.** An `observation` item whose `company_id` already has a tombstone of this installation
   in `idr_tombstones` is ignored (the resolver never reuses a company id), so a re-applied or replayed page cannot
@@ -78,7 +79,11 @@ changes, and the sync never halts because of either:
   `/`, no `?`, `#`, whitespace or control character), by the function before it writes and again by the SQL
   function. A value that fails it is not stored: the observation is kept with `page_key` null, and the result
   counts it as `page_keys_cleared`. Every value the resolver serves passes. A null `page_key` therefore means
-  either "none sent" (an older contract) or "cleared by the guard"; only the count tells them apart.
+  either "none sent" (an older contract) or "cleared by the guard"; only the count tells them apart. The upgrade
+  to schema 8 also clears, once, every stored `page_key` that fails the rule (an earlier release stored what it
+  was sent); the observations stay, and a re-run changes nothing.
+* **Index.** `idr_tombstones_company_idx` on `idr_tombstones (installation_id, company_id)` supports the tombstone
+  check above (`create index if not exists`, inside the same statement).
 
 Both counts reach the function's response (`"ignored_erased"`, `"page_keys_cleared"`, next to `"observations"`)
 and, when not zero, its log line: counts only, never a value. A non-zero `page_keys_cleared` means the resolver

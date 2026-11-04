@@ -329,3 +329,71 @@ describe("G5: the projection's column catalogue", () => {
     expect(await rawIpCapableColumns(pool)).toEqual([]);
   });
 });
+
+describe("the projection's index catalogue (schema 8: the G7 tombstone lookup)", () => {
+  /**
+   * Every index on an idr_* relation, by name and definition. Changing it is a schema change: review it, then
+   * update. Schema 8 added idr_tombstones_company_idx for idr_apply_feed_page's tombstone check (G7).
+   */
+  const INDEXES: Array<[string, string]> = [
+    ["idr_companies_pkey", "CREATE UNIQUE INDEX idr_companies_pkey ON public.idr_companies USING btree (installation_id, company_id)"],
+    ["idr_observations_company_idx", "CREATE INDEX idr_observations_company_idx ON public.idr_observations USING btree (installation_id, company_id, observed_at)"],
+    ["idr_observations_day_idx", "CREATE INDEX idr_observations_day_idx ON public.idr_observations USING btree (installation_id, observed_at)"],
+    ["idr_observations_pkey", "CREATE UNIQUE INDEX idr_observations_pkey ON public.idr_observations USING btree (installation_id, observation_id)"],
+    ["idr_sync_gaps_one_open_idx", "CREATE UNIQUE INDEX idr_sync_gaps_one_open_idx ON public.idr_sync_gaps USING btree (installation_id, kind) WHERE (resolved_at IS NULL)"],
+    ["idr_sync_gaps_pkey", "CREATE UNIQUE INDEX idr_sync_gaps_pkey ON public.idr_sync_gaps USING btree (id)"],
+    ["idr_sync_state_pkey", "CREATE UNIQUE INDEX idr_sync_state_pkey ON public.idr_sync_state USING btree (installation_id)"],
+    ["idr_tombstones_company_idx", "CREATE INDEX idr_tombstones_company_idx ON public.idr_tombstones USING btree (installation_id, company_id)"],
+    ["idr_tombstones_pkey", "CREATE UNIQUE INDEX idr_tombstones_pkey ON public.idr_tombstones USING btree (installation_id, tombstone_id)"],
+  ];
+  const indexes = async (q: pg.Pool | pg.PoolClient) =>
+    (
+      await q.query<{ n: string; d: string }>(
+        "select indexname as n, indexdef as d from pg_indexes where schemaname = 'public' and tablename like 'idr\\_%' order by 1",
+      )
+    ).rows.map((r) => [r.n, r.d]);
+  /** The plan of idr_apply_feed_page's tombstone check, with sequential scans priced out (the tables are tiny). */
+  const lookupPlan = async (c: pg.PoolClient) => {
+    await c.query("set local enable_seqscan = off");
+    const r = await c.query<{ p: string }>("explain (costs off) select 1 from public.idr_tombstones t where t.installation_id = 'inst' and t.company_id = 7");
+    return r.rows.map((x) => Object.values(x)[0]).join("\n");
+  };
+
+  let pool: pg.Pool;
+  beforeAll(async () => {
+    pool = newPool();
+  });
+  afterAll(async () => {
+    await resetDatabase(pool);
+    await pool.end();
+  });
+
+  it("a fresh install, and a re-run, have exactly these indexes", async () => {
+    await resetDatabase(pool);
+    await ensureProjection(pool);
+    expect(await indexes(pool)).toEqual(INDEXES);
+  });
+
+  it.each(LEGACY.map((l) => [l.name, l.path] as const))("an upgrade from the %s release converges to exactly these indexes", async (_name, path) => {
+    await freshPublicSchema(pool);
+    await ensureProjection(pool, path);
+    expect(await indexes(pool)).not.toContainEqual(INDEXES.find(([n]) => n === "idr_tombstones_company_idx"));
+    await ensureProjection(pool);
+    await ensureProjection(pool);
+    expect(await indexes(pool)).toEqual(INDEXES);
+  });
+
+  it("the tombstone check can use the index (and without it, cannot)", async () => {
+    await resetDatabase(pool);
+    const c = await pool.connect();
+    try {
+      await c.query("begin");
+      expect(await lookupPlan(c)).toMatch(/Index (Only )?Scan using idr_tombstones_company_idx on idr_tombstones/);
+      await c.query("drop index public.idr_tombstones_company_idx");
+      expect(await lookupPlan(c)).not.toContain("idr_tombstones_company_idx");
+    } finally {
+      await c.query("rollback");
+      c.release();
+    }
+  });
+});

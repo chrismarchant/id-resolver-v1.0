@@ -238,6 +238,56 @@ describe.each(["6318ab2", "f12b1ad", "fced2ea", "399aef7", "0b1331e", "92933e2"]
       { id: 4, c: 8, k: null },
     ]);
   });
+
+  it("the upgrade clears every page_key the earlier release stored that fails the rule, keeps the rows and valid keys, and a re-run changes nothing", async () => {
+    await installLegacy(version);
+    // The earlier release stored whatever page_key it was sent (within its 256-character column check).
+    const stored: Array<[number, string | null]> = [
+      [1, "/pricing"],
+      [2, "/checkout?email=someone"],
+      [3, "/page#token"],
+      [4, "/a b"],
+      [5, "no-leading-slash"],
+      [6, ""],
+      [7, "/a\u0001b"],
+      [8, null],
+      [9, `/${"\u{1F600}".repeat(255)}`], // 256 code points (511 UTF-16 units): valid, kept
+      [10, "/caf\u00e9"],
+    ];
+    const valid = new Set([1, 9, 10]);
+    const items = JSON.stringify(stored.map(([id, k]) => obs(id, 8, D, { page_key: k })));
+    const call = hasGenerations(version) ? "select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb, null)" : "select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb)";
+    await asRole(pool, "service_role", (c) => c.query(call, [INSTALLATION, items]));
+    const read = async () =>
+      (await pool.query<{ id: number; k: string | null; x: string }>("select observation_id::int as id, page_key as k, xmin::text as x from public.idr_observations order by 1")).rows;
+    const before = await read();
+    // Seeded as intended: the earlier release kept the invalid values.
+    expect(before.map((r) => [r.id, r.k])).toEqual(stored);
+
+    await ensureProjection(pool);
+    const after = await read();
+    expect(after.map((r) => [r.id, r.k])).toEqual(stored.map(([id, k]) => [id, valid.has(id) ? k : null]));
+    // Only the rows that held a failing value were written; valid keys and nulls were not touched.
+    for (const [i, row] of after.entries()) {
+      const touched = row.x !== before[i]!.x;
+      expect(touched, `observation ${row.id}`).toBe(!valid.has(row.id) && stored[i]![1] !== null);
+    }
+    expect((await counts(pool)).observations).toBe(stored.length);
+
+    // Idempotent: a re-run writes no row at all.
+    await ensureProjection(pool);
+    expect(await read()).toEqual(after);
+  });
+
+  it("the upgrade creates the index that supports the tombstone lookup (G7), once", async () => {
+    await installLegacy(version);
+    const idx = async () =>
+      (await pool.query<{ d: string }>("select indexdef as d from pg_indexes where schemaname = 'public' and indexname = 'idr_tombstones_company_idx'")).rows.map((r) => r.d);
+    expect(await idx()).toEqual([]);
+    await ensureProjection(pool);
+    await ensureProjection(pool);
+    expect(await idx()).toEqual(["CREATE INDEX idr_tombstones_company_idx ON public.idr_tombstones USING btree (installation_id, company_id)"]);
+  });
 });
 
 describe("R3-D: the script is atomic and reports its version last", () => {

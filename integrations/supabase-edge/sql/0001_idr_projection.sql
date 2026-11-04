@@ -76,6 +76,23 @@ create table if not exists public.idr_tombstones (
   received_at     timestamptz not null default now(),
   primary key (installation_id, tombstone_id)
 );
+-- Schema 8 (docs/GUARDRAILS.md G7): idr_apply_feed_page checks, for every
+-- observation, whether its company already has a tombstone of the
+-- installation; this index answers that lookup without scanning the table.
+create index if not exists idr_tombstones_company_idx
+  on public.idr_tombstones (installation_id, company_id);
+
+-- Schema 8 (docs/GUARDRAILS.md G5): a page_key stored by an earlier release
+-- that fails the resolver's own rule (the same test idr_apply_feed_page
+-- applies before it stores one: 1-256 code points, starting with '/', no '?',
+-- '#', whitespace or control character) is cleared, keeping the observation.
+-- Idempotent: it changes rows only the first time it runs after such a
+-- release (a schema 8 install can hold no such value, since the function
+-- clears it before storing), and later runs find nothing to change.
+update public.idr_observations
+   set page_key = null
+ where page_key is not null
+   and not (char_length(page_key) between 1 and 256 and page_key ~ '^/[^?#[:space:][:cntrl:]]*$');
 
 create table if not exists public.idr_sync_state (
   installation_id text primary key,
@@ -370,12 +387,15 @@ $$;
 --     or a replay item that sorts before the tombstone); ignoring it means
 --     nothing can resurrect an erased company. Counted as ignored_erased.
 --   * page_key guard (G5): page_key is re-checked against the resolver's own
---     rule (apps/resolver migration 0005: 1-256 characters, starting with '/',
---     no '?', '#', whitespace or control character). A value that fails it is
---     not stored: the observation is kept with page_key null (the value the
---     contract already allows for older observations), so a query string or
---     other identifier can never land in the projection. Counted as
---     page_keys_cleared.
+--     rule (apps/resolver migration 0005: 1-256 characters, char_length, i.e.
+--     code points; starting with '/', no '?', '#', whitespace or control
+--     character). A value that fails it is not stored: the observation is
+--     kept with page_key null (the value the contract already allows for
+--     older observations), so a query string or other identifier is never
+--     stored by this function; values an earlier release stored are cleared
+--     by the upgrade above. Counted as page_keys_cleared. (The Edge function
+--     applies the same rule before it calls this, so normally nothing
+--     failing reaches it.)
 -- (The four- and five-argument versions of earlier releases are dropped on re-run.)
 drop function if exists public.idr_apply_feed_page(text, text, text, jsonb);
 drop function if exists public.idr_apply_feed_page(text, text, text, jsonb, text);
@@ -771,9 +791,10 @@ grant execute on function public.idr_resolve_sync_gaps(text, text) to service_ro
 -- (The script's one-statement form changes nothing that is installed, so it
 -- does not change this version.)
 -- 8 = this release: idr_apply_feed_page ignores observations of a company
--- already tombstoned for the installation (erasure propagation) and stores a
--- page_key only if it passes the resolver's own rule (docs/GUARDRAILS.md G5,
--- G7). The engine refuses any earlier install. 7 = every function has
+-- already tombstoned for the installation (erasure propagation, with the
+-- index idr_tombstones_company_idx) and stores a page_key only if it passes
+-- the resolver's own rule; the upgrade clears stored values that fail it
+-- (docs/GUARDRAILS.md G5, G7). The engine refuses any earlier install. 7 = every function has
 -- search_path = pg_catalog, pg_temp, so
 -- a caller's temporary schema cannot capture a type name in a SECURITY
 -- DEFINER function (CHR-66 G5R1-M1); idr_begin_resync is the owner's alone
