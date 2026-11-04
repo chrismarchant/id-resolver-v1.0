@@ -101,6 +101,14 @@ name variables, never values. See `.env.example` for every variable.
 * Removed variables are refused rather than silently ignored:
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
+* Three-database separation (`docs/GUARDRAILS.md` G3a): the resolver holds no
+  Supabase credential, URL or project ref. Any `SUPABASE_*` variable is refused
+  by name, and a `DATABASE_URL` whose host (or `host`/`hostaddr` parameter) is
+  under `supabase.co`, `supabase.in` or `supabase.com` (the connection pooler)
+  is refused, by the service, `migrate`, every ops command and
+  `ops:db-tls-fingerprint`, before any connection. The private Supabase project
+  pulls the reporting feed with its own Edge secret; the resolver never
+  connects to it.
 
 ## Database TLS
 
