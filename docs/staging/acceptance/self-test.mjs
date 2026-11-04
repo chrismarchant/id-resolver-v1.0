@@ -2,7 +2,7 @@
 //   node --test docs/staging/acceptance/self-test.mjs
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -434,4 +434,350 @@ test("cf-site-check browser phase: compared and clean is INFO locally (no claim)
   });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stdout, /INFO \[browser \(manual, real browsers\)\] browser: G4-I8 header canary \(local workerd: not the production edge, no claim\) \(no header carried the tester IP \(2 requests, each compared\)\)/);
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// lovable-provenance-check.mjs (CHR-119): end to end against an in-process canary, two stand-in IP-echo servers (one
+// answering with a cf-ray header in the /cdn-cgi/trace `ip=` format, one in plain text without it) and a stand-in site
+// that, for an eligible document navigation, posts an entrance.v1 body to the canary after its response, the way the
+// adapter would. R, F and F2 are documentation addresses: the canary and the stand-ins accept them and --local-probe
+// allows them. A real run REFUSES a documentation-range F: the adapter refuses those addresses, so a forged value that
+// got through would be dropped exactly like an edge rejection.
+const PROV_R = IP;
+const PROV_F = FORGED;
+const PROV_F2 = "192.0.2.10"; // RFC 5737
+const PROV_PAGE = "/landing/prov";
+const RAY = "7a1b2c3d4e5f6a7b-AMS";
+const CASE_IDS = ["P1", "P2", "P3a", "P3b", "P3c", "P3d", "P4", "P5"];
+
+/** Stand-in site. Modes: honest, forged-cf, forged-dup, forged-xff, wrong-ip, edge-reject, wrong-reject, cached-reject, leaky, silent. */
+function provSite(host, canaryPort, mode, R) {
+  const state = { requests: 0, eligible: 0, nonces: new Set(), noCache: 0, dupLines: 0 };
+  let n = 0;
+  const server = http.createServer((req, res) => {
+    state.requests++;
+    const url = new URL(req.url, "http://site.invalid");
+    const h = req.headers;
+    const cf = [];
+    for (let i = 0; i + 1 < req.rawHeaders.length; i += 2) if (req.rawHeaders[i].toLowerCase() === "cf-connecting-ip") cf.push(req.rawHeaders[i + 1]);
+    if (cf.length >= 2) state.dupLines++;
+    if (url.searchParams.has("idrprov")) state.nonces.add(url.searchParams.get("idrprov"));
+    if (h["cache-control"] === "no-cache") state.noCache++;
+    if (/-reject$/.test(mode) && cf.length > 0) {
+      return res.writeHead(403, { "content-type": "text/plain", "cf-ray": RAY, server: "cloudflare" }).end("error code: 1000");
+    }
+    res.writeHead(200, { "content-type": "text/html", "cf-ray": RAY, server: "cloudflare", ...(mode === "cached-reject" ? { "cf-cache-status": "HIT" } : {}) }).end("<!doctype html><html><body>page</body></html>");
+    const eligible = req.method === "GET" && url.pathname === PROV_PAGE && /text\/html/.test(h.accept ?? "") && h["sec-fetch-dest"] === "document" && h["sec-fetch-mode"] === "navigate" && Boolean(h["user-agent"]) && !h.upgrade;
+    if (!eligible || mode === "silent" || mode === "cached-reject") return;
+    state.eligible++;
+    n++;
+    let ip = R;
+    if (mode === "forged-cf" && cf.length > 0) ip = h["cf-connecting-ip"];
+    if (mode === "forged-dup" && cf.length >= 2) ip = cf[1];
+    if (mode === "forged-xff" && h["x-forwarded-for"]) ip = h["x-forwarded-for"].split(",")[0].trim();
+    if (mode === "wrong-ip" || mode === "wrong-reject") ip = `198.51.100.${100 + n}`; // a different address every time
+    const body = JSON.stringify({ contract: "entrance.v1", website_id: "w", ip, entrance_id: `provsite${String(n).padStart(14, "0")}`, occurred_at: "2026-11-04T10:00:00Z", page_key: url.pathname, acquisition: "direct", eligibility: "tsa-1" });
+    const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json", accept: "application/json", "content-length": Buffer.byteLength(body), ...(mode === "leaky" ? { "x-real-ip": R } : {}) };
+    const out = http.request({ host, port: canaryPort, path: "/v1/entrances", method: "POST", headers }, (r) => r.resume());
+    out.on("error", () => {});
+    out.end(body);
+  });
+  return { server, state };
+}
+
+/** Stand-in IP echo: answers[i] for the i-th request (the last one repeats). */
+function echoServer(answers, viaCloudflare) {
+  const state = { requests: 0 };
+  const server = http.createServer((req, res) => {
+    const a = answers[Math.min(state.requests, answers.length - 1)];
+    state.requests++;
+    if (viaCloudflare) res.writeHead(200, { "content-type": "text/plain", "cf-ray": RAY }).end(`fl=1\nh=echo.invalid\nip=${a}\nts=1\n`);
+    else res.writeHead(200, { "content-type": "text/plain" }).end(`${a}\n`);
+  });
+  return { server, state };
+}
+
+const listenOn = (server, host) => new Promise((r) => server.listen(0, host, () => r(server.address().port)));
+const closeServer = async (server) => {
+  server.closeAllConnections();
+  await new Promise((r) => server.close(r));
+};
+function spawnScript(script, argv, env) {
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [join(HERE, script), ...argv], { env: { PATH: process.env.PATH, ...env } });
+    let stdout = "";
+    let stderr = "";
+    p.stdout.on("data", (d) => (stdout += d));
+    p.stderr.on("data", (d) => (stderr += d));
+    p.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+/** One run of the script against the stand-ins (one stand-in site per mode); returns its output plus what each stand-in received. */
+async function runProv({ mode = "honest", family = 4, echo = [[PROV_R], [PROV_R]], echoRay = [true, false], env = {}, argv = (a) => a, forged } = {}) {
+  const host = family === 6 ? "::1" : "127.0.0.1";
+  const urlHost = family === 6 ? "[::1]" : "127.0.0.1";
+  const R = echo[0][0];
+  const [F, F2] = forged ?? (family === 6 ? ["2001:db8::9", "2001:db8::a"] : [PROV_F, PROV_F2]);
+  const { server: canary } = createCanary(loadConfig({ CANARY_TOKEN: TOKEN, CANARY_BIND: host, PORT: "1", CANARY_FORGED_IP: F }));
+  let canaryHits = 0;
+  canary.on("request", () => canaryHits++);
+  const canaryPort = await listenOn(canary, host);
+  const sites = [mode].flat().map((m) => provSite(host, canaryPort, m, R));
+  const sitePorts = [];
+  for (const s of sites) sitePorts.push(await listenOn(s.server, host));
+  const e1 = echoServer(echo[0], echoRay[0]);
+  const e2 = echoServer(echo[1], echoRay[1]);
+  const [p1, p2] = [await listenOn(e1.server, host), await listenOn(e2.server, host)];
+  const dir = mkdtempSync(join(tmpdir(), "idr-prov-"));
+  const outFile = join(dir, "prov.json");
+  try {
+    const fullEnv = {
+      PROV_SITE_URLS: sitePorts.map((p) => `http://${urlHost}:${p}`).join(","),
+      PROV_PAGE_PATH: PROV_PAGE,
+      PROV_CANARY_URL: `http://${urlHost}:${canaryPort}`,
+      PROV_CANARY_TOKEN: TOKEN,
+      PROV_ECHO_URLS: `http://${urlHost}:${p1}/cdn-cgi/trace,http://${urlHost}:${p2}/ip`,
+      ...(family === 6 ? { PROV_FORGED_IP6: F, PROV_FORGED_IP6B: F2 } : { PROV_FORGED_IP: F, PROV_FORGED_IP2: F2 }),
+      ...env,
+    };
+    const base = ["--local-probe", "--family", String(family), "--network-label", "selftest", "--confirm-target", sitePorts.map((p) => `${urlHost}:${p}`).reverse().join(","), "--out", outFile, "--poll-timeout-s", "1", "--settle-ms", "150", "--delay-ms", "0"];
+    const r = await spawnScript("lovable-provenance-check.mjs", argv(base), fullEnv);
+    let file = "";
+    let fileMode = null;
+    try {
+      file = readFileSync(outFile, "utf8");
+      fileMode = statSync(outFile).mode & 0o777;
+    } catch {
+      /* no file (refusal) */
+    }
+    return { ...r, file, fileMode, site: sites[0].state, sites: sites.map((s) => s.state), echoHits: [e1.state.requests, e2.state.requests], canaryHits };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    for (const s of [...sites.map((x) => x.server), canary, e1.server, e2.server]) await closeServer(s);
+  }
+}
+
+/** Nothing the script prints or writes holds an IP literal (any spelling), a test address, a loopback host or the token. */
+function assertNoProvLeak(r) {
+  for (const [where, text] of [["stdout", r.stdout], ["stderr", r.stderr], ["--out file", r.file]]) {
+    assert.deepEqual(ipLiterals(text), [], `${where} holds no IP literal`);
+    for (const s of ["198.51.100", "203.0.113", "192.0.2.", "2001:db8", "127.0.0.1", TOKEN]) assert.ok(!text.toLowerCase().includes(s), `${where} must not contain ${s}`);
+  }
+}
+const caseRe = (id, http, cfError, entrances, verdict, reason, site = "<site1>") => new RegExp(`^${site} net=selftest IPv4 ${id} http=${http} cf-error=${cfError} entrances=${entrances} => ${verdict}: ${reason}$`, "m");
+
+test("lovable-provenance-check: refusals exit 2 and send nothing", async () => {
+  let hits = 0;
+  const servers = Array.from({ length: 4 }, () => http.createServer((q, s) => (hits++, s.end("x"))));
+  const ports = [];
+  for (const s of servers) ports.push(await listenOn(s, "127.0.0.1"));
+  const L = {
+    PROV_SITE_URLS: `http://127.0.0.1:${ports[0]}`,
+    PROV_PAGE_PATH: PROV_PAGE,
+    PROV_CANARY_URL: `http://127.0.0.1:${ports[1]}`,
+    PROV_CANARY_TOKEN: TOKEN,
+    PROV_ECHO_URLS: `http://127.0.0.1:${ports[2]}/ip,http://127.0.0.1:${ports[3]}/ip`,
+    PROV_FORGED_IP: PROV_F,
+    PROV_FORGED_IP2: PROV_F2,
+  };
+  const site = `127.0.0.1:${ports[0]}`;
+  const ok = ["--local-probe", "--family", "4", "--network-label", "selftest", "--confirm-target", site];
+  const HTTPS = { ...L, PROV_SITE_URLS: "https://staging.example.com,https://www.example.com", PROV_CANARY_URL: "https://canary.example.org", PROV_ECHO_URLS: "https://echo-a.example.net/ip,https://echo-b.example.org/ip" };
+  const httpsArgs = ["--family", "4", "--network-label", "home", "--confirm-target", "www.example.com,staging.example.com"];
+  const refusals = [
+    ["no variables", {}, ["--family", "4", "--network-label", "x", "--confirm-target", site], /missing required environment variable\(s\): PROV_SITE_URLS, PROV_PAGE_PATH, PROV_CANARY_URL, PROV_CANARY_TOKEN, PROV_ECHO_URLS, PROV_FORGED_IP, PROV_FORGED_IP2/],
+    ["no --family", L, ok.filter((a, i) => i !== 1 && i !== 2), /--family 4 or --family 6/],
+    ["IPv6 run without the IPv6 forged values", L, ok.map((a) => (a === "4" ? "6" : a)), /PROV_FORGED_IP6, PROV_FORGED_IP6B/],
+    ["http without --local-probe", L, ok.slice(1), /must use https/],
+    ["no --confirm-target", L, ok.slice(0, -2), /--confirm-target <host> is required/],
+    ["mismatched --confirm-target", L, [...ok.slice(0, -1), "127.0.0.1:1"], /does not match/],
+    ["only one of two entry points confirmed", HTTPS, [...httpsArgs.slice(0, -1), "staging.example.com"], /must name every entry-point host \(2\)/],
+    ["a wrong host among two confirmed", HTTPS, [...httpsArgs.slice(0, -1), "staging.example.com,other.example.com"], /does not match/],
+    ["documentation-range F outside --local-probe", HTTPS, httpsArgs, /PROV_FORGED_IP is in a documentation range .*The adapter refuses those addresses/],
+    ["a private F", { ...HTTPS, PROV_FORGED_IP: "10.1.2.3" }, httpsArgs, /PROV_FORGED_IP is private, reserved or otherwise not public/],
+    ["F equal to PROV_TESTER_IP", { ...L, PROV_TESTER_IP: PROV_F }, ok, /a forged value equals PROV_TESTER_IP/],
+    ["F equal to F2", { ...L, PROV_FORGED_IP2: PROV_F }, ok, /must differ/],
+    ["an address as network label", L, ok.map((a) => (a === "selftest" ? PROV_R : a)), /--network-label is required/],
+    ["an unknown flag", L, [...ok, "--confirm-targt", site], /unknown or positional argument/],
+    ["an ineligible page path", { ...L, PROV_PAGE_PATH: "/api/page" }, ok, /never reports/],
+    ["a placeholder", { ...L, PROV_CANARY_URL: "https://<canary-host>" }, ok, /still contains a <placeholder>/],
+    ["a short canary token", { ...L, PROV_CANARY_TOKEN: "short" }, ok, /at least 32 printable characters/],
+    ["an echo URL on the site's host", { ...L, PROV_ECHO_URLS: `http://${site}/ip,http://127.0.0.1:${ports[3]}/ip` }, ok, /distinct hosts/],
+  ];
+  try {
+    for (const [name, env, argv, re] of refusals) {
+      const r = await spawnScript("lovable-provenance-check.mjs", argv, env);
+      assert.equal(r.status, 2, `${name}: ${r.stdout}${r.stderr}`);
+      assert.match(r.stderr, /^refused: /, name);
+      assert.match(r.stderr, re, name);
+      assert.equal(r.stdout, "", name);
+      assert.deepEqual(ipLiterals(r.stderr), [], `${name}: no IP in the refusal`);
+      assert.ok(!r.stderr.includes(TOKEN), name);
+    }
+    const dry = await spawnScript("lovable-provenance-check.mjs", ["--dry-run", ...ok], L);
+    assert.equal(dry.status, 0, dry.stderr);
+    assert.match(dry.stdout, /^dry-run: configuration valid; nothing was sent$/m);
+    assert.match(dry.stdout, /entry points <site1>; per entry point, serially: P1, P2, P3a, P3b, P3c, P3d, P4, P5, then P7/);
+    assertNoProvLeak({ ...dry, file: "" });
+    assert.equal(hits, 0, "no refusal and no dry run contacted any server");
+  } finally {
+    for (const s of servers) await closeServer(s);
+  }
+});
+
+test("lovable-provenance-check: an honest site (the edge sets R) is a PASS on every case; duplicates go out as two raw lines", async () => {
+  const r = await runProv({ mode: "honest" });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  for (const id of CASE_IDS) assert.match(r.stdout, caseRe(id, 200, "-", 1, "PASS", "ip == R"), id);
+  assert.match(r.stdout, /^echo start \(IPv4\): <echo1> via_cloudflare=true, <echo2> via_cloudflare=false: agree$/m);
+  assert.match(r.stdout, /^canary: token accepted, records compared; its CANARY_FORGED_IP is this run's F: the forged flag corroborates$/m);
+  assert.match(r.stdout, /^<site1> net=selftest IPv4 P7 runtime => INFO: cf-ray present=true value=7a1b2c3d4e5f6a7b-AMS; server cloudflare=true/m);
+  assert.match(r.stdout, /^<site1> net=selftest IPv4 headers => INFO: names on the entrance subrequest\(s\) at the canary: accept, authorization, connection, content-length, content-type, host; outside the allowlist \(review\): none$/m);
+  assert.match(r.stdout, /^echo end \(IPv4\): .*: agree, and equal to the start$/m);
+  assert.match(r.stdout, /^overall: PASS \(8 of 8 cases run: 8 PASS, 0 FAIL, 0 HOLD, 0 INCONCLUSIVE; 0 run problem\(s\)\) \[local probe: stand-in servers, no claim about any platform\]$/m);
+  assert.deepEqual([r.site.requests, r.site.eligible, r.site.nonces.size, r.site.noCache, r.site.dupLines], [8, 8, 8, 8, 1], "serial, eligible, cache-busted, no-cache, P4 as two raw header lines");
+  assert.deepEqual(r.echoHits, [2, 2], "every echo URL at start and at end");
+  assert.equal(r.fileMode, 0o600);
+  const doc = JSON.parse(r.file);
+  assert.deepEqual([doc.overall, doc.cases.length, doc.canaryForgedIsF, doc.echo.start.map((e) => e.viaCloudflare)], ["PASS", 8, true, [true, false]]);
+  assert.deepEqual(doc.headerNames["<site1>"].outsideAllowlist, []);
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check: a site that selects a forged value FAILS on that case and stops", async () => {
+  const table = [
+    ["forged-cf", "P2", 2, "canary forged flag true: F was selected"],
+    ["forged-xff", "P3a", 3, "canary forged flag true: F was selected"],
+    ["forged-dup", "P4", 7, "canary forged flag false: not F and not R \\(F2 or another value\\), counted as forged"],
+  ];
+  for (const [mode, id, ran, note] of table) {
+    const r = await runProv({ mode });
+    assert.equal(r.status, 1, `${mode}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, caseRe(id, 200, "-", 1, "FAIL", `entrance ip != R \\(${note}\\)`), mode);
+    assert.match(r.stdout, new RegExp(`^overall: FAIL \\(${ran} of 8 cases run: ${ran - 1} PASS, 1 FAIL`, "m"), mode);
+    assert.equal(r.site.requests, ran, `${mode}: the run stops at the FAIL`);
+    assert.deepEqual(r.echoHits, [2, 2], `${mode}: the end egress check still runs`);
+    assertNoProvLeak(r);
+  }
+});
+
+test("lovable-provenance-check: a wrong clean-request IP is a HOLD on P1, never a PASS", async () => {
+  const r = await runProv({ mode: "wrong-ip" });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, caseRe("P1", 200, "-", 1, "HOLD", "entrance ip != R: wrong provenance, investigate"));
+  // Conservative by design: in a forged case any ip != R is a FAIL (the canary knows one forged value only).
+  assert.match(r.stdout, caseRe("P2", 200, "-", 1, "FAIL", "entrance ip != R \\(canary forged flag false: .*\\)"));
+  assert.match(r.stdout, /^overall: FAIL /m);
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check: an edge rejection counts only with a passing P1 on the same entry point", async () => {
+  const ok = await runProv({ mode: "edge-reject" });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  for (const id of ["P2", "P4", "P5"]) assert.match(ok.stdout, caseRe(id, 403, 1000, 0, "PASS", "edge rejection \\(HTTP 403, Cloudflare error 1000\\); P1 passed on this entry point"), id);
+  for (const id of ["P1", "P3a", "P3b", "P3c", "P3d"]) assert.match(ok.stdout, caseRe(id, 200, "-", 1, "PASS", "ip == R"), id);
+  assert.match(ok.stdout, /^overall: PASS \(8 of 8 cases run: 8 PASS/m);
+  assertNoProvLeak(ok);
+
+  const bad = await runProv({ mode: "wrong-reject" });
+  assert.notEqual(bad.status, 0, bad.stdout + bad.stderr);
+  assert.match(bad.stdout, caseRe("P1", 200, "-", 1, "HOLD", "entrance ip != R: wrong provenance, investigate"));
+  assert.match(bad.stdout, caseRe("P2", 403, 1000, 0, "INCONCLUSIVE", "edge rejection \\(HTTP 403, Cloudflare error 1000\\) and P1 did not pass on this entry point"));
+  assert.ok(!/^overall: PASS/m.test(bad.stdout), bad.stdout);
+  assertNoProvLeak(bad);
+});
+
+test("lovable-provenance-check: a subrequest header carrying the visitor IP is a G4-I8 FAIL", async () => {
+  const r = await runProv({ mode: "leaky" });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, caseRe("P1", 200, "-", 1, "FAIL", "G4-I8: header\\(s\\) x-real-ip on the subrequest carry a visitor IP"));
+  assert.match(r.stdout, /^overall: FAIL \(1 of 8 cases run/m);
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check: no entrance at all is INCONCLUSIVE, overall HOLD", async () => {
+  const r = await runProv({ mode: "silent" });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, caseRe("P1", 200, "-", 0, "INCONCLUSIVE", "2xx page but no entrance within 1 s"));
+  assert.match(r.stdout, caseRe("P4", 200, "-", 0, "INCONCLUSIVE", "2xx page, no entrance, and P1 did not pass on this entry point"));
+  assert.match(r.stdout, /^overall: HOLD \(8 of 8 cases run: 0 PASS, 0 FAIL, 0 HOLD, 8 INCONCLUSIVE/m);
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check: echo disagreement, a Cloudflare-only ground truth, or a moved egress is never a PASS", async () => {
+  const other = "198.51.100.8";
+  const start = await runProv({ echo: [[PROV_R], [other]] });
+  assert.equal(start.status, 1, start.stdout + start.stderr);
+  assert.match(start.stdout, /^echo start \(IPv4\): <echo1> via_cloudflare=true, <echo2> via_cloudflare=false: the echo answers disagree$/m);
+  assert.match(start.stdout, /^overall: HOLD \(0 of 8 cases run/m);
+  assert.deepEqual([start.site.requests, start.canaryHits], [0, 0], "stopped before contacting the site or the canary");
+  assertNoProvLeak(start);
+
+  const cfOnly = await runProv({ echoRay: [true, true] });
+  assert.equal(cfOnly.status, 1);
+  assert.match(cfOnly.stdout, /no echo answer came from outside Cloudflare/);
+  assert.deepEqual([cfOnly.site.requests, cfOnly.canaryHits], [0, 0]);
+
+  const moved = await runProv({ echo: [[PROV_R, other], [PROV_R, other]] });
+  assert.equal(moved.status, 1, moved.stdout + moved.stderr);
+  assert.match(moved.stdout, /^echo end \(IPv4\): .*: the address changed during the run$/m);
+  assert.match(moved.stdout, /^overall: HOLD \(8 of 8 cases run: 8 PASS, 0 FAIL, 0 HOLD, 0 INCONCLUSIVE; 1 run problem\(s\)\)/m);
+  assertNoProvLeak(moved);
+
+  const tester = await runProv({ env: { PROV_TESTER_IP: other } });
+  assert.equal(tester.status, 1);
+  assert.match(tester.stdout, /PROV_TESTER_IP differs from the echoed address/);
+  assert.deepEqual([tester.site.requests, tester.canaryHits], [0, 0]);
+  assertNoProvLeak(tester);
+});
+
+test("lovable-provenance-check: F equal to the echoed R, or a family the servers cannot answer, stops before the site", async () => {
+  const same = await runProv({ forged: [PROV_R, PROV_F2] });
+  assert.equal(same.status, 2, same.stdout + same.stderr);
+  assert.match(same.stdout, /a forged value equals the tester's own address R/);
+  assert.match(same.stdout, /^overall: CONFIG-ERROR/m);
+  assert.deepEqual([same.site.requests, same.canaryHits], [0, 0], "nothing sent to the site or the canary");
+  assertNoProvLeak(same);
+
+  // --family 6 against IPv4-only stand-ins: every request is pinned and the socket family is checked (EFAMILY).
+  const fam = await runProv({ env: { PROV_FORGED_IP6: "2001:db8::9", PROV_FORGED_IP6B: "2001:db8::a" }, argv: (a) => a.map((x) => (x === "4" ? "6" : x)) });
+  assert.equal(fam.status, 1, fam.stdout + fam.stderr);
+  assert.match(fam.stdout, /^echo start \(IPv6\): <echo1> via_cloudflare=unknown, <echo2> via_cloudflare=unknown: <echo1>: EFAMILY; <echo2>: EFAMILY/m);
+  assert.deepEqual([fam.site.requests, fam.canaryHits], [0, 0]);
+  assertNoProvLeak(fam);
+});
+
+test("lovable-provenance-check: two entry points; P1 gates edge rejections per entry point; a cache HIT is not evidence", async () => {
+  const r = await runProv({ mode: ["honest", "cached-reject"] });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  for (const id of CASE_IDS) assert.match(r.stdout, caseRe(id, 200, "-", 1, "PASS", "ip == R"), `<site1> ${id}`);
+  const s2 = (id, http, cfError, reason) => assert.match(r.stdout, caseRe(id, http, cfError, 0, "INCONCLUSIVE", reason, "<site2>"), `<site2> ${id}`);
+  s2("P1", 200, "-", "served from cache \\(cf-cache-status HIT\\), no entrance \\[cf-cache-status HIT\\]");
+  s2("P3a", 200, "-", "served from cache \\(cf-cache-status HIT\\), no entrance \\[cf-cache-status HIT\\]");
+  for (const id of ["P2", "P4", "P5"]) s2(id, 403, 1000, "edge rejection \\(HTTP 403, Cloudflare error 1000\\) and P1 did not pass on this entry point");
+  assert.match(r.stdout, /^<site2> net=selftest IPv4 headers => INFO: no entrance reached the canary: no header evidence$/m);
+  assert.match(r.stdout, /^overall: HOLD \(16 of 16 cases run: 8 PASS, 0 FAIL, 0 HOLD, 8 INCONCLUSIVE/m);
+  assert.deepEqual(r.sites.map((s) => s.requests), [8, 8]);
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check: a canary that refuses the token is a configuration error before the site is contacted", async () => {
+  const r = await runProv({ env: { PROV_CANARY_TOKEN: `${TOKEN}0123456789abcdef` } }); // a different (longer) synthetic token
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stdout, /canary self-check failed \(CANARY_HTTP_401\): stopped before contacting the site/);
+  assert.equal(r.site.requests, 0);
+  assertNoProvLeak(r); // also covers the wrong token, which starts with TOKEN
+});
+
+test("lovable-provenance-check: IPv6 (P6) honest run over ::1 is a PASS", async (t) => {
+  const probe = http.createServer();
+  const v6 = await new Promise((r) => probe.once("error", () => r(false)).listen(0, "::1", () => probe.close(() => r(true))));
+  if (!v6) return t.skip("no IPv6 loopback in this environment");
+  const r = await runProv({ family: 6, echo: [["2001:db8::7"], ["2001:DB8:0:0::7"]] });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  for (const id of CASE_IDS) assert.match(r.stdout, new RegExp(`^<site1> net=selftest IPv6 P6-${id} http=200 cf-error=- entrances=1 => PASS: ip == R$`, "m"), id);
+  assert.match(r.stdout, /^overall: PASS /m);
+  assert.ok(!/::1|\[::/.test(r.stdout + r.file));
+  assertNoProvLeak(r);
 });
