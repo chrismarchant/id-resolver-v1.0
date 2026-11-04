@@ -55,14 +55,30 @@ and into the real collector bundle, and is detected.
 
 ## G3: fail-closed configuration refuses cross-environment targets
 
-**(a) Resolver (B).** `loadConfig`, `migrate`, every `ops:*` command and `ops:db-tls-fingerprint` refuse, before any
-connection: any variable named `SUPABASE_*` (case-insensitive; the message names the variable, never its value),
-and a `DATABASE_URL` whose host, or `host`/`hostaddr` query parameter (which node-postgres and libpq let override
-it), is under `supabase.co`, `supabase.in` or `supabase.com` (percent-encoding, case, trailing dots and libpq host
-lists handled). Fixed messages, following the `REMOVED_VARIABLES` pattern.
+**(a) Resolver (B).** `loadConfig`, `migrate`, every `ops:*` command and `ops:db-tls-fingerprint` run one shared
+check (`assertNoSupabaseConfiguration`) and refuse, before any connection:
+
+* any variable named `SUPABASE_*` (case-insensitive; the message names the variable, never its value);
+* a `DATABASE_URL` whose host, or `host`/`hostaddr` query parameter (which node-postgres and libpq let override
+  it), is under `supabase.co`, `supabase.in` or `supabase.com` (percent-encoding, case, trailing dots and libpq host
+  lists handled);
+* a `DATABASE_URL` that names **no host** (for example `postgres:///railway?user=…`, or only `hostaddr`, which
+  node-postgres ignores): node-postgres would then connect to `PGHOST`, so the host check above could be bypassed.
+  The resolver always names its own PostgreSQL host; a Unix socket directory given as the host or `host` parameter
+  is a host. The rule mirrors `pg-connection-string` (the last non-empty `host` parameter, else the URL's host),
+  and a test compares it with node-postgres itself;
+* `PGHOST` or `PGHOSTADDR` naming a Supabase host (host lists handled). Any other value is left alone, on purpose:
+  with a host in `DATABASE_URL`, node-postgres never reads `PGHOST`, and Railway's PostgreSQL service exposes a
+  `PGHOST` that a deployment may reference, so refusing every `PGHOST` would break a correct configuration for no
+  gain. libpq tools (`psql`) read both variables, hence both are checked;
+* an `ENRICH_API_BASE_URL` (the provider base URL, the only other outbound URL in the configuration) on a Supabase
+  host, so no privileged cross-project connection can be configured there either.
+
+Fixed messages, following the `REMOVED_VARIABLES` pattern.
 Files: `apps/resolver/src/config/index.ts`, `src/db/migrate.ts`, `src/ops/env.ts`, `src/ops/db-tls-fingerprint.ts`;
-test `apps/resolver/test/unit/supabase-separation.test.ts` (each path, the migrate CLI exiting before it connects,
-look-alike hosts accepted).
+test `apps/resolver/test/unit/supabase-separation.test.ts` (each path, the migrate and fingerprint CLIs exiting
+before they connect, the host-less bypass shown against node-postgres and refused, look-alike hosts and other
+`PGHOST` values accepted).
 
 **(b) Adapter (A).** A `resolverUrl` on a host under those domains is invalid configuration like any other:
 eager options throw at creation with a fixed message, lazy options disable reporting with `config_invalid` and
