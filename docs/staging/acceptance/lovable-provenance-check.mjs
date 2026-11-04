@@ -17,8 +17,8 @@
 //   P4a, P4b two CF-Connecting-IP lines, (F, F2) and (F2, F) | P5 control CF-Connecting-IP: R
 //   P6 = all of these with --family 6, forging the canary's F over IPv6 | P7 runtime evidence from the P1 response
 // Verdicts (README, "lovable-provenance-check"): FAIL only when the canary identifies the forged value (its forged
-// flag, or a subrequest header carrying it) or a subrequest header carries a visitor IP (G4-I8); any other address
-// than R is a HOLD. An edge rejection counts for P2 and P4 only, and only as a 4xx with cf-ray and an allowed
+// flag, or a subrequest header carrying it; in any window, since only this script sends F) or a subrequest header
+// carries a visitor IP (G4-I8); any other address than R is a HOLD. An edge rejection counts for P2 and P4 only, and only as a 4xx with cf-ray and an allowed
 // Cloudflare code (PROV_EDGE_REJECT_CODES, default 1000), after a passing P1 and followed by a fresh passing baseline.
 // Overall PASS only when every case on every entry point is provider-controlled and G4-I8 coverage at the canary is
 // complete; the first FAIL stops the run.
@@ -45,8 +45,11 @@
 //   any request to the site: a forged value equal to R, a canary that refuses the token, a canary without F. No IP
 //   address, token or host is printed or written (hosts appear as <site1>, <canary>, <echo1>; every line and the --out
 //   file pass the redactor). R lives in memory only: it goes to the canary's /_canary/expect and, in the P5 control,
-//   to the site as CF-Connecting-IP. Network errors are reported by code only. The canary is reset on every exit path.
-// Exit: 0 PASS, 1 FAIL or HOLD, 2 refusal or configuration error.
+//   to the site as CF-Connecting-IP. Network errors are reported by code only. After the first canary contact the canary
+//   is reset when the run ends (PASS, FAIL, HOLD, an error or a configuration error) and on SIGINT or SIGTERM (best
+//   effort, about 5 s; verdict INTERRUPTED, exit 130). A delivery still in flight from the site can reach the canary
+//   after that reset, and a crash or SIGKILL leaves the canary as it is until its next reset or restart.
+// Exit: 0 PASS, 1 FAIL or HOLD, 2 refusal or configuration error, 130 interrupted.
 //
 //   export PROV_SITE_URLS=https://<project>.lovable.app,https://<custom-domain> PROV_PAGE_PATH=/ \
 //          PROV_CANARY_URL=https://<canary-host> PROV_ECHO_URLS=https://<echo-host-a>/<path>,https://<echo-host-b>/<path> \
@@ -368,16 +371,25 @@ function pinnedRequest(url, { method = "GET", headers = {}, body, maxBody = 65_5
 }
 
 let canaryContacted = false;
+let canaryInFlight = 0;
+let interrupted = false; // set by SIGINT/SIGTERM: from then on only the signal handler's final reset reaches the canary
 const canary = {
-  async call(method, path, body, extra = {}) {
+  async call(method, path, body, extra = {}, { final = false } = {}) {
+    if (interrupted && !final) throw codeError("INTERRUPTED");
     canaryContacted = true;
-    const r = await pinnedRequest(new URL(path, cfg.canary), {
-      method,
-      headers: { ...extra, authorization: `Bearer ${cfg.token}`, "content-type": "application/json", accept: "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      maxBody: 16 << 20,
-      anyFamily: cfg.canaryAnyFamily,
-    });
+    canaryInFlight++;
+    let r;
+    try {
+      r = await pinnedRequest(new URL(path, cfg.canary), {
+        method,
+        headers: { ...extra, authorization: `Bearer ${cfg.token}`, "content-type": "application/json", accept: "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        maxBody: 16 << 20,
+        anyFamily: cfg.canaryAnyFamily,
+      });
+    } finally {
+      canaryInFlight--;
+    }
     if (r.status >= 300) throw codeError(`CANARY_HTTP_${r.status}`);
     if (!r.body) return null;
     try {
@@ -485,29 +497,35 @@ let fx = null; // the forged values of this run: the canary's value F (or F6) an
 const uniq = (xs) => [...new Set(xs)].sort().join(", ");
 
 /**
+ * F at the canary, in any window but the pre-flight (whose synthetic entrance the reset after it clears): only this
+ * script sends F, and only to the site, so F reaching the canary means the site accepted a forged value.
+ */
+function forgedSeen(recs) {
+  if (recs.some((r) => r.ip?.matchesForged === true)) return `the canary identified ${fx.name} as the entrance ip: a client-forged value was selected`;
+  const carried = uniq(recs.flatMap((r) => r.headersWithForgedIp ?? []));
+  return carried ? `header(s) ${carried} on the subrequest carry ${fx.name}: a client-supplied value reached the resolver` : null;
+}
+
+/**
  * The verdict for one case: [verdict, reason, basis]. PENDING means a PASS that still needs a fresh baseline right
  * after it (an edge rejection, or P4 without an entrance). Only records for PROV_PAGE_PATH count for the case.
  */
 function evaluate(c, ctx, p1Passed) {
   const { resp, errCode, res } = ctx;
   const recs = res.records;
-  const id = ID(c.id);
+  const id = c === REBASE ? "the re-baseline" : ID(c.id);
   const leak = uniq(recs.flatMap((r) => r.headersWithClientIp ?? []));
   if (leak) return ["FAIL", `G4-I8: header(s) ${leak} on the subrequest carry a visitor IP`];
+  const hit = forgedSeen(recs); // clean cases, re-baselines and the zero-record check included
+  if (hit) return ["FAIL", hit];
   if (ctx.notSent) return ["INCONCLUSIVE", `foreign traffic: ${recs.length} record(s) at the canary right after the reset${res.expectationSet === true ? "" : ", and no expectation"}; the request was not sent`];
   const ours = recs.filter((r) => r.route === "entrances" && r.pageKey === cfg.pageKey);
-  if (c.forged) {
-    if (ours.some((r) => r.ip?.matchesForged === true)) return ["FAIL", `the canary identified ${fx.name} as the entrance ip: a client-forged value was selected`];
-    const carried = uniq(ours.flatMap((r) => r.headersWithForgedIp ?? []));
-    if (carried) return ["FAIL", `header(s) ${carried} on the subrequest carry ${fx.name}: a client-supplied value reached the resolver`];
-  }
   const n = new Set(ours.map((r) => r.id)).size;
   const ok2xx = resp !== null && resp.status >= 200 && resp.status < 300;
   const notes = [];
   if (ours.some((r) => r.ip?.present === true && r.ip.matchesExpected !== true)) notes.push(c.forged ? `unexpected address in ${id}: neither R nor ${fx.name} (the canary cannot name it)` : `entrance ip != R in ${id}: wrong provenance, investigate`);
   if (ours.some((r) => r.ip?.present !== true)) notes.push("an entrance without an ip field");
   if (n > 1) notes.push(`${n} entrances for one request`);
-  if (!c.forged && ours.some((r) => (r.headersWithForgedIp ?? []).length > 0)) notes.push("a subrequest header carries the canary's forged value in a clean case");
   if (recs.some((r) => r.compared !== true)) notes.push("record(s) the canary could not compare");
   if (ours.some((r) => r.bodyContainsClientIp === true)) notes.push("a visitor IP elsewhere in the entrance body");
   if (res.expectationSet !== true) notes.push("the canary lost the expected IP (reset by another client?)");
@@ -531,6 +549,7 @@ function evaluate(c, ctx, p1Passed) {
   const edge = edgeRejection(resp);
   const code = cfErrorCode(resp);
   const seen = `HTTP ${resp.status}${code !== null ? `, Cloudflare error ${code}` : ""}`;
+  if (c === REBASE) return ["INCONCLUSIVE", why(`${seen}: the clean re-baseline was refused as well`)];
   if (!c.edge) return ["INCONCLUSIVE", why(`${seen}: an edge rejection does not count for ${id} (owner's matrix: P2 and P4 only)`)];
   if (!edge.ok) return ["INCONCLUSIVE", why(`${seen}: not a qualifying edge rejection (${edge.why})`)];
   if (!p1Passed) return ["INCONCLUSIVE", why(`edge rejection (${edge.why}), and P1 did not pass on this entry point`)];
@@ -571,11 +590,12 @@ const summarize = (records) =>
 
 /**
  * Records that reached the canary for the last scored probe after it was scored. A late record that identifies F or
- * carries a visitor IP is a FAIL; any other late record (or a canary reset by someone else) makes the case a HOLD.
+ * carries a visitor IP is a FAIL, whatever the case; any other late record (or a canary reset by someone else) makes
+ * the case a HOLD.
  */
 async function lateCheck() {
   if (!last) return;
-  const { entry, c, count } = last;
+  const { entry, count } = last;
   last = null;
   const res = await canary.results();
   const extra = res.records.slice(count);
@@ -584,9 +604,9 @@ async function lateCheck() {
   if (res.records.length < count || res.expectationSet !== true) [v, why] = ["HOLD", "the canary was reset by another client after the case was scored (one run at a time per canary)"];
   else if (extra.length > 0) {
     const leak = uniq(extra.flatMap((r) => r.headersWithClientIp ?? []));
-    const forged = c.forged && extra.some((r) => r.pageKey === cfg.pageKey && (r.ip?.matchesForged === true || (r.headersWithForgedIp ?? []).length > 0));
+    const hit = forgedSeen(extra); // after any case, clean ones and re-baselines included
     if (leak) [v, why] = ["FAIL", `late record: G4-I8, header(s) ${leak} carry a visitor IP`];
-    else if (forged) [v, why] = ["FAIL", `late entrance: the canary identified ${fx.name}`];
+    else if (hit) [v, why] = ["FAIL", `late record: ${hit}`];
     else [v, why] = ["HOLD", `late entrance: ${extra.length} record(s) arrived after the case was scored`];
   }
   if (!v) return;
@@ -623,7 +643,8 @@ const entrancesOf = (ctx) => new Set(ctx.res.records.filter((r) => r.route === "
 async function runCase(label, site, c, p1Passed) {
   const ctx = await probe(site, c);
   if (!ctx) return null;
-  const [v, reason, basis] = evaluate(c, ctx, p1Passed);
+  // Read after probe(): its late check may just have turned P1 into a HOLD, which retracts the P1 gate.
+  const [v, reason, basis] = evaluate(c, ctx, p1Passed());
   const entry = { site: label, id: ID(c.id), forged: c.forged === true, http: httpText(ctx), cfError: cfErrorCode(ctx.resp), cfCacheStatus: cacheStatus(ctx.resp), entrances: entrancesOf(ctx), verdict: v, reason, basis: null, records: summarize(ctx.res.records) };
   report.cases.push(entry);
   last = { entry, c, count: ctx.res.records.length };
@@ -659,7 +680,7 @@ async function runSite(label, site) {
   const start = report.cases.length;
   for (const c of CASES) {
     if (report.stop) break;
-    const entry = await runCase(label, site, c, p1?.verdict === "PASS");
+    const entry = await runCase(label, site, c, () => p1?.verdict === "PASS");
     if (c.id === "P1") p1 = entry;
     if (report.stop) break;
     if (cfg.delayMs > 0) await sleep(cfg.delayMs);
@@ -743,13 +764,62 @@ async function main() {
   if (end.problems.length > 0 || moved) problem("egress check at end failed: the results cannot be tied to R (a FAIL above stays a FAIL; rerun)");
 }
 
+const planned = cfg.sites.length * CASES.length;
+const count = (v) => report.cases.filter((c) => c.verdict === v).length;
+const byBasis = (b) => report.cases.filter((c) => c.verdict === "PASS" && c.basis === b).length;
+const tally = () => ({ pass: count("PASS"), pass_by_edge_rejection: byBasis("edge_rejection"), pass_by_adapter_refusal: byBasis("adapter_refusal"), fail: count("FAIL"), hold: count("HOLD"), inconclusive: count("INCONCLUSIVE") });
+function writeOut(overall) {
+  if (outFd === null) return;
+  const fd = outFd;
+  outFd = null;
+  const { stop, ...rest } = report;
+  void stop;
+  const doc = { script: "lovable-provenance-check", version: 2, ranAt: new Date().toISOString(), localProbe: LOCAL, family: FAMILY, networkLabel: cfg.label, forgedValue: fx?.name ?? null, edgeRejectCodes: [...cfg.edgeCodes], entryPoints: siteLabels, overall, summary: tally(), ...rest, lines };
+  try {
+    writeSync(fd, `${redact(JSON.stringify(doc, null, 2))}\n`);
+    closeSync(fd);
+  } catch (e) {
+    console.error(`could not write the --out file (${codeOf(e)})`);
+  }
+}
+
+/**
+ * SIGINT / SIGTERM: no new canary call is made; once the calls in flight settle (at most 2 s), the canary is reset
+ * (best effort, at most 3 s) so it does not keep R; the --out file gets the verdict INTERRUPTED (never PASS); exit 130.
+ * A second signal leaves at once.
+ */
+async function onSignal(sig) {
+  if (interrupted) process.exit(130);
+  interrupted = true;
+  let reset = "the canary was not contacted";
+  if (canaryContacted) {
+    const t0 = Date.now();
+    while (canaryInFlight > 0 && Date.now() - t0 < 2000) await sleep(50);
+    try {
+      await Promise.race([canary.call("POST", "/_canary/reset", {}, {}, { final: true }), sleep(3000).then(() => Promise.reject(codeError("ETIMEDOUT")))]);
+      reset = "the canary was reset (a delivery still in flight from the site can reach it after this)";
+    } catch (e) {
+      reset = `the canary reset failed (${codeOf(e)}): it may hold R until its next reset or restart`;
+    }
+  }
+  say(`interrupted (${sig}): ${report.cases.length} of ${planned} cases run; ${reset}`);
+  say("overall: INTERRUPTED (no verdict)");
+  writeOut("INTERRUPTED");
+  process.exit(130);
+}
+process.on("SIGINT", () => void onSignal("SIGINT"));
+process.on("SIGTERM", () => void onSignal("SIGTERM"));
+const parkIfInterrupted = () => (interrupted ? new Promise(() => {}) : undefined); // the handler finishes and exits
+
 try {
   await main();
 } catch (e) {
   problem(`run stopped (${codeOf(e)})`);
 }
+await parkIfInterrupted();
 if (canaryContacted) {
-  // Every exit path after the first canary contact: read back late records, then leave nothing (R included) behind.
+  // Every normal end after the first canary contact (signals: onSignal): read back late records, then leave nothing
+  // (R included) behind.
   try {
     await lateCheck();
   } catch (e) {
@@ -762,24 +832,12 @@ if (canaryContacted) {
   }
   for (const w of report.warnings) say(`warning: ${w}`);
 }
+await parkIfInterrupted();
 
-const count = (v) => report.cases.filter((c) => c.verdict === v).length;
-const byBasis = (b) => report.cases.filter((c) => c.verdict === "PASS" && c.basis === b).length;
-const planned = cfg.sites.length * CASES.length;
 const overall = configError ? "CONFIG-ERROR" : count("FAIL") > 0 ? "FAIL" : count("PASS") !== planned || report.problems.length > 0 ? "HOLD" : "PASS";
-const summary = { pass: count("PASS"), pass_by_edge_rejection: byBasis("edge_rejection"), pass_by_adapter_refusal: byBasis("adapter_refusal"), fail: count("FAIL"), hold: count("HOLD"), inconclusive: count("INCONCLUSIVE") };
+const summary = tally();
 say(
   `overall: ${overall} (${report.cases.length} of ${planned} cases run: ${summary.pass} PASS [${summary.pass_by_edge_rejection} by edge rejection, ${summary.pass_by_adapter_refusal} by adapter refusal], ${summary.fail} FAIL, ${summary.hold} HOLD, ${summary.inconclusive} INCONCLUSIVE; ${report.problems.length} run problem(s))${LOCAL ? " [local probe: stand-in servers, no claim about any platform]" : ""}`,
 );
-if (outFd !== null) {
-  const { stop, ...rest } = report;
-  const doc = { script: "lovable-provenance-check", version: 2, ranAt: new Date().toISOString(), localProbe: LOCAL, family: FAMILY, networkLabel: cfg.label, forgedValue: fx?.name ?? null, edgeRejectCodes: [...cfg.edgeCodes], entryPoints: siteLabels, overall, summary, ...rest, lines };
-  void stop;
-  try {
-    writeSync(outFd, `${redact(JSON.stringify(doc, null, 2))}\n`);
-    closeSync(outFd);
-  } catch (e) {
-    console.error(`could not write the --out file (${codeOf(e)})`);
-  }
-}
+writeOut(overall);
 process.exit(overall === "CONFIG-ERROR" ? 2 : overall === "PASS" ? 0 : 1);

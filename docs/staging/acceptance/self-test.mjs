@@ -475,11 +475,16 @@ function postEntrance(host, port, ip, pageKey, extra = {}) {
  *   ratelimit every request after the first gets 429 "error code: 1015" | reject-then-block reject-cf, and no entrance
  *   at all after the first rejection | wrong-reject reject-cf, else wrong-ip | cached-reject reject-cf, else a cache HIT
  *   without an entrance | noisy honest, plus an entrance for another page on the third eligible request | late honest,
- *   but the first entrance is posted 2.5 s late | trickle the first response trickles its body for 6 s.
+ *   but the first entrance is posted 2.5 s late | trickle the first response trickles its body for 6 s | f-in-p1 F in
+ *   the first entrance (P1, a clean case) | f-in-rebaseline reject-cf, and F in the first entrance after a rejection
+ *   (the re-baseline) | late-f F in the first entrance, posted 2.5 s late | reject-sticky reject-cf, and every request
+ *   after the first rejection is refused too | late-dup-reject reject-cf, and the first entrance is sent twice, the
+ *   second copy 2.5 s late.
  */
 function provSite(host, canaryPort, mode, R) {
   const state = { requests: 0, eligible: 0, nonces: new Set(), noCache: 0, dupOrders: [], rejected: 0 };
   let n = 0;
+  let fUsed = false;
   const server = http.createServer((req, res) => {
     state.requests++;
     const url = new URL(req.url, "http://site.invalid");
@@ -491,7 +496,8 @@ function provSite(host, canaryPort, mode, R) {
     if (h["cache-control"] === "no-cache") state.noCache++;
     const cfPage = (status, code) => res.writeHead(status, { "content-type": "text/plain", "cf-ray": RAY, server: "cloudflare" }).end(`error code: ${code}`);
     if (mode === "ratelimit" && state.requests > 1) return cfPage(429, 1015);
-    if (["reject-cf", "reject-then-block", "wrong-reject", "cached-reject"].includes(mode) && cf.length > 0) return (state.rejected++, cfPage(403, 1000));
+    if (mode === "reject-sticky" && state.rejected > 0) return cfPage(403, 1000);
+    if (["reject-cf", "reject-then-block", "wrong-reject", "cached-reject", "f-in-rebaseline", "reject-sticky", "late-dup-reject"].includes(mode) && cf.length > 0) return (state.rejected++, cfPage(403, 1000));
     if (mode === "reject-any" && FWD_HEADERS.some((x) => h[x] !== undefined)) return cfPage(403, 1000);
     if (mode === "reject-1020" && cf.length > 0) return cfPage(403, 1020);
     const eligible = req.method === "GET" && url.pathname === PROV_PAGE && /text\/html/.test(h.accept ?? "") && h["sec-fetch-dest"] === "document" && h["sec-fetch-mode"] === "navigate" && Boolean(h["user-agent"]) && !h.upgrade;
@@ -515,9 +521,12 @@ function provSite(host, canaryPort, mode, R) {
     if (mode === "header-forward" && cf.length > 0) extra["x-forwarded-for"] = cf[0];
     if (mode === "wrong-ip" || mode === "wrong-reject") ip = `198.51.100.${100 + n}`; // a different address every time
     if (mode === "leaky") extra["x-real-ip"] = R;
+    if ((mode === "f-in-p1" || mode === "late-f") && n === 1) ip = PROV_F;
+    if (mode === "f-in-rebaseline" && state.rejected > 0 && !fUsed) [ip, fUsed] = [PROV_F, true];
     const send = () => void postEntrance(host, canaryPort, ip, url.pathname, extra);
-    if (mode === "late" && n === 1) setTimeout(send, 2500);
+    if ((mode === "late" || mode === "late-f") && n === 1) setTimeout(send, 2500);
     else send();
+    if (mode === "late-dup-reject" && n === 1) setTimeout(send, 2500);
     if (mode === "noisy" && n === 3) void postEntrance(host, canaryPort, R, "/elsewhere");
   });
   return { server, state };
@@ -540,7 +549,7 @@ function echoServer(answers, viaCloudflare) {
  * edge that strips or overwrites them would), and can post a foreign entrance into the canary right after the n-th
  * /_canary/expect, before that answer reaches the script.
  */
-function canaryEdge(host, canaryPort, { strip = [], injectAfterExpect = 0 } = {}) {
+function canaryEdge(host, canaryPort, { strip = [], injectAfterExpect = 0, injectIp = PROV_R, injectPage = "/elsewhere" } = {}) {
   let expects = 0;
   return http.createServer((req, res) => {
     const raw = [];
@@ -550,7 +559,7 @@ function canaryEdge(host, canaryPort, { strip = [], injectAfterExpect = 0 } = {}
       const parts = [];
       r.on("data", (c) => parts.push(c));
       r.on("end", async () => {
-        if (inject) await postEntrance(host, canaryPort, PROV_R, "/elsewhere");
+        if (inject) await postEntrance(host, canaryPort, injectIp, injectPage);
         res.writeHead(r.statusCode, r.headers).end(Buffer.concat(parts));
       });
     });
@@ -564,19 +573,22 @@ const closeServer = async (server) => {
   server.closeAllConnections();
   await new Promise((r) => server.close(r));
 };
-function spawnScript(script, argv, env) {
+function spawnScript(script, argv, env, onStdout = null) {
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [join(HERE, script), ...argv], { env: { PATH: process.env.PATH, ...env } });
     let stdout = "";
     let stderr = "";
-    p.stdout.on("data", (d) => (stdout += d));
+    p.stdout.on("data", (d) => {
+      stdout += d;
+      onStdout?.(stdout, p);
+    });
     p.stderr.on("data", (d) => (stderr += d));
     p.on("close", (status) => resolve({ status, stdout, stderr }));
   });
 }
 
 /** One run of the script against the stand-ins (one stand-in site per mode); returns its output plus what each stand-in saw. */
-async function runProv({ mode = "honest", family = 4, echo = [[PROV_R], [PROV_R]], echoRay = [true, false], env = {}, argv = (a) => a, canaryForged = PROV_F, edge = null } = {}) {
+async function runProv({ mode = "honest", family = 4, echo = [[PROV_R], [PROV_R]], echoRay = [true, false], env = {}, argv = (a) => a, canaryForged = PROV_F, edge = null, signal = null } = {}) {
   const host = family === 6 ? "::1" : "127.0.0.1";
   const urlHost = family === 6 ? "[::1]" : "127.0.0.1";
   const R = echo[0][0];
@@ -606,7 +618,10 @@ async function runProv({ mode = "honest", family = 4, echo = [[PROV_R], [PROV_R]
       ...env,
     };
     const base = ["--local-probe", "--family", String(family), "--network-label", "selftest", "--confirm-target", sitePorts.map((p) => `${urlHost}:${p}`).reverse().join(","), "--out", outFile, ...FAST];
-    const r = await spawnScript("lovable-provenance-check.mjs", argv(base), fullEnv);
+    // signal: { after: RegExp, sig }: sends sig once stdout matches `after` (a mid-run interruption).
+    let sent = false;
+    const onStdout = signal ? (out, p) => !sent && signal.after.test(out) && ((sent = true), p.kill(signal.sig)) : null;
+    const r = await spawnScript("lovable-provenance-check.mjs", argv(base), fullEnv, onStdout);
     let file = "";
     let fileMode = null;
     try {
@@ -788,7 +803,7 @@ test("lovable-provenance-check (M1): an address that is neither R nor F is a HOL
 });
 
 test("lovable-provenance-check (H1): an edge rejection counts for P2 and P4 only, as an allowed 4xx with cf-ray, bracketed by passing baselines", async () => {
-  const [ok, any, c1020, rate, block, wrong] = await Promise.all(["reject-cf", "reject-any", "reject-1020", "ratelimit", "reject-then-block", "wrong-reject"].map((mode) => runProv({ mode })));
+  const [ok, any, c1020, rate, block, wrong, sticky] = await Promise.all(["reject-cf", "reject-any", "reject-1020", "ratelimit", "reject-then-block", "wrong-reject", "reject-sticky"].map((mode) => runProv({ mode })));
   const edgePass = "edge rejection \\(HTTP 403, Cloudflare error 1000\\); the re-baseline right after it passed \\(ip == R\\)";
   for (const id of ["P2", "P4a", "P4b"]) assert.match(ok.stdout, caseRe(id, 403, 1000, 0, "PASS \\(by edge rejection\\)", edgePass), id);
   assert.match(ok.stdout, caseRe("P5", 403, 1000, 0, "INCONCLUSIVE", "HTTP 403, Cloudflare error 1000: an edge rejection does not count for P5 \\(owner's matrix: P2 and P4 only\\)"));
@@ -801,7 +816,9 @@ test("lovable-provenance-check (H1): an edge rejection counts for P2 and P4 only
   assert.match(rate.stdout, caseRe("P2", 429, 1015, 0, "INCONCLUSIVE", "HTTP 429, Cloudflare error 1015: not a qualifying edge rejection \\(HTTP 429 \\(rate limited\\) never counts\\)"));
   assert.match(block.stdout, caseRe("P2", 403, 1000, 0, "INCONCLUSIVE", "edge rejection \\(HTTP 403, Cloudflare error 1000\\), but the re-baseline right after it did not pass \\(INCONCLUSIVE: 2xx page but no entrance"));
   assert.match(wrong.stdout, caseRe("P2", 403, 1000, 0, "INCONCLUSIVE", "edge rejection \\(HTTP 403, Cloudflare error 1000\\), and P1 did not pass on this entry point"));
-  for (const r of [ok, any, c1020, rate, block, wrong]) {
+  // N5: a re-baseline that is itself refused says so (not "does not count for rebaseline").
+  assert.match(sticky.stdout, caseRe("P2", 403, 1000, 0, "INCONCLUSIVE", "edge rejection \\(HTTP 403, Cloudflare error 1000\\), but the re-baseline right after it did not pass \\(INCONCLUSIVE: HTTP 403, Cloudflare error 1000: the clean re-baseline was refused as well\\)"));
+  for (const r of [ok, any, c1020, rate, block, wrong, sticky]) {
     assert.equal(r.status, 1, r.stdout + r.stderr);
     assert.ok(!/^overall: PASS/m.test(r.stdout), r.stdout);
     assertCanaryLeftClean(r);
@@ -948,4 +965,59 @@ test("lovable-provenance-check: IPv6 (P6) honest run over ::1 forges the canary'
   assert.ok(!/::1|\[::/.test(r.stdout + r.file));
   assertCanaryLeftClean(r);
   assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check (N1): F at the canary is a FAIL in every window: a clean case, a re-baseline, a late record, the zero-record check", async () => {
+  const late = ["--delay-ms", "3000"]; // the late entrance (2.5 s) lands after P1 was scored (poll 1 s) and before P2's reset
+  const [p1, rebase, lateF, zero] = await Promise.all([
+    runProv({ mode: "f-in-p1" }),
+    runProv({ mode: "f-in-rebaseline" }),
+    runProv({ mode: "late-f", argv: (a) => [...a, ...late] }),
+    runProv({ edge: { injectAfterExpect: 3, injectIp: PROV_F } }), // F lands right after P2's reset, before its request
+  ]);
+  const identified = "the canary identified F as the entrance ip: a client-forged value was selected";
+  assert.match(p1.stdout, caseRe("P1", 200, "-", 1, "FAIL", identified));
+  assert.match(p1.stdout, overallRe("FAIL \\(1 of 9 cases run"));
+  assert.match(rebase.stdout, caseRe("P2", 403, 1000, 0, "FAIL", `re-baseline after edge rejection \\(HTTP 403, Cloudflare error 1000\\): ${identified}`));
+  assert.match(rebase.stdout, overallRe("FAIL \\(2 of 9 cases run"));
+  assert.equal(rebase.site.requests, 3, "P1, P2 and its re-baseline");
+  assert.match(lateF.stdout, caseRe("P1", 200, "-", 0, "INCONCLUSIVE", "2xx page but no entrance within 1 s"));
+  assert.match(lateF.stdout, new RegExp(`^<site1> net=selftest IPv4 P1 late => FAIL: late record: ${identified}$`, "m"));
+  assert.match(lateF.stdout, overallRe("FAIL \\(1 of 9 cases run: 0 PASS .*1 FAIL"));
+  assert.equal(lateF.site.requests, 1, "the late FAIL stops the run before P2 is sent");
+  assert.equal(JSON.parse(lateF.file).cases[0].verdict, "FAIL");
+  assert.match(zero.stdout, caseRe("P2", "not-sent", "-", 0, "FAIL", identified));
+  for (const r of [p1, rebase, lateF, zero]) {
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assertCanaryLeftClean(r);
+    assertNoProvLeak(r);
+  }
+});
+
+test("lovable-provenance-check (N5): a late record that turns P1 into a HOLD retracts the P1 gate for later edge rejections", async () => {
+  const r = await runProv({ mode: "late-dup-reject", argv: (a) => [...a, "--delay-ms", "3000"] });
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, caseRe("P1", 200, "-", 1, "PASS", "ip == R"));
+  assert.match(r.stdout, /^<site1> net=selftest IPv4 P1 late => HOLD: late entrance: 1 record\(s\) arrived after the case was scored$/m);
+  for (const id of ["P2", "P4a", "P4b"]) assert.match(r.stdout, caseRe(id, 403, 1000, 0, "INCONCLUSIVE", "edge rejection \\(HTTP 403, Cloudflare error 1000\\), and P1 did not pass on this entry point"), id);
+  assert.ok(!/by edge rejection\)/.test(r.stdout.split("\n").filter((l) => l.startsWith("<site1>")).join("\n")), "no edge-rejection PASS after P1 became a HOLD");
+  assertNoProvLeak(r);
+});
+
+test("lovable-provenance-check (N3): SIGINT or SIGTERM mid-run resets the canary, writes INTERRUPTED and exits 130", async () => {
+  const after = /^<site1> net=selftest IPv4 P1 .*=> PASS/m; // then the script sleeps --delay-ms before P2
+  const runs = await Promise.all(["SIGINT", "SIGTERM"].map((sig) => runProv({ argv: (a) => [...a, "--delay-ms", "5000"], signal: { after, sig } })));
+  for (const [i, sig] of ["SIGINT", "SIGTERM"].entries()) {
+    const r = runs[i];
+    assert.equal(r.status, 130, `${sig}: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, new RegExp(`^interrupted \\(${sig}\\): 1 of 9 cases run; the canary was reset`, "m"));
+    assert.match(r.stdout, /^overall: INTERRUPTED \(no verdict\)$/m);
+    assert.ok(!/^overall: (PASS|FAIL|HOLD)/m.test(r.stdout), r.stdout);
+    assert.equal(r.site.requests, 1, `${sig}: nothing after the signal`);
+    assert.equal(r.fileMode, 0o600);
+    const doc = JSON.parse(r.file);
+    assert.deepEqual([doc.overall, doc.cases.length, doc.summary.pass], ["INTERRUPTED", 1, 1]);
+    assertCanaryLeftClean(r, sig);
+    assertNoProvLeak(r);
+  }
 });

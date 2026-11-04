@@ -206,10 +206,10 @@ starting at most `timeoutMs` (default 5000) plus the wait (`retryDelayMs`, defau
 | condition | verdict |
 |---|---|
 | any record names a header carrying a visitor IP (`headersWithClientIp`, G4-I8) | FAIL |
+| any record whose ip the canary identifies as F (`matchesForged`), or with a header carrying F (`headersWithForgedIp`), in any window: a forged or clean case, a re-baseline, the zero-record check before a request, or a late record. Only this script sends F, and only to the site (the pre-flight's synthetic entrance goes straight to the canary and is cleared by the reset after it) | FAIL |
 | the canary held records (or no expectation) right after the reset | INCONCLUSIVE, foreign traffic; the request is not sent |
-| forged case: an entrance of ours whose ip the canary identifies as F (`matchesForged`), or a header of ours carrying F (`headersWithForgedIp`) | FAIL |
 | any record that is not ours in the case's window | INCONCLUSIVE, foreign traffic (other findings are added to the reason) |
-| an address that is neither R nor F (forged case: "unexpected address in <case>"; clean case: "wrong provenance"); an entrance without `ip`; more than one entrance; a clean-case header carrying F; a record not compared; a visitor IP elsewhere in the body; the canary lost its expectation; an entrance although the site answered non-2xx or did not answer | HOLD (reason lists each) |
+| an address that is neither R nor F (forged case: "unexpected address in <case>"; clean case: "wrong provenance"); an entrance without `ip`; more than one entrance; a record not compared; a visitor IP elsewhere in the body; the canary lost its expectation; an entrance although the site answered non-2xx or did not answer | HOLD (reason lists each) |
 | exactly one entrance of ours (retries of the same `entrance_id` counted once), ip == R | PASS |
 | no entrance: no answer from the site (error code) | INCONCLUSIVE |
 | no entrance, 2xx, `cf-cache-status` present and not DYNAMIC, BYPASS or MISS | INCONCLUSIVE (possibly served without the Worker) |
@@ -217,7 +217,7 @@ starting at most `timeoutMs` (default 5000) plus the wait (`retryDelayMs`, defau
 | no entrance, 2xx, any other case | INCONCLUSIVE |
 | no entrance, non-2xx, P2, P4a or P4b, a qualifying edge rejection, P1 passed on this entry point, and a fresh baseline right after it passes | PASS by edge rejection; otherwise INCONCLUSIVE (only the status and the code are kept) |
 | no entrance, non-2xx, P1, P3a-d or P5 | INCONCLUSIVE (the owner's matrix accepts edge rejections for P2 and P4 only) |
-| a record for the case that arrives after it was scored | the case becomes a HOLD ("late entrance"), or a FAIL when that record identifies F or carries a visitor IP |
+| a record for the case that arrives after it was scored | the case becomes a HOLD ("late entrance"), or a FAIL when that record identifies F or carries a visitor IP. A late record that turns P1 into a HOLD also withdraws P1's pass for the edge rejections and refusals that follow |
 
 A qualifying edge rejection is a 4xx other than 429, with a `cf-ray` header and a numeric Cloudflare error code in the
 body (`error code: 1000`, `cf-error-code`, `<title>... Error 1000`) that is in `PROV_EDGE_REJECT_CODES`. The fresh
@@ -232,10 +232,15 @@ otherwise **HOLD**. The overall line and the `--out` file count passes by edge r
 separately (`pass_by_edge_rejection`, `pass_by_adapter_refusal`), so that evidence is never mistaken for an entrance
 with ip == R. When an entrance is missing, the reason also names unauthenticated requests the canary refused (a wrong
 `IDR_RESOLVER_TOKEN`) and requests to unknown canary paths. Exit 0 PASS, 1 FAIL or HOLD, 2 refusal or configuration
-error. A refusal sends nothing; three configuration errors are found after the echo checks and also exit 2 before any
+error, 130 interrupted. A refusal sends nothing; three configuration errors are found after the echo checks and also exit 2 before any
 request to the site: a forged value equal to the echoed R (nothing sent to the canary either), a canary that refuses
-the token, and a canary whose `CANARY_FORGED_IP` is not F. The canary is reset on every exit path after it was first
-contacted, so it does not keep R.
+the token, and a canary whose `CANARY_FORGED_IP` is not F. After the first canary contact, the canary is reset when the
+run ends (PASS, FAIL, HOLD, an error or a configuration error), so it does not keep R. On SIGINT or SIGTERM the
+script makes no new canary call, waits at most 2 s for the calls in flight, resets the canary (best effort, at most
+3 s), prints an `interrupted` line, writes the `--out` file with the verdict INTERRUPTED (never PASS) and exits 130;
+a second signal exits at once. Not covered: a delivery still in flight from the site can reach the canary after that
+reset (it then holds that record, and the visitor IP from its body in memory, until its next reset), and a crash or
+SIGKILL leaves the canary as it is until its next reset or restart.
 
 **G4-I8 coverage.** The pre-flight entrance carries F in `CF-Connecting-IP`, `X-Forwarded-For`, `X-Real-IP`,
 `True-Client-IP`, `Forwarded` and `X-Client-IP`. The canary's forged-value detection (`headersWithForgedIp`) shows
@@ -264,7 +269,8 @@ that the runtime is Node, not workerd), `via`, `forwarded`, `cookie`, `referer`,
 **Output.** One line per case: `<siteN> net=<label> IPv4|IPv6 <case> http=<status> cf-error=<code|-> entrances=<n> =>
 <verdict>[ (by edge rejection| by adapter refusal)]: <reason>`, a `<case> late => <verdict>` line when a late record
 amends a case, the P7 and header-name INFO lines, the echo lines (`<echoN> via_cloudflare=<bool>`, never the
-answers), the canary and G4-I8 coverage line, notes, problems, warnings and the overall line. Every line and the
+answers), the canary and G4-I8 coverage line, notes, problems, warnings, an `interrupted` line on a signal, and the
+overall line. Every line and the
 `--out` file pass the redactor with R, F, F2, F6, F6b, the token and every echo answer as explicit secrets. The
 `cf-ray` value is kept as asked. It names the Cloudflare data centre that served the tester (a coarse location), and
 the zone owner and Cloudflare can join it to their logs, which hold the tester's address: the raw output stays
@@ -277,8 +283,16 @@ query nonce, and the canary has no per-request handle or run identity). The cana
 header value (for example a forwarded User-Agent) cannot be judged except for visitor IPs and F. All requests use
 HTTP/1.1; browsers reach Cloudflare over HTTP/2 or HTTP/3, where duplicate headers (P4) are handled differently, and
 that is not covered. `CF-Connecting-IPv6`, `CF-Pseudo-IPv4` and `X-Client-IP` are not sent as forged cases. An edge
-rejection alone proves nothing; it counts only as described above. A `--local-probe` result is no claim about any
+rejection alone proves nothing; it counts only as described above. The G4-I8 coverage probe comes from the tester,
+while the site's subrequest comes from Cloudflare's egress: an edge with source-dependent trusted-proxy rules could
+keep or overwrite the watched headers differently for the two. A `--local-probe` result is no claim about any
 platform.
+
+**Expect a HOLD on the real platform (owner briefing).** An overall PASS may be unreachable by design. If Cloudflare
+answers a client-supplied `CF-Connecting-IP` with error 1000 (as in the earlier probe), P5 is INCONCLUSIVE in every
+run under the owner's matrix. If the canary's Railway edge sets or rewrites `X-Real-IP` (or `X-Forwarded-For`)
+itself, that header is a G4-I8 blind spot in every run. Either one makes the overall result a HOLD. The owner then
+decides these items explicitly from the per-case lines and the `--out` file, not from the overall line.
 
 ## Executed so far (3 Nov 2026)
 
@@ -301,8 +315,11 @@ platform.
   foreign traffic before and during a case; a late entrance; a G4-I8 blind spot; a leaky header; no entrance; a
   trickling body; echo disagreement, a Cloudflare-only ground truth, a moved egress; F equal to R, a refused token, a
   canary without F, a pinned family the servers cannot answer; refusals (including `--out` over an existing file or a
-  symlink); the page-path lists pinned to the adapter source; the canary left without R after every run. No IP
-  literal in any output. `self-test.mjs`: 32 pass, 1 skipped, 0 fail (33 tests, 15 of them for this script); the
+  symlink); the page-path lists pinned to the adapter source; the canary left without R after every run. After the
+  re-verification follow-ups (N1, N3, N5): F at the canary is a FAIL in P1, in a re-baseline, as a late record after
+  a clean case and in the zero-record check; a late record that turns P1 into a HOLD withdraws its gate; SIGINT and
+  SIGTERM mid-run leave the canary clean, write INTERRUPTED and exit 130. No IP literal in any output.
+  `self-test.mjs`: 35 pass, 1 skipped, 0 fail (36 tests, 18 of them for this script); the
   skipped one is the IPv6 end-to-end test, which skips where there is no IPv6 loopback, as in that session, so the
   IPv6 path has not run. **Not run** against Lovable, Cloudflare or Railway.
 * `supabase-hosted-check.mjs`: refusals and `--dry-run` only (self-test). The hosted checks are **unexecuted**;
