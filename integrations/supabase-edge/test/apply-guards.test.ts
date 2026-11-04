@@ -98,6 +98,8 @@ describe("G7: erasure propagation", () => {
     mock.items = [obs(1, 7, D), obs(2, 8, D), tomb(1, 7), obs(3, 7, D)];
     const r = await runSync(testConfig(mock), testDeps(store));
     expect(r.status).toBe("ok");
+    // The count reaches the run result (and the handler's response and log line): obs 1 and 3 of company 7.
+    expect(r).toMatchObject({ ignoredErased: 2, pageKeysCleared: 0 });
     expect(await companyIds()).toEqual([8]);
     expect(await obsIds()).toEqual([2]);
   });
@@ -147,6 +149,7 @@ describe("G5: page_key guard (the resolver's rule, migration 0005)", () => {
     mock.items = [obs(1, 7, D, { page_key: "/reset?token=abc" }), obs(2, 7, D, { page_key: "/ok" })];
     const r = await runSync(testConfig(mock), testDeps(new PgStore(pool)));
     expect(r.status).toBe("ok");
+    expect(r).toMatchObject({ observations: 2, pageKeysCleared: 1, ignoredErased: 0 });
     const rows = (await pool.query<{ k: string | null }>("select page_key as k from public.idr_observations order by observation_id")).rows;
     expect(rows.map((x) => x.k)).toEqual([null, "/ok"]);
   });

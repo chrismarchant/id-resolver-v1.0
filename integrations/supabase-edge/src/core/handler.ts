@@ -59,6 +59,11 @@ function summary(r: SyncResult): unknown {
     gap_recorded: r.gap?.recorded === true,
     gap_new: r.gap?.newGap === true,
     gaps_resolved: r.gapsResolved,
+    // Schema 8 (docs/GUARDRAILS.md G7, G5): counts only. Observations of an
+    // already-erased company that were ignored, and page_key values that
+    // failed the resolver's rule and were not stored.
+    ignored_erased: r.ignoredErased,
+    page_keys_cleared: r.pageKeysCleared,
   };
 }
 
@@ -67,6 +72,8 @@ function logLine(r: SyncResult): string {
   const parts = [`sync ${r.status}`, `pages=${r.pages}`, `observations=${r.observations}`, `tombstones=${r.tombstones}`];
   if (r.gap !== null) parts.push(`gap_recorded=${r.gap.recorded}`, `gap_new=${r.gap.newGap}`);
   if (r.gapsResolved > 0) parts.push(`gaps_resolved=${r.gapsResolved}`);
+  if (r.ignoredErased > 0) parts.push(`ignored_erased=${r.ignoredErased}`);
+  if (r.pageKeysCleared > 0) parts.push(`page_keys_cleared=${r.pageKeysCleared}`);
   return parts.join(" ");
 }
 

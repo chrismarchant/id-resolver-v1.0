@@ -78,6 +78,10 @@ changes, and the sync never halts because of either:
   `/`, no `?`, `#`, whitespace or control character). A value that fails it is not stored: the observation is kept
   with `page_key` null, and the result counts it as `page_keys_cleared`. Every value the resolver serves passes.
 
+Both counts reach the function's response (`"ignored_erased"`, `"page_keys_cleared"`, next to `"observations"`)
+and, when not zero, its log line: counts only, never a value. A non-zero `page_keys_cleared` means the resolver
+served a `page_key` that fails its own rule; worth a look on the resolver side, but nothing to repair here.
+
 Upgrade: re-run the script (it is idempotent and keeps every row); until then the function answers
 `schema_mismatch` and fetches nothing. The engine of this release requires schema 8.
 

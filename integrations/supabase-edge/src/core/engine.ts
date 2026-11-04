@@ -51,7 +51,17 @@ export function reconcileWindow(nowMs: number, days: number): { from: string; to
  */
 export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResult> {
   const deadline = deps.now() + cfg.budgetMs;
-  const result: SyncResult = { status: "ok", pages: 0, observations: 0, tombstones: 0, reconcile: null, gap: null, gapsResolved: 0 };
+  const result: SyncResult = {
+    status: "ok",
+    pages: 0,
+    observations: 0,
+    tombstones: 0,
+    reconcile: null,
+    gap: null,
+    gapsResolved: 0,
+    ignoredErased: 0,
+    pageKeysCleared: 0,
+  };
 
   async function finish(status: SyncStatus, needsResync: boolean | null = null): Promise<SyncResult> {
     result.status = status;
@@ -287,6 +297,9 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     result.pages++;
     result.observations += applied.observations;
     result.tombstones += applied.tombstones;
+    // Schema 8 counts (G7, G5): additive, 0 when a store does not report them.
+    result.ignoredErased += applied.ignoredErased ?? 0;
+    result.pageKeysCleared += applied.pageKeysCleared ?? 0;
     if (!page.hasMore) {
       drained = true;
       break;

@@ -140,7 +140,9 @@ across pages, with cache-linked, nameless and erased companies, and the 410).
 **Enforces.** `idr_apply_feed_page` ignores an observation whose `company_id` already has a tombstone of the
 installation in `idr_tombstones` (the contract's recommendation, `docs/contracts/reporting-feed.v1.md`, "Erasure
 and re-observation": company ids are never reused). A re-applied or replayed page can therefore never resurrect
-an erased company; the result counts such items as `ignored_erased`.
+an erased company; the result counts such items as `ignored_erased`, and the count (never a value) reaches the
+Edge function's run result, its response (`"ignored_erased"`) and, when not zero, its log line (`PostgrestStore`,
+`engine.ts`, `handler.ts`; tests in `test/handler.test.ts`).
 
 **Tests.** `integrations/supabase-edge/test/apply-guards.test.ts`: a stale page after the tombstone, an
 observation after its tombstone in the same page, a replay through the engine after a resync (positive); a

@@ -22,6 +22,10 @@ function int(v: unknown): number {
   if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) throw new StoreError("bad_rpc_response");
   return v;
 }
+/** A count the function may omit (an additive field): absent is 0, anything else must be a valid count. */
+function optInt(v: unknown): number {
+  return v === undefined ? 0 : int(v);
+}
 
 /**
  * Store over Supabase PostgREST RPC using plain fetch (no supabase-js).
@@ -86,8 +90,15 @@ export class PostgrestStore implements Store {
         p_drained: a.drained,
       }),
     );
-    if (r["applied"] !== true) return { applied: false, observations: 0, tombstones: 0 };
-    return { applied: true, observations: int(r["observations"]), tombstones: int(r["tombstones"]) };
+    if (r["applied"] !== true) return { applied: false, observations: 0, tombstones: 0, ignoredErased: 0, pageKeysCleared: 0 };
+    return {
+      applied: true,
+      observations: int(r["observations"]),
+      tombstones: int(r["tombstones"]),
+      // Schema 8 (docs/GUARDRAILS.md G7, G5): counts only, never values.
+      ignoredErased: optInt(r["ignored_erased"]),
+      pageKeysCleared: optInt(r["page_keys_cleared"]),
+    };
   }
 
   async resetCursor(expectedCursor: string): Promise<boolean> {

@@ -72,6 +72,14 @@ export interface ApplyPageResult {
   applied: boolean;
   observations: number;
   tombstones: number;
+  /**
+   * Schema 8 (docs/GUARDRAILS.md G7): observations ignored because their
+   * company already has a tombstone of the installation. Optional so a store
+   * that does not report it stays valid (counted as 0).
+   */
+  ignoredErased?: number;
+  /** Schema 8 (G5): page_key values the store's own re-check did not store (set to null). Optional, as above. */
+  pageKeysCleared?: number;
 }
 
 export type SyncStatus =
@@ -214,4 +222,11 @@ export interface SyncResult {
   gap: RecordGapResult | null;
   /** Open gaps this run marked resolved after draining the buffer post-resync. */
   gapsResolved: number;
+  /** Observations of an already-erased company that applied pages ignored (G7). A count only. */
+  ignoredErased: number;
+  /**
+   * page_key values not stored because they failed the resolver's own rule
+   * (G5); the observation is kept with page_key null. A count only.
+   */
+  pageKeysCleared: number;
 }
