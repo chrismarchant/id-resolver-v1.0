@@ -365,6 +365,9 @@ for (const [rule, path, content, value] of [
   ["email", "e.txt", `owner ${email}\n`, email],
   ["railway-public-host", "h.txt", `url ${host}\n`, host],
   ["railway-private-host", "p.txt", `db ${["api-prod", "railway", "internal"].join(".")}\n`, ["api-prod", "railway", "internal"].join(".")],
+  ["supabase-project-host", "s.txt", `url https://${[["qwertyuiop", "asdfghjklz"].join(""), "supabase", "co"].join(".")}\n`, [["qwertyuiop", "asdfghjklz"].join(""), "supabase", "co"].join(".")],
+  ["supabase-pooler-host", "q.txt", `db ${["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".")}\n`, ["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".")],
+  ["supabase-api-key", "t.txt", `key ${["sb", "secret", "k".repeat(30)].join("_")}\n`, ["sb", "secret", "k".repeat(30)].join("_")],
 ]) {
   test(`refuses an allow entry for ${rule} (hard error, no fingerprint offered)`, () => {
     const { dir, sha } = historyRepo(path, content);
@@ -936,6 +939,98 @@ test("the IPv4 rule matches before a trailing dot or a file extension, not insid
   const dir = repoWith({ "ok.md": "version 1.2.3.4.5 and build 10.20.30.40.1 and 5.6.7.8.9.10\n" });
   try {
     assert.equal(runGate(dir).code, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Supabase identifiers and credentials (docs/GUARDRAILS.md G1) -----------
+// Every value is synthetic and assembled at runtime so this file passes the gate.
+
+const sbRef = ["qwertyuiop", "asdfghjklz"].join(""); // 20 characters, not a real project
+const sbHost = [sbRef, "supabase", "co"].join(".");
+const sbHostIn = [sbRef, "supabase", "in"].join(".");
+const sbDbHost = ["db", sbRef, "supabase", "co"].join(".");
+const sbPooler = ["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".");
+const sbSecret = ["sb", "secret", "k".repeat(30)].join("_");
+const sbPublishable = ["sb", "publishable", "k".repeat(30)].join("_");
+const b64url = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+const jwt = (claims) => [b64url({ alg: "HS256", typ: "JWT" }), b64url(claims), "c2lnbmF0dXJlLW5vdC1yZWFs"].join(".");
+const serviceJwt = jwt({ iss: "supabase", ref: sbRef, role: "service_role", iat: 1, exp: 2 });
+const anonJwt = jwt({ iss: "supabase", role: "anon", iat: 1, exp: 2 });
+
+for (const [name, content, ruleId] of [
+  ["a Supabase project URL", `SUPABASE_URL=https://${sbHost}\n`, "supabase-project-host"],
+  ["a Supabase project host on .supabase.in", `host = "${sbHostIn}"\n`, "supabase-project-host"],
+  ["a direct database host db.<ref>.supabase.co in a connection string", `postgres://postgres:pw@${sbDbHost}:5432/postgres\n`, "supabase-project-host"],
+  ["an upper-case project host", `url = https://${sbHost.toUpperCase()}\n`, "supabase-project-host"],
+  ["a connection-pooler host", `DATABASE_URL=postgres://postgres.x:pw@${sbPooler}:6543/postgres\n`, "supabase-pooler-host"],
+  ["an sb_secret_ key", `key = "${sbSecret}"\n`, "supabase-api-key"],
+  ["an sb_publishable_ key", `VITE_KEY=${sbPublishable}\n`, "supabase-api-key"],
+  ["a service_role JWT", `SUPABASE_SERVICE_ROLE_KEY=${serviceJwt}\n`, "service-role-jwt"],
+]) {
+  test(`detects ${name}`, () => {
+    const r = expectFinding({ "cfg.ts": content }, ruleId);
+    // Redacted: the value is never printed.
+    for (const v of [sbRef, sbPooler, sbSecret, serviceJwt]) assert.ok(!r.out.includes(v), r.out);
+  });
+}
+
+test("Supabase rules stay quiet on placeholders, docs links, bare key prefixes, an anon JWT and the documented synthetic ref", () => {
+  const dir = repoWith({
+    "ok.md": [
+      "SBH_URL=https://<PROJECT_REF>.supabase.co and https://<project-ref>.supabase.co/functions/v1/idr-sync",
+      "pricing at https://supabase.com/pricing, docs at https://supabase.com/docs/guides/database",
+      "pooler: aws-0-<region>.pooler.supabase.com and <region>.pooler.supabase.com",
+      "the `sb_publishable_` key and the `sb_secret_` key; the service_role role",
+      "a label longer than a ref: averyveryverylongprojectlabel.supabase.co is not a project host",
+      `anon key ${anonJwt}`,
+      // The one documented synthetic ref (SYNTHETIC_SUPABASE_REFS), already in the public history.
+      `https://${["abcdefghijklmnopqrst", "supabase", "co"].join(".")}`,
+    ].join("\n") + "\n",
+  });
+  try {
+    const r = runGate(dir);
+    assert.equal(r.code, 0, r.out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the synthetic marker does not opt out any Supabase rule", () => {
+  const marked = (v) => `x = "${v}" // public-safety: allow-synthetic test input\n`;
+  for (const [v, ruleId] of [
+    [sbHost, "supabase-project-host"],
+    [sbPooler, "supabase-pooler-host"],
+    [sbSecret, "supabase-api-key"],
+    [serviceJwt, "service-role-jwt"],
+  ]) {
+    const r = expectFinding({ "m.ts": marked(v) }, ruleId);
+    assert.doesNotMatch(r.out, /opt-out/);
+  }
+});
+
+test("--history finds a Supabase host, key and service JWT that were added then removed", () => {
+  const { dir } = historyRepo("old.env.example", `SUPABASE_URL=https://${sbHost}\nKEY=${sbSecret}\nSERVICE=${serviceJwt}\nPOOL=${sbPooler}\n`);
+  try {
+    assert.equal(runGate(dir).code, 0);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    for (const rule of ["supabase-project-host", "supabase-api-key", "service-role-jwt", "supabase-pooler-host"]) {
+      assert.match(r.out, new RegExp(`${rule}: .*\\n\\s+cannot be allow-listed`));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refuses an allow entry for service-role-jwt (hard error)", () => {
+  const { dir, sha } = historyRepo("j.txt", `key ${serviceJwt}\n`);
+  try {
+    writeFileSync(join(dir, ALLOW), `# reviewed: it is fine, trust me\n${sha}:j.txt:service-role-jwt:${sha256(serviceJwt)}\n`);
+    const r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /rule service-role-jwt cannot be allow-listed/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

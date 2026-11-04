@@ -23,6 +23,14 @@
  *     documentation 2001:db8::/32, 3fff::/20 and the 2001::/23 protocol block; link-local, ULA, loopback, "::" and mapped
  *     private IPv4 are never reported)
  *   - a private-key block or a committed env/key file
+ *   - Supabase identifiers and credentials (three-database separation,
+ *     docs/GUARDRAILS.md G1): a concrete project host
+ *     (<20-character project ref>.supabase.co or .supabase.in, including
+ *     db.<ref>.supabase.co), a concrete connection-pooler host
+ *     (<name>.pooler.supabase.com), an sb_secret_ or sb_publishable_ API key,
+ *     and a JWT whose payload carries "role":"service_role" (a service key).
+ *     Placeholders such as <project-ref>.supabase.co are allowed, and so is
+ *     exactly one documented synthetic project ref (SYNTHETIC_SUPABASE_REFS)
  *   - a text file larger than MAX_BYTES that is not on the reviewed list
  *     (it is never skipped silently)
  *
@@ -55,9 +63,9 @@
  * hit value: entries store the SHA-256 of the value. Every entry needs a
  * justification comment directly above it (or above its block). Entries for
  * the rules in NEVER_ALLOW are refused as a hard error: a committed key or env
- * file, a real e-mail address or a concrete Railway host needs history
- * rewriting and credential rotation, not a waiver. The allow-list is validated
- * in every mode.
+ * file, a real e-mail address, a concrete Railway host or a Supabase project
+ * host, pooler host, API key or service-role JWT needs history rewriting and
+ * credential rotation, not a waiver. The allow-list is validated in every mode.
  *
  * Output never contains a matched value, nor a hash of one: the repository
  * and its CI logs are public, and a hash of a low-entropy value (an IPv4
@@ -147,11 +155,81 @@ const RULES = [
     filter: (m) => isPublicIpv6(m),
     why: "public IPv6 literal (use RFC 3849 2001:db8::/32)",
   },
+  // ---- Supabase (three-database separation, docs/GUARDRAILS.md G1) ----------
+  // The private Insights project's ref, URL and keys belong in that project's
+  // Edge secrets only, never in this public repository or in a website or
+  // browser artifact built from it. None of these rules honours the opt-out
+  // marker, and none can be allow-listed in history (NEVER_ALLOW).
+  {
+    id: "supabase-project-host",
+    // A project ref is 20 lower-case alphanumerics; `db.<ref>.supabase.co` contains this host too.
+    // "<project-ref>.supabase.co" and "supabase.com/docs" do not match.
+    re: /(?<![A-Za-z0-9])[a-z0-9]{20}\.supabase\.(?:co|in)(?![A-Za-z0-9-])/gi,
+    allowMarker: false,
+    filter: (m) => !SYNTHETIC_SUPABASE_REFS.has(m.slice(0, 20).toLowerCase()),
+    why: "concrete Supabase project host (use <project-ref>.supabase.co)",
+  },
+  {
+    id: "supabase-pooler-host",
+    re: /(?<![A-Za-z0-9-])[a-z0-9][a-z0-9-]*\.pooler\.supabase\.com(?![A-Za-z0-9-])/gi,
+    allowMarker: false,
+    why: "concrete Supabase connection-pooler host (use <region>.pooler.supabase.com)",
+  },
+  {
+    id: "supabase-api-key",
+    // A bare prefix in prose ("an `sb_publishable_` key") is not a key.
+    re: /(?<![A-Za-z0-9])sb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}/g,
+    allowMarker: false,
+    why: "Supabase API key (sb_secret_ / sb_publishable_)",
+  },
+  {
+    id: "service-role-jwt",
+    re: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
+    allowMarker: false,
+    filter: (m) => isServiceRoleJwt(m),
+    why: "JWT whose payload has role service_role (a Supabase service key)",
+  },
 ];
+
+/**
+ * Supabase project refs that are synthetic by construction and already in the
+ * public history (docs/staging/acceptance/self-test.mjs uses the first twenty
+ * letters of the alphabet as a stand-in ref). Exact values only: any other
+ * 20-character ref is reported, in the tree and in history.
+ */
+const SYNTHETIC_SUPABASE_REFS = new Set(["abcdefghijklmnopqrst"]);
+
+/** True when the token's payload (second segment, base64url JSON) says role service_role. Never throws. */
+export function isServiceRoleJwt(token) {
+  const payload = token.split(".")[1] ?? "";
+  let text;
+  try {
+    text = Buffer.from(payload, "base64url").toString("utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const claims = JSON.parse(text);
+    if (claims && typeof claims === "object" && claims.role === "service_role") return true;
+  } catch {
+    // Not JSON (e.g. a truncated token): fall back to the raw claim text.
+  }
+  return /"role"\s*:\s*"service_role"/.test(text);
+}
 
 // History hits of these rules can never be allow-listed: they need history
 // rewriting and credential rotation, not a waiver.
-const NEVER_ALLOW = new Set(["forbidden-file", "private-key-block", "email", "railway-public-host", "railway-private-host"]);
+const NEVER_ALLOW = new Set([
+  "forbidden-file",
+  "private-key-block",
+  "email",
+  "railway-public-host",
+  "railway-private-host",
+  "supabase-project-host",
+  "supabase-pooler-host",
+  "supabase-api-key",
+  "service-role-jwt",
+]);
 const KNOWN_RULES = new Set([...RULES.map((r) => r.id), "forbidden-file"]);
 const REMEDIATION =
   "if the value is real, rewrite history to remove it and rotate or revoke it; only a SYNTHETIC value may be allow-listed (entry: run locally with --fingerprints)";
