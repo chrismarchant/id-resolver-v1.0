@@ -366,7 +366,7 @@ for (const [rule, path, content, value] of [
   ["railway-public-host", "h.txt", `url ${host}\n`, host],
   ["railway-private-host", "p.txt", `db ${["api-prod", "railway", "internal"].join(".")}\n`, ["api-prod", "railway", "internal"].join(".")],
   ["supabase-project-host", "s.txt", `url https://${[["qwertyuiop", "asdfghjklz"].join(""), "supabase", "co"].join(".")}\n`, [["qwertyuiop", "asdfghjklz"].join(""), "supabase", "co"].join(".")],
-  ["supabase-pooler-host", "q.txt", `db ${["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".")}\n`, ["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".")],
+  ["supabase-pooler-user", "q.txt", `user ${["postgres", ["qwertyuiop", "asdfghjklz"].join("")].join(".")}\n`, ["postgres", ["qwertyuiop", "asdfghjklz"].join("")].join(".")],
   ["supabase-api-key", "t.txt", `key ${["sb", "secret", "k".repeat(30)].join("_")}\n`, ["sb", "secret", "k".repeat(30)].join("_")],
 ]) {
   test(`refuses an allow entry for ${rule} (hard error, no fingerprint offered)`, () => {
@@ -952,6 +952,10 @@ const sbHost = [sbRef, "supabase", "co"].join(".");
 const sbHostIn = [sbRef, "supabase", "in"].join(".");
 const sbDbHost = ["db", sbRef, "supabase", "co"].join(".");
 const sbPooler = ["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".");
+const sbPoolerUser = ["postgres", sbRef].join("."); // the shared pooler's user name carries the project ref
+const sbRefPooler = [sbRef, "pooler", "supabase", "com"].join("."); // a pooler host named after a ref
+/** Percent-encodes ':' and '/' as an encoded URL (a query parameter, a redirect target) does. */
+const pct = (v) => v.replace(/:/g, "%3A").replace(/\//g, "%2F");
 const sbSecret = ["sb", "secret", "k".repeat(30)].join("_");
 const sbPublishable = ["sb", "publishable", "k".repeat(30)].join("_");
 const b64url = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
@@ -965,6 +969,17 @@ for (const [name, content, ruleId] of [
   ["a direct database host db.<ref>.supabase.co in a connection string", `postgres://postgres:pw@${sbDbHost}:5432/postgres\n`, "supabase-project-host"],
   ["an upper-case project host", `url = https://${sbHost.toUpperCase()}\n`, "supabase-project-host"],
   ["a connection-pooler host", `DATABASE_URL=postgres://postgres.x:pw@${sbPooler}:6543/postgres\n`, "supabase-pooler-host"],
+  ["a percent-encoded project URL (%2F before the ref)", `next=${pct(`https://${sbHost}/rest/v1`)}\n`, "supabase-project-host"],
+  ["a percent-encoded lower-case %2f before the ref", `next=https%3a%2f%2f${sbHost}\n`, "supabase-project-host"],
+  ["a percent-encoded database host", `u=${pct(`postgres://postgres:pw@${sbDbHost}:5432/postgres`)}\n`, "supabase-project-host"],
+  ["a percent-encoded pooler host", `u=${pct(`https://${sbPooler}`)}\n`, "supabase-pooler-host"],
+  ["a pooler host named after a ref", `host = "${sbRefPooler}"\n`, "supabase-project-host"],
+  ["the pooler user postgres.<ref> in a connection string", `DATABASE_URL=postgres://${sbPoolerUser}:pw@${sbPooler}:6543/postgres\n`, "supabase-pooler-user"],
+  ["the pooler user as PGUSER", `PGUSER=${sbPoolerUser}\n`, "supabase-pooler-user"],
+  ["the pooler user as a user= parameter", `postgres://${sbPooler}:6543/postgres?user=${sbPoolerUser}\n`, "supabase-pooler-user"],
+  ["the pooler user in a percent-encoded URL", `u=${pct(`postgresql://${sbPoolerUser}:pw@${sbPooler}`)}\n`, "supabase-pooler-user"],
+  ["an sb_secret_ key after a percent-encoded byte", `q=apikey%3D${sbSecret}\n`, "supabase-api-key"],
+  ["a service_role JWT after a percent-encoded byte", `q=token%3D${serviceJwt}\n`, "service-role-jwt"],
   ["an sb_secret_ key", `key = "${sbSecret}"\n`, "supabase-api-key"],
   ["an sb_publishable_ key", `VITE_KEY=${sbPublishable}\n`, "supabase-api-key"],
   ["a service_role JWT", `SUPABASE_SERVICE_ROLE_KEY=${serviceJwt}\n`, "service-role-jwt"],
@@ -975,6 +990,11 @@ for (const [name, content, ruleId] of [
     for (const v of [sbRef, sbPooler, sbSecret, serviceJwt]) assert.ok(!r.out.includes(v), r.out);
   });
 }
+
+test("a pooler host named after a ref is reported once, as the project host (never as the waivable pooler host)", () => {
+  const r = expectFinding({ "cfg.ts": `host = "${sbRefPooler}"\n` }, "supabase-project-host");
+  assert.doesNotMatch(r.out, /supabase-pooler-host/);
+});
 
 test("Supabase rules stay quiet on placeholders, docs links, bare key prefixes, an anon JWT and the documented synthetic ref", () => {
   const dir = repoWith({
@@ -987,6 +1007,16 @@ test("Supabase rules stay quiet on placeholders, docs links, bare key prefixes, 
       `anon key ${anonJwt}`,
       // The one documented synthetic ref (SYNTHETIC_SUPABASE_REFS), already in the public history.
       `https://${["abcdefghijklmnopqrst", "supabase", "co"].join(".")}`,
+      `user ${["postgres", "abcdefghijklmnopqrst"].join(".")} and ${pct(`https://${["abcdefghijklmnopqrst", "supabase", "co"].join(".")}`)}`,
+      // Pooler user look-alikes: placeholders, the Railway host, code, a longer or upper-case tail, a dotted host,
+      // a longer name ending in postgres, and percent-encoded docs links.
+      "user postgres.<project-ref> or postgres.[YOUR-PROJECT-REF]; host postgres.railway.internal",
+      "expect(postgres.defaultMountPath).toBe(x); postgres.connectionString",
+      `${["postgres", "qwertyuiopasdfghjklzx"].join(".")} ${["postgres", "QWERTYUIOPASDFGHJKLZ"].join(".")}`,
+      `${["postgres", sbRef, "example", "com"].join(".")} ${["my_postgres", sbRef].join(".")} ${["db.postgres", sbRef].join(".")}`,
+      `${pct("https://supabase.com/docs/guides/database")} and ${pct("https://<project-ref>.supabase.co")}`,
+      // A percent-encoded byte before a LONGER label is still not a ref.
+      `${pct("https://")}averyveryverylongprojectlabel.supabase.co`,
     ].join("\n") + "\n",
   });
   try {
@@ -997,11 +1027,13 @@ test("Supabase rules stay quiet on placeholders, docs links, bare key prefixes, 
   }
 });
 
-test("the synthetic marker does not opt out any Supabase rule", () => {
+test("the synthetic marker does not opt out any Supabase rule that carries a project ref or a key", () => {
   const marked = (v) => `x = "${v}" // public-safety: allow-synthetic test input\n`;
   for (const [v, ruleId] of [
     [sbHost, "supabase-project-host"],
-    [sbPooler, "supabase-pooler-host"],
+    [pct(`https://${sbHost}`), "supabase-project-host"],
+    [sbRefPooler, "supabase-project-host"],
+    [sbPoolerUser, "supabase-pooler-user"],
     [sbSecret, "supabase-api-key"],
     [serviceJwt, "service-role-jwt"],
   ]) {
@@ -1010,15 +1042,68 @@ test("the synthetic marker does not opt out any Supabase rule", () => {
   }
 });
 
+test("a regional pooler host (no project ref) is waivable: the marker opts it out, and it is listed as an opt-out", () => {
+  const dir = repoWith({ "m.md": `Pooler endpoint ${sbPooler} // public-safety: allow-synthetic regional endpoint, names no project\n` });
+  try {
+    const r = runGate(dir);
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /opt-out/);
+    assert.match(r.out, /supabase-pooler-host/);
+    assert.ok(!r.out.includes(sbPooler), r.out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // Without the marker it is still a finding; with the pooler user on the same line, the marker does not help.
+  expectFinding({ "n.md": `Pooler endpoint ${sbPooler}\n` }, "supabase-pooler-host");
+  const r = expectFinding({ "o.md": `postgres://${sbPoolerUser}@${sbPooler} // public-safety: allow-synthetic\n` }, "supabase-pooler-user");
+  assert.match(r.out, /opt-out/);
+});
+
+test("a regional pooler host in history can be waived by a reviewed entry; the pooler user and a ref-named pooler host cannot", () => {
+  const { dir, sha } = historyRepo("pool.md", `endpoint ${sbPooler}\n`);
+  try {
+    let r = runGate(dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /supabase-pooler-host: .*\n\s+if the value is real, rewrite history/);
+    writeFileSync(join(dir, ALLOW), `# reviewed: the regional pooler endpoint of a documentation example, names no project\n${sha}:pool.md:supabase-pooler-host:${sha256(sbPooler)}\n`);
+    r = runGate(dir, "--history");
+    assert.equal(r.code, 0, r.out);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  for (const [value, rule] of [
+    [sbPoolerUser, "supabase-pooler-user"],
+    [sbRefPooler, "supabase-project-host"],
+  ]) {
+    const h = historyRepo("pool.md", `endpoint ${value}\n`);
+    try {
+      writeFileSync(join(h.dir, ALLOW), `# reviewed: it is fine, trust me\n${h.sha}:pool.md:${rule}:${sha256(value)}\n`);
+      const r = runGate(h.dir, "--history");
+      assert.equal(r.code, 1, r.out);
+      assert.match(r.out, new RegExp(`rule ${rule} cannot be allow-listed`));
+    } finally {
+      rmSync(h.dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("--history finds a Supabase host, key and service JWT that were added then removed", () => {
-  const { dir } = historyRepo("old.env.example", `SUPABASE_URL=https://${sbHost}\nKEY=${sbSecret}\nSERVICE=${serviceJwt}\nPOOL=${sbPooler}\n`);
+  const { dir } = historyRepo(
+    "old.env.example",
+    `SUPABASE_URL=https://${sbHost}\nKEY=${sbSecret}\nSERVICE=${serviceJwt}\nPOOL=${sbPooler}\nPGUSER=${sbPoolerUser}\nNEXT=${pct(`https://${sbHostIn}`)}\n`,
+  );
   try {
     assert.equal(runGate(dir).code, 0);
     const r = runGate(dir, "--history");
     assert.equal(r.code, 1, r.out);
-    for (const rule of ["supabase-project-host", "supabase-api-key", "service-role-jwt", "supabase-pooler-host"]) {
+    for (const rule of ["supabase-project-host", "supabase-api-key", "service-role-jwt", "supabase-pooler-user"]) {
       assert.match(r.out, new RegExp(`${rule}: .*\\n\\s+cannot be allow-listed`));
     }
+    // Two project hosts: the plain one and the percent-encoded one.
+    assert.equal(r.out.match(/supabase-project-host: /g)?.length, 2, r.out);
+    // The regional pooler host is reported, but waivable.
+    assert.match(r.out, /supabase-pooler-host: .*\n\s+if the value is real, rewrite history/);
+    for (const v of [sbRef, sbPooler, sbSecret, serviceJwt]) assert.ok(!r.out.includes(v), r.out);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1034,4 +1119,81 @@ test("refuses an allow entry for service-role-jwt (hard error)", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- The gitleaks mirror of the Supabase rules (.gitleaks.toml) ------------------------------------------------
+// The custom rules are read from .gitleaks.toml and run as JavaScript regular expressions (their RE2 syntax here
+// is a subset JavaScript reads the same way, with `(?i)` as the `i` flag), against the same planted values and
+// allowed forms; with GITLEAKS_BIN set (locally, e.g. the pinned 8.30.1), the real binary runs on them as well.
+
+/** [[rules]] blocks of .gitleaks.toml: id, regex, secretGroup and the rule's own secret allowlist regexes. */
+function gitleaksRules() {
+  const toml = readFileSync(resolve(import.meta.dirname, "..", ".gitleaks.toml"), "utf8");
+  return toml
+    .split(/^\[\[rules\]\]$/m)
+    .slice(1)
+    .map((block) => {
+      const id = /^id = "([^"]+)"$/m.exec(block)?.[1];
+      const raw = /^regex = '''(.*)'''$/m.exec(block)?.[1];
+      const group = Number(/^secretGroup = (\d+)$/m.exec(block)?.[1] ?? 0);
+      const allow = [...block.matchAll(/^regexes = \['''(.*)'''\]$/gm)].map((m) => new RegExp(m[1]));
+      const ci = raw.startsWith("(?i)");
+      return { id, re: new RegExp(ci ? raw.slice(4) : raw, ci ? "gi" : "g"), group, allow };
+    });
+}
+function gitleaksHits(text) {
+  const out = [];
+  for (const r of gitleaksRules()) {
+    for (const m of text.matchAll(r.re)) {
+      const secret = m[r.group] ?? m[0];
+      if (!r.allow.some((a) => a.test(secret))) out.push(r.id);
+    }
+  }
+  return out;
+}
+const GITLEAKS_PLANTED = [
+  ["supabase-project-host", `next=${pct(`https://${sbHost}/rest`)}`],
+  ["supabase-project-host", `next=https%3a%2f%2f${sbHostIn}`],
+  ["supabase-project-host", `plain https://${sbHost}`],
+  ["supabase-project-host", `host ${sbRefPooler}`],
+  ["supabase-pooler-user", `DATABASE_URL=postgres://${sbPoolerUser}:pw@${sbPooler}:6543/postgres`],
+  ["supabase-pooler-user", `u=${pct(`postgresql://${sbPoolerUser}:pw@x`)}`],
+  ["supabase-api-key", `q=apikey%3D${sbSecret}`],
+  ["supabase-api-key", `key = "${sbPublishable}"`],
+];
+const GITLEAKS_QUIET = [
+  `regional pooler endpoint ${sbPooler}`, // not a secret: the gate reports it (waivable), gitleaks does not
+  "user postgres.<project-ref> and postgres.railway.internal and postgres.defaultMountPath",
+  `synthetic ${["postgres", "abcdefghijklmnopqrst"].join(".")} and ${pct(`https://${["abcdefghijklmnopqrst", "supabase", "co"].join(".")}`)}`,
+  `${pct("https://supabase.com/docs/guides/database")} ${pct("https://<project-ref>.supabase.co")}`,
+  `longer ${pct("https://")}averyveryverylongprojectlabel.supabase.co and ${["postgres", `${sbRef}x`].join(".")}`,
+  "the `sb_publishable_` key and the `sb_secret_` key",
+];
+
+test("gitleaks mirror: the Supabase rules report every planted form (percent-encoded and pooler user included) and no allowed one", () => {
+  const ids = gitleaksRules().map((r) => r.id);
+  assert.deepEqual(ids, ["supabase-project-host", "supabase-pooler-user", "supabase-api-key"]);
+  for (const [rule, text] of GITLEAKS_PLANTED) assert.ok(gitleaksHits(text).includes(rule), `${rule} not reported`);
+  for (const text of GITLEAKS_QUIET) assert.deepEqual(gitleaksHits(text), [], "an allowed form is reported");
+});
+
+test("gitleaks binary (GITLEAKS_BIN, local): the same planted forms are leaks, the allowed forms are not", { skip: !process.env["GITLEAKS_BIN"] && "GITLEAKS_BIN not set" }, () => {
+  const bin = process.env["GITLEAKS_BIN"];
+  const config = resolve(import.meta.dirname, "..", ".gitleaks.toml");
+  const scan = (lines) => {
+    const dir = mkdtempSync(join(tmpdir(), "gitleaks-mirror-"));
+    try {
+      lines.forEach((l, i) => writeFileSync(join(dir, `f${i}.txt`), `${l}\n`));
+      const report = join(dir, "report.json");
+      spawnSync(bin, ["dir", dir, "--config", config, "--redact", "--no-banner", "--exit-code", "0", "--max-decode-depth", "0", "--report-format", "json", "--report-path", report], { encoding: "utf8" });
+      return JSON.parse(readFileSync(report, "utf8")).filter((f) => f.File.endsWith(".txt"));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const found = scan(GITLEAKS_PLANTED.map(([, t]) => t));
+  for (const [i, [rule]] of GITLEAKS_PLANTED.entries()) {
+    assert.ok(found.some((f) => f.File.endsWith(`f${i}.txt`) && f.RuleID === rule), `f${i}.txt: ${rule} not reported`);
+  }
+  assert.deepEqual(scan(GITLEAKS_QUIET), []);
 });

@@ -17,15 +17,21 @@ regexes = [
 
 # Supabase identifiers and credentials (three-database separation,
 # docs/GUARDRAILS.md G1), mirrored from scripts/check-public-safety.mjs so the
-# secret scan reports them too. A JWT (including a service_role key) is already
-# reported by the default `jwt` rule. The one allow-listed value is the
-# synthetic stand-in project ref used by docs/staging/acceptance/self-test.mjs.
+# secret scan reports them too: the rules that carry a project ref or a key
+# (NEVER_ALLOW there). A JWT (including a service_role key) is already reported
+# by the default `jwt` rule. Each rule below also matches right after a
+# percent-encoded byte (`https%3A%2F%2F<ref>.supabase.co`): RE2 has no
+# lookbehind, and `\b` sees no boundary between the encoded byte's hex digit
+# and the ref. The generic regional pooler host (aws-0-<region>.pooler.supabase.com)
+# names no project and is not a secret, so it is not a gitleaks rule; the
+# public-safety gate still reports it (waivable). The one allow-listed value is
+# the synthetic stand-in project ref used by docs/staging/acceptance/self-test.mjs.
 [[rules]]
 id = "supabase-project-host"
-description = "Concrete Supabase project host (<20-character ref>.supabase.co or .supabase.in)"
-regex = '''(?i)\b([a-z0-9]{20})\.supabase\.(?:co|in)\b'''
+description = "Concrete Supabase project host (<20-character ref>.supabase.co or .supabase.in, or <ref>.pooler.supabase.com)"
+regex = '''(?i)(?:\b|%[0-9a-f]{2})([a-z0-9]{20})\.(?:supabase\.(?:co|in)|pooler\.supabase\.com)\b'''
 secretGroup = 1
-keywords = ["supabase.co", "supabase.in"]
+keywords = ["supabase.co", "supabase.in", "pooler.supabase.com"]
 
 [[rules.allowlists]]
 description = "Synthetic stand-in project ref (exact value only)"
@@ -33,13 +39,19 @@ regexTarget = "secret"
 regexes = ['''^abcdefghijklmnopqrst$''']
 
 [[rules]]
-id = "supabase-pooler-host"
-description = "Concrete Supabase connection-pooler host"
-regex = '''(?i)\b[a-z0-9][a-z0-9-]*\.pooler\.supabase\.com\b'''
-keywords = ["pooler.supabase.com"]
+id = "supabase-pooler-user"
+description = "Supabase pooler user name carrying a project ref (postgres.<20-character ref>)"
+regex = '''(?:\b|%[0-9A-Fa-f]{2})postgres\.([a-z0-9]{20})\b'''
+secretGroup = 1
+keywords = ["postgres."]
+
+[[rules.allowlists]]
+description = "Synthetic stand-in project ref (exact value only)"
+regexTarget = "secret"
+regexes = ['''^abcdefghijklmnopqrst$''']
 
 [[rules]]
 id = "supabase-api-key"
 description = "Supabase API key (sb_secret_ / sb_publishable_)"
-regex = '''\bsb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}'''
+regex = '''(?:\b|%[0-9A-Fa-f]{2})sb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}'''
 keywords = ["sb_secret_", "sb_publishable_"]

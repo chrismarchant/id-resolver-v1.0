@@ -26,11 +26,14 @@
  *   - Supabase identifiers and credentials (three-database separation,
  *     docs/GUARDRAILS.md G1): a concrete project host
  *     (<20-character project ref>.supabase.co or .supabase.in, including
- *     db.<ref>.supabase.co), a concrete connection-pooler host
- *     (<name>.pooler.supabase.com), an sb_secret_ or sb_publishable_ API key,
- *     and a JWT whose payload carries "role":"service_role" (a service key).
- *     Placeholders such as <project-ref>.supabase.co are allowed, and so is
- *     exactly one documented synthetic project ref (SYNTHETIC_SUPABASE_REFS)
+ *     db.<ref>.supabase.co and a ref-named <ref>.pooler.supabase.com), the
+ *     pooler user name postgres.<ref>, an sb_secret_ or sb_publishable_ API
+ *     key, and a JWT whose payload carries "role":"service_role" (a service
+ *     key), also right after a percent-encoded byte (an encoded URL); and a
+ *     concrete regional connection-pooler host (<name>.pooler.supabase.com),
+ *     which names no project and is waivable. Placeholders such as
+ *     <project-ref>.supabase.co are allowed, and so is exactly one documented
+ *     synthetic project ref (SYNTHETIC_SUPABASE_REFS)
  *   - a text file larger than MAX_BYTES that is not on the reviewed list
  *     (it is never skipped silently)
  *
@@ -39,9 +42,10 @@
  * valid UTF-8 is scanned as text (NUL treated as a line break). Anything else
  * is binary: it is NOT scanned and is listed in the output.
  *
- * A line can opt out of the UUID/IPv4/IPv6 rules ONLY with the marker
- * `public-safety: allow-synthetic` and a reason, for deliberately synthetic
- * test inputs. Opt-outs are listed in the output so reviewers see them.
+ * A line can opt out of the UUID/IPv4/IPv6 and regional pooler-host rules
+ * ONLY with the marker `public-safety: allow-synthetic` and a reason, for
+ * deliberately synthetic test inputs (or, for the pooler host, a reviewed
+ * mention). Opt-outs are listed in the output so reviewers see them.
  *
  * Modes:
  *   (default)   every file tracked by git (or untracked and not ignored)
@@ -64,8 +68,9 @@
  * justification comment directly above it (or above its block). Entries for
  * the rules in NEVER_ALLOW are refused as a hard error: a committed key or env
  * file, a real e-mail address, a concrete Railway host or a Supabase project
- * host, pooler host, API key or service-role JWT needs history rewriting and
- * credential rotation, not a waiver. The allow-list is validated in every mode.
+ * host, pooler user (both carry the project ref), API key or service-role JWT
+ * needs history rewriting and credential rotation, not a waiver. The
+ * allow-list is validated in every mode.
  *
  * Output never contains a matched value, nor a hash of one: the repository
  * and its CI logs are public, and a hash of a low-entropy value (an IPv4
@@ -158,33 +163,55 @@ const RULES = [
   // ---- Supabase (three-database separation, docs/GUARDRAILS.md G1) ----------
   // The private Insights project's ref, URL and keys belong in that project's
   // Edge secrets only, never in this public repository or in a website or
-  // browser artifact built from it. None of these rules honours the opt-out
-  // marker, and none can be allow-listed in history (NEVER_ALLOW).
+  // browser artifact built from it. Every rule that carries a project ref or
+  // a key ignores the opt-out marker and cannot be allow-listed in history
+  // (NEVER_ALLOW). The generic regional pooler host carries neither: it is
+  // reported, but waivable (see supabase-pooler-host).
+  // Each rule also matches right after a percent-encoded byte (`%2F`), as in
+  // an encoded URL (`https%3A%2F%2F<ref>.supabase.co`), where the encoded
+  // byte's alphanumeric hex digit would otherwise hide the boundary.
   {
     id: "supabase-project-host",
-    // A project ref is 20 lower-case alphanumerics; `db.<ref>.supabase.co` contains this host too.
-    // "<project-ref>.supabase.co" and "supabase.com/docs" do not match.
-    re: /(?<![A-Za-z0-9])[a-z0-9]{20}\.supabase\.(?:co|in)(?![A-Za-z0-9-])/gi,
+    // A project ref is 20 lower-case alphanumerics; `db.<ref>.supabase.co` contains this host too, and so would a
+    // pooler host named after a ref (`<ref>.pooler.supabase.com`). "<project-ref>.supabase.co" and
+    // "supabase.com/docs" do not match.
+    re: /(?:(?<![A-Za-z0-9])|(?<=%[0-9A-Fa-f]{2}))[a-z0-9]{20}\.(?:supabase\.(?:co|in)|pooler\.supabase\.com)(?![A-Za-z0-9-])/gi,
     allowMarker: false,
     filter: (m) => !SYNTHETIC_SUPABASE_REFS.has(m.slice(0, 20).toLowerCase()),
     why: "concrete Supabase project host (use <project-ref>.supabase.co)",
   },
   {
-    id: "supabase-pooler-host",
-    re: /(?<![A-Za-z0-9-])[a-z0-9][a-z0-9-]*\.pooler\.supabase\.com(?![A-Za-z0-9-])/gi,
+    id: "supabase-pooler-user",
+    // The shared pooler's user name carries the project ref: `postgres.<ref>` (in a URL, a `user=` parameter or
+    // PGUSER). Lower-case and exactly 20 characters, not part of a longer name or a dotted host; placeholders
+    // (`postgres.<project-ref>`) and code such as `postgres.defaultMountPath` do not match.
+    re: /(?:(?<![A-Za-z0-9_.-])|(?<=%[0-9A-Fa-f]{2}))postgres\.[a-z0-9]{20}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])/g,
     allowMarker: false,
-    why: "concrete Supabase connection-pooler host (use <region>.pooler.supabase.com)",
+    filter: (m) => !SYNTHETIC_SUPABASE_REFS.has(m.slice("postgres.".length)),
+    why: "Supabase pooler user name with a project ref (use postgres.<project-ref>)",
+  },
+  {
+    id: "supabase-pooler-host",
+    // A regional endpoint of Supabase's shared connection pooler (`aws-0-<region>.pooler.supabase.com`) is shared by
+    // every project in that region and names none: not a secret. It is still reported, since a concrete pooler host
+    // usually means a connection is being configured, but it is WAIVABLE (the marker, or a reviewed history entry).
+    // The project is identified by the pooler user (supabase-pooler-user) or a ref-named host (supabase-project-host),
+    // both NEVER_ALLOW, so a host whose first label is a ref is left to supabase-project-host.
+    re: /(?:(?<![A-Za-z0-9-])|(?<=%[0-9A-Fa-f]{2}))[a-z0-9][a-z0-9-]*\.pooler\.supabase\.com(?![A-Za-z0-9-])/gi,
+    allowMarker: true,
+    filter: (m) => !/^[a-z0-9]{20}\./i.test(m),
+    why: "concrete Supabase connection-pooler host (use <region>.pooler.supabase.com; a regional endpoint, not a secret: waivable)",
   },
   {
     id: "supabase-api-key",
     // A bare prefix in prose ("an `sb_publishable_` key") is not a key.
-    re: /(?<![A-Za-z0-9])sb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}/g,
+    re: /(?:(?<![A-Za-z0-9])|(?<=%[0-9A-Fa-f]{2}))sb_(?:secret|publishable)_[A-Za-z0-9_-]{16,}/g,
     allowMarker: false,
     why: "Supabase API key (sb_secret_ / sb_publishable_)",
   },
   {
     id: "service-role-jwt",
-    re: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
+    re: /(?:(?<![A-Za-z0-9_-])|(?<=%[0-9A-Fa-f]{2}))eyJ[A-Za-z0-9_-]{8,}\.ey[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g,
     allowMarker: false,
     filter: (m) => isServiceRoleJwt(m),
     why: "JWT whose payload has role service_role (a Supabase service key)",
@@ -226,7 +253,7 @@ const NEVER_ALLOW = new Set([
   "railway-public-host",
   "railway-private-host",
   "supabase-project-host",
-  "supabase-pooler-host",
+  "supabase-pooler-user",
   "supabase-api-key",
   "service-role-jwt",
 ]);

@@ -19,23 +19,40 @@ reporting feed from B (`/v1/reporting/observations`). Nothing else connects.
 ## G1: public-safety gate and secret scan know Supabase
 
 **Enforces.** No concrete Supabase project host (`<20-character ref>.supabase.co` or `.supabase.in`, including
-`db.<ref>.supabase.co`), no concrete connection-pooler host (`<name>.pooler.supabase.com`), no `sb_secret_` or
-`sb_publishable_` key, and no JWT whose decoded payload has `"role":"service_role"` anywhere in the tree, in any
-file or ref name, or anywhere in the git history (every added line, commit and tag message, identity). These
-rules are in the `NEVER_ALLOW` class: they do not honour the `public-safety: allow-synthetic` marker and cannot be
-allow-listed in `.public-safety-history-allow`; a hit needs history rewriting and rotation. Placeholders such as
-`<project-ref>.supabase.co`, links to `supabase.com/docs`, bare key prefixes in prose and anon JWTs are not
+`db.<ref>.supabase.co` and a ref-named `<ref>.pooler.supabase.com`), no pooler user name carrying a project ref
+(`postgres.<20-character ref>`, the user of the shared connection pooler, in a URL, a `user=` parameter or
+`PGUSER`), no `sb_secret_` or `sb_publishable_` key, and no JWT whose decoded payload has `"role":"service_role"`
+anywhere in the tree, in any file or ref name, or anywhere in the git history (every added line, commit and tag
+message, identity). These rules are in the `NEVER_ALLOW` class: they do not honour the
+`public-safety: allow-synthetic` marker and cannot be allow-listed in `.public-safety-history-allow`; a hit needs
+history rewriting and rotation. Each of them also matches right after a percent-encoded byte, as in an encoded URL
+(`https%3A%2F%2F<ref>.supabase.co`), where the encoded byte's hex digit would otherwise hide the boundary.
+Placeholders such as `<project-ref>.supabase.co` and `postgres.<project-ref>`, links to `supabase.com/docs`, bare
+key prefixes in prose, anon JWTs, `postgres.railway.internal` and code such as `postgres.defaultMountPath` are not
 reported. Exactly one synthetic stand-in ref, already in the public history
-(`docs/staging/acceptance/self-test.mjs`), is exempt by exact value (`SYNTHETIC_SUPABASE_REFS`). The project-host,
-pooler-host and key rules are mirrored as custom gitleaks rules in `.gitleaks.toml` (gitleaks' default `jwt` rule
-already reports every JWT).
+(`docs/staging/acceptance/self-test.mjs`), is exempt by exact value (`SYNTHETIC_SUPABASE_REFS`).
+
+**The regional pooler host is waivable.** A concrete connection-pooler host (`aws-0-<region>.pooler.supabase.com`)
+is still reported (`supabase-pooler-host`), since one in the repository usually means a connection is being
+configured, but it is not in `NEVER_ALLOW`: it is a regional endpoint shared by every project in that region and
+names none, so it is not a secret and gives nothing to rotate. A reviewed mention can carry the marker, and a
+historical one can be allow-listed with a justification. What identifies a project, the pooler user
+`postgres.<ref>` or a host named after the ref, stays `NEVER_ALLOW`.
+
+The `NEVER_ALLOW` Supabase rules (project host, pooler user, API key) are mirrored as custom gitleaks rules in
+`.gitleaks.toml`, with the same percent-encoding handling (RE2 has no lookbehind: an alternative `%XX` prefix);
+gitleaks' default `jwt` rule already reports every JWT. The regional pooler host is not a gitleaks rule (gitleaks
+is the secret scan, and the host is not a secret; the gate covers it).
 
 **Files.** `scripts/check-public-safety.mjs`, `scripts/check-public-safety.test.mjs`, `.gitleaks.toml`,
 `.public-safety-history-allow` (header), `docs/PUBLIC_REPO_SECURITY.md`.
 
-**Tests.** The self-test plants each value (assembled at runtime) in the tree and in history, proves the marker
-does not opt it out, that an allow-list entry for each rule is refused, that output is redacted, and that the
-allowed forms stay quiet.
+**Tests.** The self-test plants each value (assembled at runtime) in the tree and in history, also
+percent-encoded, proves the marker does not opt out a `NEVER_ALLOW` rule, that an allow-list entry for each is
+refused, that the regional pooler host is opted out by the marker and waived by a reviewed entry (and a ref-named
+pooler host is not), that output is redacted, and that the allowed forms stay quiet. The gitleaks rules are read
+from `.gitleaks.toml` and run on the same planted and allowed forms; with `GITLEAKS_BIN` set (locally), the real
+binary is run on them too.
 
 ## G2: website and browser artifacts carry nothing of B's reporting side or of C
 
