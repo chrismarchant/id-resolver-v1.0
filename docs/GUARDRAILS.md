@@ -202,7 +202,7 @@ an erased company; the result counts such items as `ignored_erased`, and the cou
 Edge function's run result, its response (`"ignored_erased"`) and, when not zero, its log line (`PostgrestStore`,
 `engine.ts`, `handler.ts`; tests in `test/handler.test.ts`). The check is one lookup per observation by
 `(installation_id, company_id)`; schema 8 adds the index `idr_tombstones_company_idx` on exactly those columns
-(idempotently), so it never scans `idr_tombstones`.
+(idempotently), so the lookup does not have to scan `idr_tombstones`.
 
 **Tests.** `integrations/supabase-edge/test/apply-guards.test.ts`: a stale page after the tombstone, an
 observation after its tombstone in the same page, a replay through the engine after a resync (positive); a
@@ -222,7 +222,7 @@ npm ci --ignore-scripts
 # G1
 node scripts/check-public-safety.mjs
 node scripts/check-public-safety.mjs --history
-node --test scripts/check-public-safety.test.mjs
+node --test scripts/check-public-safety.test.mjs   # GITLEAKS_BIN=/path/to/gitleaks also runs the binary on the planted forms
 gitleaks git . --config .gitleaks.toml --redact --no-banner --exit-code 1   # pinned 8.30.1, as in CI
 # G2-G7 (PostgreSQL 16+ with a superuser test role, as in CI)
 export TEST_DATABASE_URL=postgres://resolver:resolver@127.0.0.1:5432/id_resolver_test
