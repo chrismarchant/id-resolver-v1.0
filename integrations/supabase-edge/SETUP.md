@@ -49,7 +49,7 @@ the owner). The temporary schema is listed **last** on purpose (CHR-66 G5R1-M1):
 `search_path`, PostgreSQL still looks up type names in the caller's temporary schema first, so a
 session that may call these functions could have planted a `pg_temp.text` (or `jsonb`,
 `timestamptz`) domain whose check ran its own code with the owner's rights. Schema 6 (Gate 5
-before this fix) had that flaw; re-run the script (schema 7) on every project. So a holder of the service-role key
+before this fix) had that flaw; re-run the script (schema 7 or later) on every project. So a holder of the service-role key
 cannot insert a gap row, mark one resolved, or change `needs_resync`, the generations,
 `reset_from_*` or `drained_generation` directly; the state machine described under "`needs_resync`
 and `idr_sync_gaps`" is the only way. A change by hand (for example deleting projection rows) must
@@ -59,6 +59,27 @@ holds.
 No role but the owner keeps `TRUNCATE`, `REFERENCES`, `TRIGGER` or `MAINTAIN` on any `idr_*` table, write
 access to the view, or any privilege on the `idr_sync_gaps` id sequence (an identity column needs none).
 Re-running the script on an existing project removes those privileges there too.
+
+These exposure rules are enforced as invariants by `test/exposure.test.ts` (`docs/GUARDRAILS.md` G4), also with
+Supabase's RLS auto-enable event trigger (`ensure_rls`) emulated: no `anon` or `PUBLIC` privilege on any `idr_*`
+object, `authenticated` only `SELECT` and only through RLS policies, no `idr_*` function executable by `anon`,
+`authenticated` or `PUBLIC`, and a pinned `search_path` on every `SECURITY DEFINER` function. The projection
+stays in `public` for now; moving it to a dedicated schema is a separate, reviewed change.
+
+### Schema 8 (guardrails)
+
+Schema 8 changes `idr_apply_feed_page` only (`docs/GUARDRAILS.md` G5 and G7); no table, grant or cursor rule
+changes, and the sync never halts because of either:
+
+* **Erasure propagation.** An `observation` item whose `company_id` already has a tombstone of this installation
+  in `idr_tombstones` is ignored (the resolver never reuses a company id), so a re-applied or replayed page cannot
+  resurrect an erased company. The function's result counts these as `ignored_erased`.
+* **`page_key` guard.** `page_key` is re-checked against the resolver's own rule (1-256 characters, starting with
+  `/`, no `?`, `#`, whitespace or control character). A value that fails it is not stored: the observation is kept
+  with `page_key` null, and the result counts it as `page_keys_cleared`. Every value the resolver serves passes.
+
+Upgrade: re-run the script (it is idempotent and keeps every row); until then the function answers
+`schema_mismatch` and fetches nothing. The engine of this release requires schema 8.
 
 ### How to apply it
 
@@ -131,6 +152,8 @@ supabase secrets set --project-ref <project-ref> \
   IDR_SYNC_SECRET="$IDR_SYNC_SECRET"
 ```
 
+`IDR_BASE_URL` is the ID Resolver service: a host under `supabase.co`, `supabase.in` or `supabase.com` is refused
+as misconfigured (`docs/GUARDRAILS.md` G3c), so the reporting token is never sent to a Supabase project.
 `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are provided by Supabase. Optional tuning:
 `IDR_PAGE_LIMIT` (1-500, default 200), `IDR_MAX_PAGES` (default 50), `IDR_BUDGET_MS`
 (default 50000, max 140000), `IDR_REQUEST_TIMEOUT_MS`, `IDR_MAX_RETRIES`,
@@ -206,7 +229,7 @@ used.
 | `contract_error` | malformed response, wrong installation id, or 4xx | check `IDR_BASE_URL` and `IDR_INSTALLATION_ID`; resolver version |
 | `cursor_rejected` | resolver answered 400 to the stored cursor: its cursor key rotated (its `IP_HMAC_SECRET` was rotated) and the cursor is not behind its retention watermark; the engine reset the cursor once and replayed from the buffer start. The rejected cursor is kept in `idr_sync_state.reset_from_cursor` until the first page of the replay is applied; if the replay did not start (resolver blip, function killed), the next run first presents it again, and a 410 then becomes a recorded gap instead of a silent loss. The first page after that check is sent at once and only once (no retry or backoff; any failure ends the run with the position kept, so the next run checks again); what remains unchecked is the interval between the resolver's check and that one request (plus, right after a 400, the one store write that keeps the position), each bounded by its timeout | none: the replay is idempotent and nothing after the cursor was pruned. A stale cursor that is already behind the resolver's retention buffer gets 410 instead and ends in `needs_resync` with an `idr_sync_gaps` row, so a potential gap is never reported as `cursor_rejected`. Repeated every run means the resolver keeps rejecting cursors: check its version/secret rotation |
 | `store_error` | database call failed | check that the SQL was applied and the function logs |
-| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 7 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
+| `schema_mismatch` | the installed projection SQL is not the version this function requires (`idr_schema_version()`, 8 for this release); the function fetched and wrote nothing. HTTP 500 | re-run `sql/0001_idr_projection.sql` (idempotent, keeps all rows); alert on it |
 | `reconcile_mismatch` | projection differs from the resolver summary | see below |
 | `needs_resync` | resolver answered 410 `cursor_expired`: a **potential synchronisation continuity gap**. The function responds `409` with `"gap_recorded": true` and an `idr_sync_gaps` row exists | alert; see below |
 

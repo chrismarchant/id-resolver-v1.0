@@ -3,8 +3,10 @@
  * must stay re-runnable over installs of earlier releases, keeping every
  * existing row. Fixtures are verbatim copies of the script as released at
  * 6318ab2 (before the gap log), f12b1ad (gap log, round 2), fced2ea
- * (schema version 4, the Gate 3 release), 399aef7 (schema 5, G4-L4) and
- * 0b1331e (schema 6, as merged in Gate 5 before CHR-66 G5R1-M1/L3). Every
+ * (schema version 4, the Gate 3 release), 399aef7 (schema 5, G4-L4),
+ * 0b1331e (schema 6, as merged in Gate 5 before CHR-66 G5R1-M1/L3) and
+ * 92933e2 (schema 7, as released on main at the end of Gate 5, before the
+ * schema 8 guardrails of docs/GUARDRAILS.md G5/G7). Every
  * install is created under Supabase's default privileges (freshPublicSchema),
  * so the upgrade must also take away what those defaults granted (G4-L4).
  */
@@ -30,9 +32,10 @@ const LEGACY = {
   fced2ea: fixture("0001_idr_projection.fced2ea.sql"),
   "399aef7": fixture("0001_idr_projection.399aef7.sql"),
   "0b1331e": fixture("0001_idr_projection.0b1331e.sql"),
+  "92933e2": fixture("0001_idr_projection.92933e2.sql"),
 } as const;
-/** Releases with idr_schema_version() and generations: schema 4, 5 and 6. */
-const GENERATIONS = ["fced2ea", "399aef7", "0b1331e"] as const;
+/** Releases with idr_schema_version() and generations: schema 4, 5, 6 and 7. */
+const GENERATIONS = ["fced2ea", "399aef7", "0b1331e", "92933e2"] as const;
 const hasGenerations = (v: keyof typeof LEGACY) => (GENERATIONS as readonly string[]).includes(v);
 const D = "2026-11-02T12:00:00.000Z";
 
@@ -62,7 +65,7 @@ async function installLegacy(version: keyof typeof LEGACY): Promise<void> {
 async function seedLegacyState(version: keyof typeof LEGACY): Promise<void> {
   const items = JSON.stringify([obs(1, 7, D), obs(2, 7, D)]);
   if (hasGenerations(version)) {
-    // Schema 4, 5 and 6: the five-argument apply call (schema 6 defaults its sixth argument),
+    // Schema 4 to 7: the five-argument apply call (schema 6 and 7 default the sixth argument),
     // the three-argument gap record (an open gap with needs_resync).
     await asRole(pool, "service_role", (c) => c.query("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null)", [INSTALLATION, items]));
     await asRole(pool, "service_role", (c) => c.query("select public.idr_record_sync_gap($1, 'cursor_expired', 'c2')", [INSTALLATION]));
@@ -84,7 +87,7 @@ const idrFunctions = async () =>
     )
   ).rows;
 
-describe.each(["6318ab2", "f12b1ad", "fced2ea", "399aef7", "0b1331e"] as const)("upgrade from the %s release (halted: an open gap with needs_resync)", (version) => {
+describe.each(["6318ab2", "f12b1ad", "fced2ea", "399aef7", "0b1331e", "92933e2"] as const)("upgrade from the %s release (halted: an open gap with needs_resync)", (version) => {
   it("R2-6: before the upgrade the current function refuses loudly (schema_mismatch, HTTP 500), fetches nothing and writes nothing", async () => {
     await installLegacy(version);
     await seedLegacyState(version);
@@ -208,6 +211,32 @@ describe.each(GENERATIONS)("upgrade from the %s release in the middle of a resyn
     const r = await runSync(testConfig(mock), testDeps(new PgStore(pool)));
     expect(r).toMatchObject({ status: "ok", gapsResolved: 1 });
     expect((await gapRows(pool)).map((g) => g.resolution)).toEqual(["full_resync"]);
+  });
+});
+
+describe.each(["6318ab2", "f12b1ad", "fced2ea", "399aef7", "0b1331e", "92933e2"] as const)("schema 8 guards after upgrading from the %s release (G5, G7)", (version) => {
+  it("a tombstone recorded by the earlier release blocks a later observation of that company; an invalid page_key is not stored; existing rows are kept", async () => {
+    await installLegacy(version);
+    // Under the earlier release: company 7 observed then erased, company 8 observed.
+    const legacyItems = JSON.stringify([obs(1, 7, D), obs(2, 8, D), { type: "company_erased", tombstone_id: "1", company_id: 7, erased_at: D }]);
+    const call = hasGenerations(version) ? "select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb, null)" : "select public.idr_apply_feed_page($1, null, 'c1', $2::jsonb)";
+    await asRole(pool, "service_role", (c) => c.query(call, [INSTALLATION, legacyItems]));
+    const before = await pool.query("select * from public.idr_observations order by observation_id");
+    await ensureProjection(pool);
+    expect((await pool.query<{ v: number }>("select public.idr_schema_version() as v")).rows[0]!.v).toBe(8);
+    expect((await pool.query("select * from public.idr_observations order by observation_id")).rows).toEqual(before.rows);
+    const r = await asRole(pool, "service_role", (c) =>
+      c.query<{ r: Record<string, unknown> }>("select public.idr_apply_feed_page($1, 'c1', 'c2', $2::jsonb, null) as r", [
+        INSTALLATION,
+        JSON.stringify([obs(1, 7, D), obs(3, 7, D), obs(4, 8, D, { page_key: "/p?x=1" })]),
+      ]),
+    );
+    expect(r.rows[0]!.r).toEqual({ applied: true, observations: 1, tombstones: 0, ignored_erased: 2, page_keys_cleared: 1 });
+    const rows = (await pool.query<{ id: number; c: number; k: string | null }>("select observation_id::int as id, company_id::int as c, page_key as k from public.idr_observations order by 1")).rows;
+    expect(rows).toEqual([
+      { id: 2, c: 8, k: "/pricing" },
+      { id: 4, c: 8, k: null },
+    ]);
   });
 });
 

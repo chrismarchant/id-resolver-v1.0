@@ -33,7 +33,7 @@ export interface FeedPage {
  * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
  * this code requires. The engine refuses to run against any other.
  */
-export const PROJECTION_SCHEMA_VERSION = 7;
+export const PROJECTION_SCHEMA_VERSION = 8;
 
 export interface SyncState {
   /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
