@@ -27,6 +27,11 @@ export interface FeedPage {
   items: FeedItem[];
   nextCursor: string;
   hasMore: boolean;
+  /**
+   * Observations whose page_key failed the resolver's own rule (G5) and was
+   * replaced by null by the validator: the value is never forwarded.
+   */
+  pageKeysCleared: number;
 }
 
 /**
@@ -226,7 +231,9 @@ export interface SyncResult {
   ignoredErased: number;
   /**
    * page_key values not stored because they failed the resolver's own rule
-   * (G5); the observation is kept with page_key null. A count only.
+   * (G5): cleared by the validator before the store (FeedPage), or by the
+   * store's own re-check. The observation is kept with page_key null. A
+   * count only.
    */
   pageKeysCleared: number;
 }

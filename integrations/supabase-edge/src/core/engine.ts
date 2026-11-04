@@ -299,7 +299,7 @@ export async function runSync(cfg: SyncConfig, deps: SyncDeps): Promise<SyncResu
     result.tombstones += applied.tombstones;
     // Schema 8 counts (G7, G5): additive, 0 when a store does not report them.
     result.ignoredErased += applied.ignoredErased ?? 0;
-    result.pageKeysCleared += applied.pageKeysCleared ?? 0;
+    result.pageKeysCleared += page.pageKeysCleared + (applied.pageKeysCleared ?? 0);
     if (!page.hasMore) {
       drained = true;
       break;

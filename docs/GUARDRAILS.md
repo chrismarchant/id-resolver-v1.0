@@ -116,13 +116,32 @@ allowlist: `ip_resolution_cache.ip_fingerprint`, the 32-byte HMAC-SHA-256 of the
 `apps/resolver/test/integration/schema-no-raw-ip.test.ts` (planted columns caught, including behind a domain, in a
 view and in another schema).
 
-**page_key guard (projection schema 8).** `idr_apply_feed_page` re-checks `page_key` against the resolver's own
-rule (`apps/resolver/migrations/0005`: 1-256 characters, leading `/`, no `?`, `#`, whitespace or control
-character). A failing value is not stored: the observation is kept with `page_key` null (the value the contract
-already allows), the page applies and the cursor advances, so the sync neither halts nor stores the value; the
-result counts it as `page_keys_cleared`. Tests: `integrations/supabase-edge/test/apply-guards.test.ts` (every
-valid form stored unchanged; each invalid form cleared, at the function and through the engine),
-`test/upgrade.test.ts` (after upgrading from every release).
+**page_key guard (projection schema 8).** `page_key` is checked against the resolver's own rule
+(`isValidPageKey` in `apps/resolver/src/contracts/api.ts`, and the CHECK of `apps/resolver/migrations/0005`:
+1-256 **code points**, leading `/`, no `?`, `#`, whitespace, control character or lone surrogate), twice:
+
+* by the Edge function's validator (`src/core/validate.ts`, `isResolverPageKey`), which counts code points
+  exactly as the resolver does (not UTF-16 code units: a character outside the Basic Multilingual Plane, such as
+  an emoji, is one code point and two units). A failing value is replaced by null before the page reaches the
+  store, so it is never even sent to the database;
+* by `idr_apply_feed_page` (`char_length`, the same rule in SQL), for anything that reaches it by another path.
+
+A failing value is not stored: the observation is kept with `page_key` null (the value the contract already
+allows), the page applies and the cursor advances, so the sync neither halts nor stores the value. Both counts
+are reported as `page_keys_cleared` in the run result, the function's response and (when not zero) its log line.
+Only a `page_key` that is not a string at all is a contract violation (`contract_error`), as before. Every page
+the resolver serves passes, so a resolver-valid page never halts the sync on its `page_key`.
+
+**A null `page_key` is ambiguous** (documentation only, nothing records which): it means either that the resolver
+sent none (an observation recorded through an older contract, which the contract allows) or that G5 cleared a
+value that failed the rule. `page_keys_cleared` counts the second case per run; the projection does not mark
+the row.
+
+Tests: `integrations/supabase-edge/test/apply-guards.test.ts` (every valid form stored unchanged; each invalid
+form cleared, at the function and through the engine; astral-plane keys at the 256/257 code-point boundary
+through the engine; the validator's rule compared with the resolver's own `isValidPageKey` over valid, boundary
+and invalid keys; a page of resolver-valid keys never halts), `test/upgrade.test.ts` (after upgrading from every
+release).
 
 ## G6: reporting-feed wire allowlist (resolver)
 

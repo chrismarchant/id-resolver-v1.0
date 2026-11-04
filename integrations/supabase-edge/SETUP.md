@@ -74,9 +74,11 @@ changes, and the sync never halts because of either:
 * **Erasure propagation.** An `observation` item whose `company_id` already has a tombstone of this installation
   in `idr_tombstones` is ignored (the resolver never reuses a company id), so a re-applied or replayed page cannot
   resurrect an erased company. The function's result counts these as `ignored_erased`.
-* **`page_key` guard.** `page_key` is re-checked against the resolver's own rule (1-256 characters, starting with
-  `/`, no `?`, `#`, whitespace or control character). A value that fails it is not stored: the observation is kept
-  with `page_key` null, and the result counts it as `page_keys_cleared`. Every value the resolver serves passes.
+* **`page_key` guard.** `page_key` is re-checked against the resolver's own rule (1-256 code points, starting with
+  `/`, no `?`, `#`, whitespace or control character), by the function before it writes and again by the SQL
+  function. A value that fails it is not stored: the observation is kept with `page_key` null, and the result
+  counts it as `page_keys_cleared`. Every value the resolver serves passes. A null `page_key` therefore means
+  either "none sent" (an older contract) or "cleared by the guard"; only the count tells them apart.
 
 Both counts reach the function's response (`"ignored_erased"`, `"page_keys_cleared"`, next to `"observations"`)
 and, when not zero, its log line: counts only, never a value. A non-zero `page_keys_cleared` means the resolver

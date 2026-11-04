@@ -10,7 +10,8 @@
  */
 import type pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { runSync } from "../src/core/index.ts";
+import { isValidPageKey as resolverIsValidPageKey } from "../../../apps/resolver/src/contracts/api.ts";
+import { codePointLength, isResolverPageKey, parseFeedPage, runSync } from "../src/core/index.ts";
 import { INSTALLATION, PgStore, asRole, counts, newPool, resetDatabase, storedCursor, truncateAll } from "./helpers/db.ts";
 import { MockResolver, obs, tomb } from "./helpers/mock-resolver.ts";
 import { testConfig, testDeps } from "./helpers/setup.ts";
@@ -143,6 +144,101 @@ describe("G5: page_key guard (the resolver's rule, migration 0005)", () => {
       const dump = JSON.stringify((await pool.query("select * from public.idr_observations")).rows);
       expect(dump).not.toContain(key);
     }
+  });
+
+  // Code points, not UTF-16 code units (the resolver's unit: isValidPageKey counts Array.from, migration 0005
+  // char_length). A character outside the Basic Multilingual Plane is one code point and two UTF-16 units.
+  const ASTRAL = "\u{1F600}";
+  const astralKey = (codePoints: number) => `/${ASTRAL.repeat(codePoints - 1)}`;
+
+  it("the units: an astral key of 256 code points is 511 UTF-16 units; the resolver accepts it, and 257 it refuses", () => {
+    expect(codePointLength(astralKey(256))).toBe(256);
+    expect(astralKey(256).length).toBe(511);
+    expect(resolverIsValidPageKey(astralKey(256))).toBe(true);
+    expect(resolverIsValidPageKey(astralKey(257))).toBe(false);
+  });
+
+  it("the validator applies exactly the resolver's rule (differential, over valid, boundary and invalid keys)", () => {
+    const corpus = [
+      ...VALID,
+      ...INVALID.map(([, k]) => k),
+      astralKey(150),
+      astralKey(256),
+      astralKey(257),
+      `/${"\u00e9".repeat(255)}`,
+      `/${"\u00e9".repeat(256)}`,
+      `/${"a".repeat(254)}${ASTRAL}`,
+      `/${"a".repeat(255)}${ASTRAL}`,
+      "/a\u00a0b", // no-break space (\s)
+      "/a\u2028b", // line separator
+      "/a\u0085b", // NEL (a C1 control)
+      "/a\ufeffb", // BOM (\s in JavaScript)
+      "/a\ud800b", // lone high surrogate
+      "/a\udc00b", // lone low surrogate
+      "/\u{10FFFF}",
+      "//",
+      "/%3F",
+    ];
+    for (const k of corpus) expect(isResolverPageKey(k), JSON.stringify(k)).toBe(resolverIsValidPageKey(k));
+  });
+
+  it("the reviewer's case: 150 emoji (151 code points, 301 UTF-16 units) is a valid page, not a contract error", () => {
+    const key = astralKey(151);
+    expect(key.length).toBe(301);
+    const page = parseFeedPage({ version: "1", contract: "reporting-feed.v1", scope: { installation_id: INSTALLATION }, items: [obs(1, 7, D, { page_key: key })], next_cursor: "c1", has_more: false }, INSTALLATION);
+    expect(page).not.toBeNull();
+    expect(page!.pageKeysCleared).toBe(0);
+    expect(page!.items[0]).toMatchObject({ page_key: key });
+  });
+
+  it("through the engine: astral keys at the boundary; 256 code points stored unchanged, 257 cleared (G5), never a halt", async () => {
+    const k256 = astralKey(256);
+    const k257 = astralKey(257);
+    mock.items = [obs(1, 7, D, { page_key: astralKey(151) }), obs(2, 7, D, { page_key: k256 }), obs(3, 7, D, { page_key: k257 }), obs(4, 7, D, { page_key: `/${"a".repeat(256)}` })];
+    const r = await runSync(testConfig(mock), testDeps(new PgStore(pool)));
+    expect(r).toMatchObject({ status: "ok", pages: 2, observations: 4, pageKeysCleared: 2 });
+    const rows = (await pool.query<{ id: number; k: string | null; n: number | null }>("select observation_id::int as id, page_key as k, char_length(page_key) as n from public.idr_observations order by 1")).rows;
+    expect(rows).toEqual([
+      { id: 1, k: astralKey(151), n: 151 },
+      { id: 2, k: k256, n: 256 },
+      { id: 3, k: null, n: null },
+      { id: 4, k: null, n: null },
+    ]);
+    expect(await storedCursor(pool)).toBe("c4");
+    // A replay of the same stream (at-least-once) changes nothing and still does not halt.
+    await pool.query("select public.idr_begin_resync($1)", [INSTALLATION]);
+    const again = await runSync(testConfig(mock), testDeps(new PgStore(pool)));
+    expect(again).toMatchObject({ status: "ok", observations: 0, pageKeysCleared: 2 });
+    expect((await pool.query("select observation_id::int as id, page_key as k from public.idr_observations order by 1")).rows).toEqual(rows.map(({ id, k }) => ({ id, k })));
+  });
+
+  it("through the engine: a page of resolver-valid keys only never halts and stores every key unchanged", async () => {
+    const keys = [...VALID, astralKey(2), astralKey(129), astralKey(256), `/${"\u00e9".repeat(255)}`, `/${"a".repeat(255)}`];
+    for (const k of keys) expect(resolverIsValidPageKey(k), k).toBe(true);
+    mock.items = keys.map((k, i) => obs(i + 1, 7, D, { page_key: k }));
+    const r = await runSync(testConfig(mock, { pageLimit: 5 }), testDeps(new PgStore(pool)));
+    expect(r).toMatchObject({ status: "ok", observations: keys.length, pageKeysCleared: 0 });
+    expect((await pool.query<{ k: string }>("select page_key as k from public.idr_observations order by observation_id")).rows.map((x) => x.k)).toEqual(keys);
+  });
+
+  it("a page_key that is not a string is still a contract violation (the type is the contract)", async () => {
+    for (const bad of [42, true, ["/a"], { p: "/a" }]) {
+      mock.reset();
+      mock.items = [obs(1, 7, D, { page_key: bad })];
+      expect((await runSync(testConfig(mock), testDeps(new PgStore(pool)))).status, JSON.stringify(bad)).toBe("contract_error");
+    }
+    expect(await storedCursor(pool)).toBeNull();
+  });
+
+  it("organisation_name is bounded in code points too (the resolver caps it at 200 code points)", () => {
+    const page = (name: string) =>
+      parseFeedPage({ version: "1", contract: "reporting-feed.v1", scope: { installation_id: INSTALLATION }, items: [obs(1, 7, D, { organisation_name: name })], next_cursor: "c1", has_more: false }, INSTALLATION);
+    // 512 astral code points are 1024 UTF-16 units: accepted (the earlier UTF-16 bound refused anything over 512 units).
+    expect(page(ASTRAL.repeat(512))?.items[0]).toMatchObject({ organisation_name: ASTRAL.repeat(512) });
+    expect(page(ASTRAL.repeat(200))).not.toBeNull();
+    // Over the bound is still a contract violation, as before.
+    expect(page(ASTRAL.repeat(513))).toBeNull();
+    expect(page("a".repeat(513))).toBeNull();
   });
 
   it("through the engine: an invalid page_key does not halt the sync (status ok, value not stored)", async () => {
