@@ -154,6 +154,39 @@ describe("configuration", () => {
     expect(loadConfig({ ...base, IDR_ALLOW_INSECURE_HTTP: "true" }).ok).toBe(true);
   });
 
+  it("G3c: refuses an IDR_BASE_URL on a Supabase host (fixed message, no value); SUPABASE_URL stays a Supabase host", () => {
+    const base = env({ SUPABASE_URL: "https://example-project.supabase.co", IDR_ALLOW_INSECURE_HTTP: undefined });
+    for (const url of [
+      "https://example-project.supabase.co",
+      "https://example-project.supabase.co/functions/v1/idr-sync",
+      "https://EXAMPLE-PROJECT.SUPABASE.CO./",
+      "https://example-project.supabase.in",
+      "https://pooler.supabase.com",
+      "https://example-project.supabase%2Eco",
+    ]) {
+      const r = loadConfig({ ...base, IDR_BASE_URL: url });
+      expect(r.ok, url).toBe(false);
+      if (!r.ok) {
+        expect(r.problems).toEqual(["IDR_BASE_URL must be the ID Resolver service, never a Supabase host"]);
+        expect(r.problems.join(" ")).not.toContain("example-project");
+      }
+    }
+    // Positive: the resolver's own host, and look-alikes, with this project's Supabase URL.
+    for (const url of ["https://resolver.example.com", "https://supabase.co.example.com", "https://resolver.example.com/supabase.co"]) {
+      expect(loadConfig({ ...base, IDR_BASE_URL: url }).ok, url).toBe(true);
+    }
+  });
+
+  it("G3c: the handler answers misconfigured and fetches nothing when IDR_BASE_URL is a Supabase host", async () => {
+    const logs: string[] = [];
+    const res = await handleSyncRequest(post({ "x-idr-sync-secret": SECRET }), { ...deps({ IDR_BASE_URL: "https://example-project.supabase.co" }), log: (m) => logs.push(m) });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ status: "misconfigured" });
+    expect(mock.requests).toHaveLength(0);
+    expect(logs.join(" ")).toContain("IDR_BASE_URL must be the ID Resolver service, never a Supabase host");
+    expect(logs.join(" ")).not.toContain("example-project");
+  });
+
   it("rejects URLs with credentials, bad bounds, and never echoes values", () => {
     const r = loadConfig(env({ IDR_BASE_URL: "https://user:pw@" + "resolver.example.com", IDR_PAGE_LIMIT: "9999" }));
     expect(r.ok).toBe(false);
