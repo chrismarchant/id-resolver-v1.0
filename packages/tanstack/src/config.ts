@@ -125,12 +125,12 @@ const TOKEN = /^[\x21-\x7e]{32,512}$/;
  * resolverUrl on a Supabase-operated domain (a project, its database or its pooler) is a misconfiguration that could
  * send the website's resolver token to a Supabase project, so it is refused like any other invalid option.
  */
-const SUPABASE_DOMAINS = ["supabase.co", "supabase.in", "supabase.com"] as const;
+const NOT_RESOLVER_DOMAINS = ["supabase.co", "supabase.in", "supabase.com"] as const;
 
 /** True for a Supabase-operated host name (WHATWG-normalised, so lower case; a trailing dot is ignored). */
 function isSupabaseHost(hostname: string): boolean {
   const h = hostname.toLowerCase().replace(/\.+$/, "");
-  return SUPABASE_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
+  return NOT_RESOLVER_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
 }
 
 export function intIn(name: string, v: number | undefined, min: number, max: number, dflt: number): number {
