@@ -1,0 +1,16 @@
+{
+  "name": "@idr/bigquery-sync",
+  "version": "1.0.0-dev.0",
+  "private": true,
+  "description": "Scheduled job that copies the ID Resolver reporting feed (reporting-feed.v1) into one BigQuery table, replacing it on every run",
+  "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "verify": "node --test \"test/*.test.mjs\""
+  },
+  "license": "UNLICENSED"
+}
