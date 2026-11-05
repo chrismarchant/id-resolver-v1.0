@@ -11,7 +11,8 @@
  *   sees the winner's work and does nothing.
  *
  * CLI: `npm run migrate` / `node dist/db/migrate.js` needs DATABASE_URL (the
- * owner) and follows the service's database TLS policy (DATABASE_SSL, default
+ * owner), refuses SUPABASE_* variables and a Supabase-hosted DATABASE_URL like
+ * the service (docs/GUARDRAILS.md G3a), and follows the service's database TLS policy (DATABASE_SSL, default
  * "require"; DATABASE_TLS_PIN_SHA256; DATABASE_CA_CERT; NODE_ENV=production,
  * the default, refuses disable and unverified TLS). With
  * DATABASE_RUNTIME_PASSWORD set it also provisions the runtime role
@@ -21,7 +22,7 @@ import { readdir, readFile } from "node:fs/promises";
 import type { QueryConfig, QueryResultRow } from "pg";
 import { pathToFileURL } from "node:url";
 import type { Logger } from "../log/index.js";
-import { ConfigError, ConfigSchema, databaseUrlUser, loadDatabaseTls } from "../config/index.js";
+import { assertNoSupabaseConfiguration, ConfigError, ConfigSchema, databaseUrlUser, loadDatabaseTls } from "../config/index.js";
 import { createPool, DbError, guarded, toDbError, type Pool } from "./pool.js";
 import { provisionRuntimeRole, RuntimeRoleError, type ProvisionResult } from "./runtime-role.js";
 import type { DbTlsConfig } from "./tls.js";
@@ -200,6 +201,15 @@ async function main(): Promise<void> {
   const urlCheck = DatabaseUrlSchema.safeParse({ DATABASE_URL: databaseUrl });
   if (!urlCheck.success) {
     console.error(`migrate: invalid configuration: ${urlCheck.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+    process.exitCode = 1;
+    return;
+  }
+  // Three-database separation (docs/GUARDRAILS.md G3a), as the service: no SUPABASE_* variable, and
+  // never a Supabase-hosted target. Checked before any connection is made.
+  try {
+    assertNoSupabaseConfiguration(process.env);
+  } catch (e) {
+    console.error(`migrate: ${e instanceof ConfigError ? e.message : "invalid configuration"}`);
     process.exitCode = 1;
     return;
   }

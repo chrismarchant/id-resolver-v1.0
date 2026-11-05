@@ -27,6 +27,10 @@ npm run verify --workspace @idr/resolver
 Paid provider calls are off by default (`PROVIDER_MODE=disabled`). Tests use a
 mock provider and synthetic data only.
 
+The checks that keep the website, the resolver's database and the private
+Insights Supabase project apart (G1-G7) are described in
+[docs/GUARDRAILS.md](docs/GUARDRAILS.md).
+
 ## Licence
 
 Proprietary. All rights reserved. The source is visible for review during

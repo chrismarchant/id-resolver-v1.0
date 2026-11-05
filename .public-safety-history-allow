@@ -14,8 +14,10 @@
 #   block), written by someone who looked at the content.
 # - Only SYNTHETIC values may be listed. A real address, hostname, e-mail, key
 #   or env file needs history rewriting and rotation instead. Entries for the
-#   rules forbidden-file, private-key-block, email, railway-public-host and
-#   railway-private-host are refused outright.
+#   rules forbidden-file, private-key-block, email, railway-public-host,
+#   railway-private-host, supabase-project-host, supabase-pooler-user,
+#   supabase-api-key and service-role-jwt are refused outright. (The regional
+#   supabase-pooler-host names no project and may be listed, with a reason.)
 # - Entries that no longer match anything are reported as warnings (e.g. after
 #   a history rewrite).
 #

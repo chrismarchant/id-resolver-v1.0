@@ -76,6 +76,23 @@ create table if not exists public.idr_tombstones (
   received_at     timestamptz not null default now(),
   primary key (installation_id, tombstone_id)
 );
+-- Schema 8 (docs/GUARDRAILS.md G7): idr_apply_feed_page checks, for every
+-- observation, whether its company already has a tombstone of the
+-- installation; this index answers that lookup without scanning the table.
+create index if not exists idr_tombstones_company_idx
+  on public.idr_tombstones (installation_id, company_id);
+
+-- Schema 8 (docs/GUARDRAILS.md G5): a page_key stored by an earlier release
+-- that fails the resolver's own rule (the same test idr_apply_feed_page
+-- applies before it stores one: 1-256 code points, starting with '/', no '?',
+-- '#', whitespace or control character) is cleared, keeping the observation.
+-- Idempotent: it changes rows only the first time it runs after such a
+-- release (a schema 8 install can hold no such value, since the function
+-- clears it before storing), and later runs find nothing to change.
+update public.idr_observations
+   set page_key = null
+ where page_key is not null
+   and not (char_length(page_key) between 1 and 256 and page_key ~ '^/[^?#[:space:][:cntrl:]]*$');
 
 create table if not exists public.idr_sync_state (
   installation_id text primary key,
@@ -361,6 +378,24 @@ $$;
 -- the current replay as drained (drained_generation) in the same transaction,
 -- the proof idr_resolve_sync_gaps requires (CHR-66 R2-8). It defaults to
 -- false, which never proves a drain.
+-- Schema 8 (docs/GUARDRAILS.md G5 and G7), neither of which halts the sync or
+-- changes the cursor protocol:
+--   * Erasure propagation (G7): an observation whose company_id already has a
+--     tombstone of this installation in idr_tombstones is ignored. The
+--     resolver never reuses a company id (reporting-feed.v1, "Erasure and
+--     re-observation"), so such an item can only be stale (a re-applied page,
+--     or a replay item that sorts before the tombstone); ignoring it means
+--     nothing can resurrect an erased company. Counted as ignored_erased.
+--   * page_key guard (G5): page_key is re-checked against the resolver's own
+--     rule (apps/resolver migration 0005: 1-256 characters, char_length, i.e.
+--     code points; starting with '/', no '?', '#', whitespace or control
+--     character). A value that fails it is not stored: the observation is
+--     kept with page_key null (the value the contract already allows for
+--     older observations), so a query string or other identifier is never
+--     stored by this function; values an earlier release stored are cleared
+--     by the upgrade above. Counted as page_keys_cleared. (The Edge function
+--     applies the same rule before it calls this, so normally nothing
+--     failing reaches it.)
 -- (The four- and five-argument versions of earlier releases are dropped on re-run.)
 drop function if exists public.idr_apply_feed_page(text, text, text, jsonb);
 drop function if exists public.idr_apply_feed_page(text, text, text, jsonb, text);
@@ -382,6 +417,9 @@ declare
   v_item pg_catalog.jsonb;
   v_obs int := 0;
   v_tomb int := 0;
+  v_ignored int := 0;
+  v_cleared int := 0;
+  v_page_key pg_catalog.text;
   v_rows int;
 begin
   -- Checked step by step, so no check depends on the evaluation order of another.
@@ -417,6 +455,20 @@ begin
     select e.value from jsonb_array_elements(p_items) with ordinality as e(value, ord) order by e.ord
   loop
     if v_item ->> 'type' = 'observation' then
+      -- G7: never resurrect an erased company (see above).
+      if exists (select 1 from public.idr_tombstones t
+                  where t.installation_id = p_installation_id
+                    and t.company_id = (v_item ->> 'company_id')::bigint) then
+        v_ignored := v_ignored + 1;
+        continue;
+      end if;
+      -- G5: the resolver's page_key rule, re-checked; a failing value is not stored.
+      v_page_key := v_item ->> 'page_key';
+      if v_page_key is not null
+         and not (char_length(v_page_key) between 1 and 256 and v_page_key ~ '^/[^?#[:space:][:cntrl:]]*$') then
+        v_page_key := null;
+        v_cleared := v_cleared + 1;
+      end if;
       insert into public.idr_companies (installation_id, company_id, domain, organisation_name)
         values (p_installation_id, (v_item ->> 'company_id')::bigint, v_item ->> 'domain', v_item ->> 'organisation_name')
         on conflict (installation_id, company_id) do update
@@ -424,7 +476,7 @@ begin
       insert into public.idr_observations
         (installation_id, observation_id, company_id, observed_at, method, page_key, acquisition, entrance_contract)
         values (p_installation_id, (v_item ->> 'observation_id')::bigint, (v_item ->> 'company_id')::bigint,
-                (v_item ->> 'observed_at')::pg_catalog.timestamptz, v_item ->> 'method', v_item ->> 'page_key',
+                (v_item ->> 'observed_at')::pg_catalog.timestamptz, v_item ->> 'method', v_page_key,
                 v_item ->> 'acquisition', v_item ->> 'entrance_contract')
         on conflict (installation_id, observation_id) do nothing;
       get diagnostics v_rows = row_count;
@@ -453,7 +505,8 @@ begin
                                   else drained_generation end
     where installation_id = p_installation_id;
 
-  return jsonb_build_object('applied', true, 'observations', v_obs, 'tombstones', v_tomb);
+  return jsonb_build_object('applied', true, 'observations', v_obs, 'tombstones', v_tomb,
+                            'ignored_erased', v_ignored, 'page_keys_cleared', v_cleared);
 end;
 $$;
 
@@ -737,10 +790,15 @@ grant execute on function public.idr_resolve_sync_gaps(text, text) to service_ro
 -- code expects, so code/SQL skew can never silently drop gap evidence.
 -- (The script's one-statement form changes nothing that is installed, so it
 -- does not change this version.)
--- 7 = this release: every function has search_path = pg_catalog, pg_temp, so
+-- 8 = this release: idr_apply_feed_page ignores observations of a company
+-- already tombstoned for the installation (erasure propagation, with the
+-- index idr_tombstones_company_idx) and stores a page_key only if it passes
+-- the resolver's own rule; the upgrade clears stored values that fail it
+-- (docs/GUARDRAILS.md G5, G7). The engine refuses any earlier install. 7 = every function has
+-- search_path = pg_catalog, pg_temp, so
 -- a caller's temporary schema cannot capture a type name in a SECURITY
 -- DEFINER function (CHR-66 G5R1-M1); idr_begin_resync is the owner's alone
--- (G5R1-L3). The engine refuses any earlier install. 6 = the writing
+-- (G5R1-L3). 6 = the writing
 -- functions are SECURITY DEFINER, service_role
 -- has no direct table write, and a gap resolves only after a drained replay
 -- (drained_generation; CHR-66 R2-8). 5 = exact privileges under Supabase's
@@ -755,7 +813,7 @@ returns integer
 language sql
 immutable
 set search_path = pg_catalog, pg_temp
-as $$ select 7 $$;
+as $$ select 8 $$;
 revoke all on function public.idr_schema_version() from public, anon, authenticated, service_role;
 grant execute on function public.idr_schema_version() to service_role;
 

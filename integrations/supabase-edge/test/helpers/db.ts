@@ -221,13 +221,19 @@ export class PgStore implements Store {
 
   async applyPage(a: ApplyPageArgs): Promise<ApplyPageResult> {
     const r = await asRole(this.pool, "service_role", (c) =>
-      c.query<{ r: { applied: boolean; observations?: number; tombstones?: number } }>(
+      c.query<{ r: { applied: boolean; observations?: number; tombstones?: number; ignored_erased?: number; page_keys_cleared?: number } }>(
         "select public.idr_apply_feed_page($1,$2,$3,$4::jsonb,$5,$6) as r",
         [this.installationId, a.expectedCursor, a.nextCursor, JSON.stringify(a.items), a.expectedResetFrom, a.drained],
       ),
     );
     const v = r.rows[0]!.r;
-    return { applied: v.applied, observations: v.observations ?? 0, tombstones: v.tombstones ?? 0 };
+    return {
+      applied: v.applied,
+      observations: v.observations ?? 0,
+      tombstones: v.tombstones ?? 0,
+      ignoredErased: v.ignored_erased ?? 0,
+      pageKeysCleared: v.page_keys_cleared ?? 0,
+    };
   }
 
   async resetCursor(expectedCursor: string): Promise<boolean> {

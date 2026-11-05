@@ -27,13 +27,18 @@ export interface FeedPage {
   items: FeedItem[];
   nextCursor: string;
   hasMore: boolean;
+  /**
+   * Observations whose page_key failed the resolver's own rule (G5) and was
+   * replaced by null by the validator: the value is never forwarded.
+   */
+  pageKeysCleared: number;
 }
 
 /**
  * The projection schema (sql/0001_idr_projection.sql, idr_schema_version())
  * this code requires. The engine refuses to run against any other.
  */
-export const PROJECTION_SCHEMA_VERSION = 7;
+export const PROJECTION_SCHEMA_VERSION = 8;
 
 export interface SyncState {
   /** idr_schema_version() of the installed SQL; null when the installed SQL predates it. */
@@ -72,6 +77,14 @@ export interface ApplyPageResult {
   applied: boolean;
   observations: number;
   tombstones: number;
+  /**
+   * Schema 8 (docs/GUARDRAILS.md G7): observations ignored because their
+   * company already has a tombstone of the installation. Optional so a store
+   * that does not report it stays valid (counted as 0).
+   */
+  ignoredErased?: number;
+  /** Schema 8 (G5): page_key values the store's own re-check did not store (set to null). Optional, as above. */
+  pageKeysCleared?: number;
 }
 
 export type SyncStatus =
@@ -214,4 +227,13 @@ export interface SyncResult {
   gap: RecordGapResult | null;
   /** Open gaps this run marked resolved after draining the buffer post-resync. */
   gapsResolved: number;
+  /** Observations of an already-erased company that applied pages ignored (G7). A count only. */
+  ignoredErased: number;
+  /**
+   * page_key values not stored because they failed the resolver's own rule
+   * (G5): cleared by the validator before the store (FeedPage), or by the
+   * store's own re-check. The observation is kept with page_key null. A
+   * count only.
+   */
+  pageKeysCleared: number;
 }

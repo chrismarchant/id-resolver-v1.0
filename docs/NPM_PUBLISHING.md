@@ -69,7 +69,8 @@ bootstrap. Options, for the owner to choose:
 
 ## 3. Package readiness checklist
 
-Findings from the current manifests (version `0.1.0-dev.0`) and `npm pack --dry-run` (section 5). Items marked
+Findings from the current manifests (collector `0.1.0-dev.0`; tanstack `0.1.0-dev.1`, an unreleased bump for the
+guardrails in `docs/GUARDRAILS.md`, so two different builds never share a version) and `npm pack --dry-run` (section 5). Items marked
 **blocking** must be resolved before the first publish; the draft workflow's gate refuses to publish while the
 first three are open.
 
@@ -79,7 +80,7 @@ first three are open.
 | `license` | `UNLICENSED`, no LICENSE file | same | **blocking, owner decision**: on public npm `UNLICENSED` grants nobody the right to use the package. Choose a licence, add `LICENSE` to each package directory (it is then packed automatically) and set the SPDX id |
 | `repository` | missing | missing | **blocking** for provenance (npm checks it against the publishing repository; UNVERIFIED in this session): `{ "type": "git", "url": "git+https://github.com/<GITHUB_OWNER>/<REPO>.git", "directory": "packages/<dir>" }` |
 | `publishConfig` | missing | missing | add `{ "access": "public", "provenance": true }` (a scoped package is otherwise restricted) |
-| version | `0.1.0-dev.0` | same | first public version `0.1.0-rc.1` on dist-tag `next`, then `0.1.0` on `latest` after the staging results (docs/staging). SemVer: the wire contracts (`entrance.v1`, `event.v1`) and the embedded vocabulary (`event-vocabulary.v1`) are versioned separately; a new contract or vocabulary version is a minor bump at least, removing an option a major |
+| version | `0.1.0-dev.0` | `0.1.0-dev.1` (unreleased) | first public version `0.1.0-rc.1` on dist-tag `next`, then `0.1.0` on `latest` after the staging results (docs/staging). SemVer: the wire contracts (`entrance.v1`, `event.v1`) and the embedded vocabulary (`event-vocabulary.v1`) are versioned separately; a new contract or vocabulary version is a minor bump at least, removing an option a major |
 | `exports` / `main` / `types` | `.`, `./idr-collector.min.js`, `./package.json`; ESM | `.`, `./package.json`; ESM | fine as they are |
 | `files` | `dist`, `README.md` | `dist`, `README.md`, `LOVABLE_SETUP.md` | fine; LICENSE is added automatically once it exists |
 | `sideEffects: false` | yes | yes | fine |

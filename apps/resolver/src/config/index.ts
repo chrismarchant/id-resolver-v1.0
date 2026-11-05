@@ -167,11 +167,150 @@ export class ConfigError extends Error {
   }
 }
 
+// ---- Three-database separation (docs/GUARDRAILS.md G3a) ---------------------
+//
+// The resolver (B: Railway service + its own PostgreSQL) is the operational
+// system of record. The private Insights Supabase project (C) PULLS the
+// sanitised reporting feed from it with its own Edge secret; the website's
+// Supabase project (A) never talks to it. So the resolver holds no Supabase
+// credential, URL or project ref, and never connects to a Supabase-hosted
+// database. Both are refused at start-up, by migrate and by the ops commands,
+// with fixed messages that name variables, never values.
+
+/** Registrable domains Supabase serves projects, databases and its pooler (`*.pooler.supabase.com`) from. */
+export const SUPABASE_HOST_SUFFIXES = ["supabase.co", "supabase.in", "supabase.com"] as const;
+
+/** True for a Supabase-operated host name (case-insensitive, a trailing dot ignored). */
+export function isSupabaseHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1").replace(/\.+$/, "");
+  return SUPABASE_HOST_SUFFIXES.some((s) => h === s || h.endsWith(`.${s}`));
+}
+
+function decodedHost(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * True when a postgres URL would connect to a Supabase host: its host, or the
+ * `host` / `hostaddr` query parameter that node-postgres (and libpq) let
+ * override it, each percent-decoded and split on commas (libpq's host lists).
+ * An unparsable URL is false here: the schema rejects it on its own.
+ */
+export function databaseUrlTargetsSupabase(databaseUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    return false;
+  }
+  const candidates = [url.hostname, ...url.searchParams.getAll("host"), ...url.searchParams.getAll("hostaddr")];
+  return candidates.flatMap((c) => decodedHost(c).split(",")).some((h) => h.trim() !== "" && isSupabaseHost(h));
+}
+
+/**
+ * The host node-postgres takes from a postgres URL, mirroring
+ * pg-connection-string: the last `host` query parameter when it is not empty,
+ * otherwise the URL's own host (brackets removed, percent-decoded). An empty
+ * string means the URL names no host, and node-postgres then falls back to
+ * the PGHOST environment variable (and to localhost). null: not a URL WHATWG
+ * can parse (the schema and createPool refuse those on their own).
+ */
+export function databaseUrlHost(databaseUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    return null;
+  }
+  const param = url.searchParams.getAll("host").at(-1) ?? "";
+  if (param !== "") return param;
+  return decodedHost(url.hostname.replace(/^\[(.*)\]$/, "$1"));
+}
+
+/** True when a libpq-style host value (a comma-separated list, as in PGHOST) names a Supabase host. */
+export function hostListTargetsSupabase(value: string): boolean {
+  return decodedHost(value)
+    .split(",")
+    .some((h) => h.trim() !== "" && isSupabaseHost(h));
+}
+
+/** True when an http(s) or any other URL's host is a Supabase host. An unparsable URL is false (the schema rejects it). */
+export function urlTargetsSupabase(value: string): boolean {
+  try {
+    return isSupabaseHost(decodedHost(new URL(value).hostname));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Environment variables that node-postgres or libpq read as the database host
+ * when a connection string names none. node-postgres reads PGHOST only; libpq
+ * (psql, pg_dump) reads both. Their values are refused on a Supabase host;
+ * otherwise they are left alone: an explicit DATABASE_URL host always wins in
+ * node-postgres, and Railway's PostgreSQL service exposes a PGHOST that a
+ * deployment may legitimately reference.
+ */
+export const PG_HOST_VARIABLES = ["PGHOST", "PGHOSTADDR"] as const;
+
+/** Prefix of the variable names the resolver refuses outright (case-insensitive). */
+export const SUPABASE_VARIABLE_PREFIX = "SUPABASE_";
+
+/**
+ * Refuses (ConfigError), before any connection: any SUPABASE_* variable; a
+ * DATABASE_URL on a Supabase host, or naming no host at all (node-postgres
+ * would then take it from PGHOST: the resolver always names its own
+ * PostgreSQL host explicitly); PGHOST or PGHOSTADDR on a Supabase host; and an
+ * ENRICH_API_BASE_URL on a Supabase host. The single shared check of loadConfig,
+ * migrate, the ops commands and ops:db-tls-fingerprint. Fixed messages: they
+ * name variables, never values, and a variable name that is not a plain
+ * identifier is not echoed.
+ */
+export function assertNoSupabaseConfiguration(env: NodeJS.ProcessEnv): void {
+  const names = Object.keys(env)
+    .filter((k) => k.toUpperCase().startsWith(SUPABASE_VARIABLE_PREFIX))
+    .map((k) => (/^[A-Za-z0-9_]{1,64}$/.test(k) ? k : `${SUPABASE_VARIABLE_PREFIX}<name not shown>`))
+    .sort();
+  if (names.length > 0) {
+    throw new ConfigError(
+      `invalid configuration: Supabase variable(s) set: ${names.join(", ")} (the resolver holds no Supabase credential, URL or project ref: the private Supabase project pulls the reporting feed; remove them)`,
+    );
+  }
+  const databaseUrl = env["DATABASE_URL"];
+  if (typeof databaseUrl === "string" && databaseUrlTargetsSupabase(databaseUrl)) {
+    throw new ConfigError(
+      "invalid configuration: DATABASE_URL points at a Supabase-hosted database (refused: the resolver's system of record is its own PostgreSQL, never a Supabase project)",
+    );
+  }
+  if (typeof databaseUrl === "string" && databaseUrlHost(databaseUrl) === "") {
+    throw new ConfigError(
+      "invalid configuration: DATABASE_URL names no host (refused: node-postgres would take the host from PGHOST; name the resolver's own PostgreSQL host in DATABASE_URL)",
+    );
+  }
+  for (const name of PG_HOST_VARIABLES) {
+    const value = env[name];
+    if (typeof value === "string" && hostListTargetsSupabase(value)) {
+      throw new ConfigError(`invalid configuration: ${name} names a Supabase host (refused: the resolver never connects to a Supabase project)`);
+    }
+  }
+  const enrichBaseUrl = env["ENRICH_API_BASE_URL"];
+  if (typeof enrichBaseUrl === "string" && urlTargetsSupabase(enrichBaseUrl)) {
+    throw new ConfigError(
+      "invalid configuration: ENRICH_API_BASE_URL points at a Supabase host (refused: it is the enrichment provider, and the resolver never connects to a Supabase project)",
+    );
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const removed = Object.keys(REMOVED_VARIABLES).filter((k) => env[k] !== undefined);
   if (removed.length > 0) {
     throw new ConfigError(`invalid configuration: removed variable(s) set: ${removed.map((k) => `${k} (${REMOVED_VARIABLES[k]})`).join("; ")}`);
   }
+  assertNoSupabaseConfiguration(env);
   const parsed = ConfigSchema.safeParse(env);
   if (!parsed.success) {
     // Only variable names are reported, never values.
