@@ -122,7 +122,7 @@ export interface UsageScope {
   periodKey: string;
 }
 
-export type ProviderAttemptReservation = "reserved" | "cap_exhausted" | "disabled";
+export type ProviderAttemptReservation = "reserved" | "cap_exhausted" | "resolved_cap_exhausted" | "disabled";
 
 export interface UsageSnapshot extends Record<UsageCounter, number> {
   periodKey: string;
@@ -130,15 +130,22 @@ export interface UsageSnapshot extends Record<UsageCounter, number> {
   providerCreditsReported: number;
   /** Locally estimated credits (sum). Clearly labelled estimate. */
   providerCreditsEstimated: number;
+  /** Charge slots held: provider calls that returned a domain or whose charge is uncertain. */
+  providerChargeSlots: number;
 }
 
 export interface UsageRepository {
   /**
-   * Atomically increment provider_attempts if below `cap` AND the deployment
-   * kill switch is off. The increment is never rolled back: a crash after
-   * reservation still counts, so concurrent callers cannot exceed the cap.
+   * Atomically increment provider_attempts and provider_charge_slots if
+   * provider_attempts is below `cap`, provider_charge_slots is below
+   * `resolvedCap` AND the deployment kill switch is off. provider_attempts is
+   * never rolled back; a charge slot is given back only through
+   * releaseChargeSlot. A crash after reservation still counts, so concurrent
+   * callers can exceed neither cap.
    */
-  reserveProviderAttempt(scope: UsageScope, cap: number): Promise<ProviderAttemptReservation>;
+  reserveProviderAttempt(scope: UsageScope, cap: number, resolvedCap: number): Promise<ProviderAttemptReservation>;
+  /** Give back one charge slot of the period (never below zero): the call was proven not charged. */
+  releaseChargeSlot(scope: UsageScope): Promise<void>;
   increment(scope: UsageScope, counter: UsageCounter, delta?: number): Promise<void>;
   addProviderCredits(scope: UsageScope, credits: { reported?: number; estimated?: number }): Promise<void>;
   snapshot(scope: UsageScope): Promise<UsageSnapshot>;

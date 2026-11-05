@@ -89,6 +89,12 @@ export const ConfigSchema = z.object({
   // Enrichment controls
   ENRICHMENT_ENABLED: boolFromString(true),
   PERIOD_CALL_CAP: intInRange(0, 10_000_000, 1_000),
+  /**
+   * Provider calls per usage period that may be charged (Enrich charges for a
+   * returned domain). Each call holds a slot until its answer proves it was not
+   * charged. Unset: no limit beyond PERIOD_CALL_CAP.
+   */
+  PERIOD_RESOLVED_CAP: z.coerce.number().int().min(0).max(10_000_000).optional(),
   USAGE_PERIOD: z.enum(["day", "month"]).default("month"),
 
   // Cache policy (seconds)

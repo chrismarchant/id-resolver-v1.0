@@ -48,6 +48,8 @@ async function main(): Promise<void> {
             provider_credits_reported: s.providerCreditsReported,
             // Locally estimated credits. An ESTIMATE, not a billing figure.
             provider_credits_estimated: s.providerCreditsEstimated,
+            // Charge slots held against PERIOD_RESOLVED_CAP: calls that returned a domain or whose charge is uncertain.
+            provider_charge_slots: s.providerChargeSlots,
           },
           null,
           2,

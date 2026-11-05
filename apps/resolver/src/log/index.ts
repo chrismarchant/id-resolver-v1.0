@@ -62,6 +62,7 @@ export const LOG_FIELDS = [
   "website_id",
   "period_key",
   "cap",
+  "resolved_cap",
   "attempts",
   "count",
   "route",

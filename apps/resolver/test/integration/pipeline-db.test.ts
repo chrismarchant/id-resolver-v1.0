@@ -36,6 +36,7 @@ function config(over: Partial<PipelineConfig["policy"]> = {}): PipelineConfig {
       pending_wait_ms: 1_500,
       pending_poll_ms: 20,
       period_call_cap: 100,
+      period_resolved_cap: 100,
       usage_period: "month",
       qualified_usage_types: ["COM"],
       excluded_usage_types: ["ISP"],

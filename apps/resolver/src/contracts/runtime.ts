@@ -37,6 +37,8 @@ export interface PipelineConfig {
     pending_wait_ms: number;
     pending_poll_ms: number;
     period_call_cap: number;
+    /** Calls per period that may be charged; a slot is given back when the answer proves no charge. */
+    period_resolved_cap: number;
     usage_period: "day" | "month";
     /** Usage-type codes that qualify a domain as an employer/organisation association. */
     qualified_usage_types: string[];

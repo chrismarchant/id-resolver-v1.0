@@ -104,6 +104,7 @@ export function buildPipelineConfig(config: Config): PipelineConfig {
       pending_wait_ms: config.PENDING_WAIT_MS,
       pending_poll_ms: config.PENDING_POLL_MS,
       period_call_cap: config.PERIOD_CALL_CAP,
+      period_resolved_cap: config.PERIOD_RESOLVED_CAP ?? config.PERIOD_CALL_CAP,
       usage_period: config.USAGE_PERIOD,
       qualified_usage_types: upper(config.QUALIFIED_USAGE_TYPES),
       excluded_usage_types: upper(config.EXCLUDED_USAGE_TYPES),

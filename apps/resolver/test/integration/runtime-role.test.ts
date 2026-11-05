@@ -53,6 +53,8 @@ import { testConfig, TEST_AUTH_TOKEN } from "../helpers/env.js";
 import { createCompany, FEED_REPORTING_TOKEN, FEED_SCOPE, getFeed, insertObservation, reportingAuth } from "../helpers/feed.js";
 import { createRuntimeDb, provisionTestRuntimeRole, TEST_RUNTIME_PASSWORD, TEST_RUNTIME_ROLE } from "../helpers/runtime-role.js";
 
+const UNCAPPED = 10_000_000;
+
 const MIGRATIONS_DIR = fileURLToPath(new URL("../../migrations/", import.meta.url));
 const INSUFFICIENT_PRIVILEGE = "42501";
 
@@ -419,11 +421,11 @@ describe("every runtime path works as the runtime role", () => {
     expect(await codeOf(runtime.controls.setEnrichmentEnabled("inst-test", false, "runtime must not"))).toBe(INSUFFICIENT_PRIVILEGE);
     await owner.controls.setEnrichmentEnabled("inst-test", false, "owner engages");
     expect(await runtime.controls.isEnrichmentEnabled("inst-test")).toBe(false);
-    expect(await runtime.usage.reserveProviderAttempt(usageScope, 50)).toBe("disabled");
+    expect(await runtime.usage.reserveProviderAttempt(usageScope, 50, UNCAPPED)).toBe("disabled");
     const r = await app.inject({ method: "POST", url: "/v1/entrances", headers: auth, payload: entrance("203.0.113.12") });
     expect(r.json()).toMatchObject({ status: "disabled" });
     await owner.controls.setEnrichmentEnabled("inst-test", true, "owner releases");
-    expect(await runtime.usage.reserveProviderAttempt(usageScope, 50)).toBe("reserved");
+    expect(await runtime.usage.reserveProviderAttempt(usageScope, 50, UNCAPPED)).toBe("reserved");
   });
 
   it("the reporting feed reads observations, tombstones and the watermark", async () => {
@@ -641,7 +643,7 @@ describe("upgrade, re-run and rollback", () => {
     const wm0008 = (await owner.query("SELECT pruned_through_id::text AS id FROM feed_retention_watermarks")).rows[0].id as string;
     expect(BigInt(wm0008)).toBeGreaterThan(BigInt(pruned.id));
     const up = await provisionTestRuntimeRole(scratch.url);
-    expect(up.applied).toEqual(["0009_runtime_role_support.sql"]);
+    expect(up.applied).toEqual(["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql"]);
     const pro = await owner.query("SELECT prosecdef, proconfig FROM pg_proc WHERE proname = 'feed_record_observation_deletes'");
     expect(pro.rows[0]).toEqual({ prosecdef: true, proconfig: ["search_path=public, pg_temp"] });
     expect((await owner.query("SELECT id::text FROM company_observations")).rows).toEqual([{ id: kept.id }]);
@@ -672,7 +674,7 @@ describe("upgrade, re-run and rollback", () => {
     // Its migrate finds nothing to apply; its startup check passes (the database is ahead, which is reported, not refused).
     expect((await applyMigrations(owner, undefined, { dir: oldDir })).applied).toEqual([]);
     const status = await migrationStatus(owner, undefined, { dir: oldDir });
-    expect(status).toEqual({ pending: [], unknown: ["0009_runtime_role_support.sql"] });
+    expect(status).toEqual({ pending: [], unknown: ["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql"] });
     await assertSchemaCurrent(owner, undefined, { dir: oldDir });
     // Its runtime paths, as the owner: writes, retention (watermark), erasure, the kill switch.
     const db = createDb({ databaseUrl: scratch.url, ssl: "disable", max: 2 });
