@@ -10,23 +10,39 @@ import type { Logger } from "../log/index.js";
 import { DbError, guarded, type Pool } from "./pool.js";
 
 /**
- * Atomic cap + kill-switch reservation. Both the INSERT path (first attempt of
- * a period) and the UPDATE path (ON CONFLICT) enforce the cap and the switch.
- * Under READ COMMITTED the conflicting row is locked and the WHERE is
- * re-evaluated against the latest committed value, so concurrent callers can
- * never exceed the cap. The increment is never rolled back.
+ * Atomic cap + charge-slot cap + kill-switch reservation. Both the INSERT path
+ * (first attempt of a period) and the UPDATE path (ON CONFLICT) enforce both
+ * caps and the switch. Under READ COMMITTED the conflicting row is locked and
+ * the WHERE is re-evaluated against the latest committed values, so
+ * concurrent callers can exceed neither cap. provider_attempts is never
+ * rolled back; a charge slot is given back only by RELEASE_CHARGE_SLOT_SQL.
  */
 export const RESERVE_PROVIDER_ATTEMPT_SQL = `
-INSERT INTO usage_periods (installation_id, website_id, period_key, provider_attempts, updated_at)
-SELECT $1::text, $2::text, $3::text, 1, now()
-WHERE $4::bigint > 0
+INSERT INTO usage_periods (installation_id, website_id, period_key, provider_attempts, provider_charge_slots, updated_at)
+SELECT $1::text, $2::text, $3::text, 1, 1, now()
+WHERE $4::bigint > 0 AND $5::bigint > 0
   AND COALESCE((SELECT enrichment_enabled FROM deployment_controls WHERE installation_id = $1::text), true)
 ON CONFLICT (installation_id, website_id, period_key) DO UPDATE SET
   provider_attempts = usage_periods.provider_attempts + 1,
+  provider_charge_slots = usage_periods.provider_charge_slots + 1,
   updated_at = now()
 WHERE usage_periods.provider_attempts < $4::bigint
+  AND usage_periods.provider_charge_slots < $5::bigint
   AND COALESCE((SELECT enrichment_enabled FROM deployment_controls WHERE installation_id = $1::text), true)
 RETURNING provider_attempts`;
+
+/** Gives back one charge slot; never below zero, never creates a row. */
+export const RELEASE_CHARGE_SLOT_SQL = `
+UPDATE usage_periods SET
+  provider_charge_slots = provider_charge_slots - 1,
+  updated_at = now()
+WHERE installation_id = $1 AND website_id = $2 AND period_key = $3
+  AND provider_charge_slots > 0`;
+
+const RESERVATION_STATE_SQL = `
+SELECT
+  COALESCE((SELECT enrichment_enabled FROM deployment_controls WHERE installation_id = $1), true) AS enrichment_enabled,
+  (SELECT provider_attempts FROM usage_periods WHERE installation_id = $1 AND website_id = $2 AND period_key = $3) AS provider_attempts`;
 
 export const ADD_CREDITS_SQL = `
 INSERT INTO usage_periods (installation_id, website_id, period_key, provider_credits_reported, provider_credits_estimated, updated_at)
@@ -48,7 +64,7 @@ ON CONFLICT (installation_id, website_id, period_key) DO UPDATE SET
 }
 
 const SNAPSHOT_SQL = `
-SELECT ${USAGE_COUNTERS.join(", ")}, provider_credits_reported, provider_credits_estimated
+SELECT ${USAGE_COUNTERS.join(", ")}, provider_credits_reported, provider_credits_estimated, provider_charge_slots
 FROM usage_periods
 WHERE installation_id = $1 AND website_id = $2 AND period_key = $3`;
 
@@ -59,17 +75,27 @@ function nonNegativeInt(n: number): number {
 
 export function createUsageRepository(pool: Pool, logger?: Logger): UsageRepository {
   return {
-    async reserveProviderAttempt(scope: UsageScope, cap: number): Promise<ProviderAttemptReservation> {
+    async reserveProviderAttempt(scope: UsageScope, cap: number, resolvedCap: number): Promise<ProviderAttemptReservation> {
       if (!Number.isSafeInteger(cap) || cap < 0) throw new DbError("INVALID_CAP");
+      if (!Number.isSafeInteger(resolvedCap) || resolvedCap < 0) throw new DbError("INVALID_CAP");
       return guarded(logger, async () => {
-        const params = [scope.installationId, scope.websiteId, scope.periodKey, cap];
+        const params = [scope.installationId, scope.websiteId, scope.periodKey, cap, resolvedCap];
         const res = await pool.query(RESERVE_PROVIDER_ATTEMPT_SQL, params);
         if ((res.rowCount ?? 0) > 0) return "reserved";
-        const ctl = await pool.query<{ enrichment_enabled: boolean }>(
-          "SELECT enrichment_enabled FROM deployment_controls WHERE installation_id = $1",
-          [scope.installationId],
-        );
-        return ctl.rows[0]?.enrichment_enabled === false ? "disabled" : "cap_exhausted";
+        const state = await pool.query<{ enrichment_enabled: boolean; provider_attempts: string | null }>(RESERVATION_STATE_SQL, [
+          scope.installationId,
+          scope.websiteId,
+          scope.periodKey,
+        ]);
+        const row = state.rows[0];
+        if (row?.enrichment_enabled === false) return "disabled";
+        return Number(row?.provider_attempts ?? 0) >= cap ? "cap_exhausted" : "resolved_cap_exhausted";
+      });
+    },
+
+    async releaseChargeSlot(scope) {
+      await guarded(logger, async () => {
+        await pool.query(RELEASE_CHARGE_SLOT_SQL, [scope.installationId, scope.websiteId, scope.periodKey]);
       });
     },
 
@@ -104,6 +130,7 @@ export function createUsageRepository(pool: Pool, logger?: Logger): UsageReposit
         for (const c of USAGE_COUNTERS) snap[c] = num(c);
         snap.providerCreditsReported = num("provider_credits_reported");
         snap.providerCreditsEstimated = num("provider_credits_estimated");
+        snap.providerChargeSlots = num("provider_charge_slots");
         return snap;
       });
     },

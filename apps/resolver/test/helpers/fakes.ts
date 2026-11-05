@@ -200,11 +200,11 @@ export class FakeControlsRepository implements ControlsRepository {
   }
 }
 
-type Period = Record<UsageCounter, number> & { providerCreditsReported: number; providerCreditsEstimated: number };
+type Period = Record<UsageCounter, number> & { providerCreditsReported: number; providerCreditsEstimated: number; providerChargeSlots: number };
 
 export class FakeUsageRepository implements UsageRepository {
   readonly periods = new Map<string, Period>();
-  failures: Failures<"reserveProviderAttempt" | "increment" | "addProviderCredits" | "snapshot"> = {};
+  failures: Failures<"reserveProviderAttempt" | "releaseChargeSlot" | "increment" | "addProviderCredits" | "snapshot"> = {};
   /** Delay applied to best-effort accounting (increment, addProviderCredits) only; the attempt reservation is never delayed. */
   accountingDelayMs = 0;
 
@@ -214,21 +214,31 @@ export class FakeUsageRepository implements UsageRepository {
     const k = `${scope.installationId}|${scope.websiteId}|${scope.periodKey}`;
     let p = this.periods.get(k);
     if (!p) {
-      p = { providerCreditsReported: 0, providerCreditsEstimated: 0 } as Period;
+      p = { providerCreditsReported: 0, providerCreditsEstimated: 0, providerChargeSlots: 0 } as Period;
       for (const c of USAGE_COUNTERS) p[c] = 0;
       this.periods.set(k, p);
     }
     return p;
   }
 
-  async reserveProviderAttempt(scope: UsageScope, cap: number): Promise<ProviderAttemptReservation> {
+  async reserveProviderAttempt(scope: UsageScope, cap: number, resolvedCap: number): Promise<ProviderAttemptReservation> {
     await Promise.resolve();
     failIf(this.failures, "reserveProviderAttempt");
     if (this.controls.enabled.get(scope.installationId) === false) return "disabled";
     const p = this.period(scope);
     if (p.provider_attempts >= cap) return "cap_exhausted";
+    if (p.providerChargeSlots >= resolvedCap) return "resolved_cap_exhausted";
     p.provider_attempts++;
+    p.providerChargeSlots++;
     return "reserved";
+  }
+
+  async releaseChargeSlot(scope: UsageScope): Promise<void> {
+    await Promise.resolve();
+    failIf(this.failures, "releaseChargeSlot");
+    if (this.accountingDelayMs > 0) await new Promise((r) => setTimeout(r, this.accountingDelayMs));
+    const p = this.period(scope);
+    if (p.providerChargeSlots > 0) p.providerChargeSlots--;
   }
 
   async increment(scope: UsageScope, counter: UsageCounter, delta = 1): Promise<void> {

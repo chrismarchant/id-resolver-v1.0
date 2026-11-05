@@ -51,6 +51,15 @@ describe("bounded configuration", () => {
     expect(message).not.toContain("Bad Id!");
   });
 
+  it("PERIOD_RESOLVED_CAP is optional and bounded; unset means no limit beyond PERIOD_CALL_CAP", () => {
+    expect(loadConfig(REQUIRED).PERIOD_RESOLVED_CAP).toBeUndefined();
+    expect(loadConfig({ ...REQUIRED, PERIOD_RESOLVED_CAP: "50" }).PERIOD_RESOLVED_CAP).toBe(50);
+    expect(loadConfig({ ...REQUIRED, PERIOD_RESOLVED_CAP: "0" }).PERIOD_RESOLVED_CAP).toBe(0);
+    for (const bad of ["-1", "1.5", "lots", "10000001"]) {
+      expect(errorOf(() => loadConfig({ ...REQUIRED, PERIOD_RESOLVED_CAP: bad }))).toContain("PERIOD_RESOLVED_CAP");
+    }
+  });
+
   it("never describes secrets", () => {
     const text = JSON.stringify(describeConfig(testConfig()));
     expect(text).not.toContain(TEST_AUTH_TOKEN);

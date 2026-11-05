@@ -141,6 +141,19 @@ export function outcomeFromCacheRow(row: CacheRow): ResolutionOutcome {
   }
 }
 
+/**
+ * The answer proves the call was not charged, so its charge slot is given
+ * back: no domain (unless the provider reported credits for it), a rejected
+ * key (401/403), no credits (402) or a rate limit (429). A domain, a timeout,
+ * a network or server failure (5xx) and an unreadable 2xx keep the slot: they
+ * were, or may have been, charged.
+ */
+export function provenUncharged(p: ProviderOutcome): boolean {
+  if (p.kind === "no_domain") return !(p.creditsReported !== null && p.creditsReported > 0);
+  if (p.kind === "error") return p.category === "auth" || p.category === "credits" || p.category === "rate_limited";
+  return false;
+}
+
 interface Plan {
   commit: Omit<CommitOutcome, "checkedAt">;
   result: ResolutionOutcome;
@@ -241,7 +254,7 @@ export async function runJob(
   // keeps running (tracked through onDeferred) and is logged as a timeout so
   // the usage snapshot can be reconciled; provider_attempts, reserved
   // atomically before dispatch, is the authoritative spend figure.
-  const accounting = async (category: "usage_counter" | "usage_credits", op: () => Promise<void>): Promise<void> => {
+  const accounting = async (category: "usage_counter" | "usage_credits" | "usage_charge_slot", op: () => Promise<void>): Promise<void> => {
     const budget = Math.min(ACCOUNTING_TIMEOUT_MS, job.deadline_at_ms - now().getTime() - ACCOUNTING_RESERVE_MS);
     if (budget <= 0 || aborted()) {
       logger.warn("db_error", { category: `${category}_skipped` });
@@ -409,11 +422,17 @@ export async function runJob(
 
     // 5. Usage allowance (never undone once reserved).
     checkpoint();
-    const allowance = await repo(() => usage.reserveProviderAttempt(scope, policy.period_call_cap));
-    logger.info("usage_reservation", { outcome: allowance, period_key: scope.periodKey, cap: policy.period_call_cap });
+    const allowance = await repo(() => usage.reserveProviderAttempt(scope, policy.period_call_cap, policy.period_resolved_cap));
+    logger.info("usage_reservation", {
+      outcome: allowance,
+      period_key: scope.periodKey,
+      cap: policy.period_call_cap,
+      resolved_cap: policy.period_resolved_cap,
+    });
     if (allowance !== "reserved") {
       await release();
-      return finish(outcome("disabled", allowance === "cap_exhausted" ? "cap_exhausted" : "kill_switch"));
+      const capped = allowance === "cap_exhausted" || allowance === "resolved_cap_exhausted";
+      return finish(outcome("disabled", capped ? "cap_exhausted" : "kill_switch"));
     }
 
     // 6. Bound the provider call by the lease (database-reported remaining
@@ -461,6 +480,7 @@ export async function runJob(
       const credits = plan.credits;
       await accounting("usage_credits", () => usage.addProviderCredits(scope, credits));
     }
+    if (provenUncharged(p)) await accounting("usage_charge_slot", () => usage.releaseChargeSlot(scope));
     return finish(result);
   } catch (err) {
     // Free the key for another worker only if nothing was dispatched.

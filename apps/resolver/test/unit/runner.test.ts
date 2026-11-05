@@ -263,6 +263,17 @@ describe("buildPipelineConfig", () => {
     expect(JSON.stringify(rc)).not.toContain(SECRETS.RESOLVER_AUTH_TOKEN);
   });
 
+  it("uses PERIOD_RESOLVED_CAP when set and PERIOD_CALL_CAP otherwise", () => {
+    expect(buildPipelineConfig(makeConfig({ PERIOD_CALL_CAP: "2000", PERIOD_RESOLVED_CAP: "50" })).policy).toMatchObject({
+      period_call_cap: 2000,
+      period_resolved_cap: 50,
+    });
+    expect(buildPipelineConfig(makeConfig({ PERIOD_CALL_CAP: "200" })).policy).toMatchObject({
+      period_call_cap: 200,
+      period_resolved_cap: 200,
+    });
+  });
+
   it("disables the provider when the static kill switch is off", () => {
     expect(buildPipelineConfig(makeConfig({ ENRICHMENT_ENABLED: "false" })).provider.mode).toBe("disabled");
   });

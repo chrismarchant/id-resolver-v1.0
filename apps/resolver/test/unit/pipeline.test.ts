@@ -31,6 +31,7 @@ function makeConfig(overrides: { policy?: Partial<PipelineConfig["policy"]>; pro
       pending_wait_ms: 1_500,
       pending_poll_ms: 10,
       period_call_cap: 100,
+      period_resolved_cap: 100,
       usage_period: "month",
       qualified_usage_types: ["COM", "ORG", "GOV", "EDU", "MIL", "LIB"],
       excluded_usage_types: ["ISP", "MOB", "DCH", "CDN", "SES", "RSV"],
@@ -220,6 +221,83 @@ describe("runJob: controls and caps", () => {
     expect(outcomes.map((o) => o.status)).toEqual(["no_match", "no_match", "disabled"]);
     expect(t.mock.calls).toBe(2);
     expect((await t.snapshot()).provider_attempts).toBe(2);
+  });
+
+  it("calls that find no domain give their charge slot back, so they never use up the resolved cap", async () => {
+    const t = setup();
+    const config = makeConfig({ policy: { period_call_cap: 100, period_resolved_cap: 2 } });
+    const ips = ["203.0.113.41", "203.0.113.42", "203.0.113.43", "203.0.113.44", "203.0.113.45"];
+    const outcomes = [];
+    for (const ip of ips) outcomes.push(await runJob(t.deps, config, job(ip)));
+    expect(outcomes.map((o) => o.status)).toEqual(["no_match", "no_match", "no_match", "no_match", "no_match"]);
+    expect(t.mock.calls).toBe(5);
+    const s = await t.snapshot();
+    expect(s.provider_attempts).toBe(5);
+    expect(s.providerChargeSlots).toBe(0);
+  });
+
+  it("resolved cap reached -> disabled with cap_exhausted, released, provider not called", async () => {
+    const script = {
+      "203.0.113.51": { outcome: resolved("one.example", "COM") },
+      "203.0.113.52": { outcome: resolved("isp.example", "ISP") },
+      "203.0.113.53": { outcome: resolved("three.example", "COM") },
+    };
+    const t = setup(script);
+    const config = makeConfig({ policy: { period_call_cap: 100, period_resolved_cap: 2 } });
+    const a = await runJob(t.deps, config, job("203.0.113.51"));
+    const b = await runJob(t.deps, config, job("203.0.113.52", 4_000, "obsref-b"));
+    const c = await runJob(t.deps, config, job("203.0.113.53", 4_000, "obsref-c"));
+    expect([a.status, b.status]).toEqual(["qualified", "excluded"]);
+    expect(c).toEqual({ status: "disabled", source: "none", reason: "cap_exhausted" });
+    expect(t.mock.calls).toBe(2);
+    const s = await t.snapshot();
+    expect(s.provider_attempts).toBe(2);
+    expect(s.providerChargeSlots).toBe(2);
+    const e = t.repos.cache.inspect(keyFor(config, "203.0.113.53"))!;
+    expect(e.token).toBeNull();
+    expect(e.leaseExpiresAt).toBeNull();
+    const reservation = t.logger.entries.find((x) => x["event"] === "usage_reservation" && x["outcome"] === "resolved_cap_exhausted");
+    expect(reservation?.["resolved_cap"]).toBe(2);
+  });
+
+  it("once the resolved cap is reached, every new lookup pauses, because its charge is unknown in advance", async () => {
+    const t = setup({ "203.0.113.61": { outcome: resolved("one.example", "COM") } });
+    const config = makeConfig({ policy: { period_call_cap: 100, period_resolved_cap: 1 } });
+    expect((await runJob(t.deps, config, job("203.0.113.61"))).status).toBe("qualified");
+    const o = await runJob(t.deps, config, job("203.0.113.62", 4_000, "obsref-62"));
+    expect(o.reason).toBe("cap_exhausted");
+    expect(t.mock.calls).toBe(1);
+  });
+
+  it("keeps the slot when the charge is possible or certain, gives it back when the answer proves no charge", async () => {
+    const cases: { outcome: ProviderOutcome; kept: boolean }[] = [
+      { outcome: resolved("kept.example", "COM"), kept: true },
+      { outcome: { kind: "timeout" }, kept: true },
+      { outcome: { kind: "error", category: "server", retryAfterMs: null }, kept: true },
+      { outcome: { kind: "error", category: "network", retryAfterMs: null }, kept: true },
+      { outcome: { kind: "error", category: "malformed", retryAfterMs: null }, kept: true },
+      { outcome: { kind: "no_domain", creditsReported: 100 }, kept: true },
+      { outcome: { kind: "no_domain", creditsReported: null }, kept: false },
+      { outcome: { kind: "no_domain", creditsReported: 0 }, kept: false },
+      { outcome: { kind: "error", category: "auth", retryAfterMs: null }, kept: false },
+      { outcome: { kind: "error", category: "credits", retryAfterMs: null }, kept: false },
+      { outcome: { kind: "error", category: "rate_limited", retryAfterMs: 1_000 }, kept: false },
+    ];
+    for (const [i, c] of cases.entries()) {
+      const ip = `203.0.113.${70 + i}`;
+      const t = setup({ [ip]: { outcome: c.outcome } });
+      await runJob(t.deps, t.config, job(ip));
+      expect({ i, slots: (await t.snapshot()).providerChargeSlots }).toEqual({ i, slots: c.kept ? 1 : 0 });
+    }
+  });
+
+  it("a failed give-back keeps the slot and does not change the outcome", async () => {
+    const t = setup();
+    t.repos.usage.failures.releaseChargeSlot = true;
+    const o = await runJob(t.deps, t.config, job("203.0.113.90"));
+    expect(o.status).toBe("no_match");
+    expect((await t.snapshot()).providerChargeSlots).toBe(1);
+    expect(t.logger.entries.some((x) => x["event"] === "db_error" && x["category"] === "usage_charge_slot")).toBe(true);
   });
 
   it("runtime kill switch -> disabled, released, no provider call", async () => {

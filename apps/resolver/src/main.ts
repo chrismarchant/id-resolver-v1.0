@@ -40,6 +40,7 @@ async function main(): Promise<void> {
     installation_id: String(safe["INSTALLATION_ID"]),
     website_id: String(safe["WEBSITE_ID"]),
     cap: Number(safe["PERIOD_CALL_CAP"]),
+    resolved_cap: config.PERIOD_RESOLVED_CAP ?? config.PERIOD_CALL_CAP,
     status: String(safe["PROVIDER_MODE"]),
     ready: safe["REPORTING_ENABLED"] === true,
     events_enabled: config.EVENTS_ENABLED,
