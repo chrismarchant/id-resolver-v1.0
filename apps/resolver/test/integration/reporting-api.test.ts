@@ -10,7 +10,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../../src/api/server.js";
-import type { ObservationScope } from "../../src/contracts/db.js";
+import { usagePeriodKey, type ObservationScope, type UsageCounter } from "../../src/contracts/db.js";
 import type { JobRequest, ResolutionOutcome, Runner } from "../../src/contracts/runtime.js";
 import type { Db } from "../../src/db/index.js";
 import { createMemoryLogger } from "../../src/log/index.js";
@@ -84,7 +84,7 @@ describe("reporting API", () => {
 
   describe("credentials", () => {
     it("rejects the resolver credential, a missing credential and a malformed credential on every reporting route with 401", async () => {
-      for (const url of ["/v1/reporting/companies", "/v1/reporting/companies/1", "/v1/reporting/summary?from=2026-03-01&to=2026-03-02"]) {
+      for (const url of ["/v1/reporting/companies", "/v1/reporting/companies/1", "/v1/reporting/summary?from=2026-03-01&to=2026-03-02", "/v1/reporting/activity?from=2026-03-01&to=2026-03-02"]) {
         expect((await get(url, { authorization: `Bearer ${TEST_AUTH_TOKEN}` })).statusCode).toBe(401);
         expect((await get(url, {})).statusCode).toBe(401);
         expect((await get(url, { authorization: "Bearer nope" })).statusCode).toBe(401);
@@ -231,6 +231,118 @@ describe("reporting API", () => {
       for (const q of ["from=2026-03-11&to=2026-03-10", "from=2026-02-30&to=2026-03-01", "from=2026-3-1&to=2026-03-02", "from=2026-03-01", "to=2026-03-01", "from=2026-03-01T00:00:00Z&to=2026-03-02", "from=2026-03-01&to=2026-03-02&limit=5"]) {
         const r = await get(`/v1/reporting/summary?${q}`);
         expect(r.statusCode, q).toBe(400);
+      }
+    });
+  });
+
+  describe("activity", () => {
+    const usage = (periodKey: string, websiteId = "site-test") => ({ installationId: "inst-test", websiteId, periodKey });
+    async function bump(periodKey: string, counts: Partial<Record<UsageCounter, number>>, websiteId?: string) {
+      for (const [counter, n] of Object.entries(counts) as [UsageCounter, number][]) await db.usage.increment(usage(periodKey, websiteId), counter, n);
+    }
+    async function serverWith(period: "day" | "month") {
+      const s = await buildServer({ config: testConfig({ REPORTING_AUTH_TOKEN: REPORTING_TOKEN, USAGE_PERIOD: period }), logger: createMemoryLogger(), runner, ping: () => db.ping(), reporting: db.reporting });
+      await s.ready();
+      return s;
+    }
+
+    it("returns the daily usage rows in the range, in key order, for this scope only, with the outcomes adding up", async () => {
+      const day = await serverWith("day");
+      try {
+        await bump("2026-03-10", {
+          resolver_requests: 6,
+          cache_hits: 1,
+          provider_attempts: 4,
+          domain_resolutions: 2,
+          outcome_qualified: 2,
+          outcome_no_match: 2,
+          outcome_excluded: 1,
+          outcome_ineligible: 1,
+          company_visits: 2,
+          company_first_visits: 1,
+        });
+        expect(await db.usage.reserveProviderAttempt(usage("2026-03-10"), 100, 50)).toBe("reserved");
+        await bump("2026-03-12", { resolver_requests: 3, outcome_disabled: 3 });
+        await bump("2026-03-09", { resolver_requests: 9, outcome_no_match: 9 });
+        await bump("2026-03-11", { resolver_requests: 7, outcome_no_match: 7 }, "other-site");
+        await bump("2026-03", { resolver_requests: 99, outcome_no_match: 99 });
+
+        const r = await day.inject({ method: "GET", url: "/v1/reporting/activity?from=2026-03-10&to=2026-03-12", headers: reportingAuth });
+        expect(r.statusCode).toBe(200);
+        const zero = { qualified: 0, no_match: 0, excluded: 0, unknown: 0, pending: 0, ineligible: 0, disabled: 0, uncertain: 0, unavailable: 0 };
+        expect(r.json()).toEqual({
+          version: "1",
+          scope: { installation_id: "inst-test", website_id: "site-test" },
+          period: "day",
+          from: "2026-03-10",
+          to: "2026-03-12",
+          items: [
+            {
+              period_key: "2026-03-10",
+              visits_submitted: 6,
+              outcomes: { ...zero, qualified: 2, no_match: 2, excluded: 1, ineligible: 1 },
+              cache_hits: 1,
+              provider_lookups: 5,
+              domains_found: 2,
+              charged_lookups: 1,
+              company_visits: 2,
+              company_first_visits: 1,
+            },
+            {
+              period_key: "2026-03-12",
+              visits_submitted: 3,
+              outcomes: { ...zero, disabled: 3 },
+              cache_hits: 0,
+              provider_lookups: 0,
+              domains_found: 0,
+              charged_lookups: 0,
+              company_visits: 0,
+              company_first_visits: 0,
+            },
+          ],
+        });
+        for (const item of r.json().items as { visits_submitted: number; outcomes: Record<string, number> }[]) {
+          expect(Object.values(item.outcomes).reduce((a, b) => a + b, 0)).toBe(item.visits_submitted);
+        }
+        const none = await day.inject({ method: "GET", url: "/v1/reporting/activity?from=2026-04-01&to=2026-04-30", headers: reportingAuth });
+        expect(none.json()).toMatchObject({ period: "day", items: [] });
+      } finally {
+        await day.close();
+      }
+    });
+
+    it("reports monthly rows when the deployment counts by month", async () => {
+      const month = await serverWith("month");
+      try {
+        await bump("2026-03", { resolver_requests: 40, outcome_no_match: 40 });
+        await bump("2026-04", { resolver_requests: 5, outcome_qualified: 5 });
+        await bump("2026-03-15", { resolver_requests: 1, outcome_no_match: 1 });
+        const r = await month.inject({ method: "GET", url: "/v1/reporting/activity?from=2026-03-31&to=2026-04-01", headers: reportingAuth });
+        expect(r.statusCode).toBe(200);
+        expect(r.json().period).toBe("month");
+        expect((r.json().items as { period_key: string; visits_submitted: number }[]).map((i) => [i.period_key, i.visits_submitted])).toEqual([
+          ["2026-03", 40],
+          ["2026-04", 5],
+        ]);
+      } finally {
+        await month.close();
+      }
+    });
+
+    it("rejects invalid ranges like the summary route and carries no identifier", async () => {
+      const day = await serverWith("day");
+      try {
+        expect((await day.inject({ method: "GET", url: "/v1/reporting/activity?from=2025-03-12&to=2026-03-12", headers: reportingAuth })).statusCode).toBe(200);
+        for (const q of ["from=2025-03-11&to=2026-03-12", "from=2026-03-11&to=2026-03-10", "from=2026-02-30&to=2026-03-01", "from=2026-03-01", "to=2026-03-01", "from=2026-03-01&to=2026-03-02&limit=5"]) {
+          expect((await day.inject({ method: "GET", url: `/v1/reporting/activity?${q}`, headers: reportingAuth })).statusCode, q).toBe(400);
+        }
+        await seedCompany(db, "a", "example.com", SCOPE, [{ ref: ref(1), at: at(0) }]);
+        await bump(usagePeriodKey("day", new Date()), { resolver_requests: 1, outcome_qualified: 1, company_visits: 1, company_first_visits: 1 });
+        const today = usagePeriodKey("day", new Date());
+        const body = (await day.inject({ method: "GET", url: `/v1/reporting/activity?from=${today}&to=${today}`, headers: reportingAuth })).body;
+        for (const needle of ["example.com", TEST_IP, "ip_fingerprint", "observation_ref", REPORTING_TOKEN]) expect(body, needle).not.toContain(needle);
+      } finally {
+        await day.close();
       }
     });
   });

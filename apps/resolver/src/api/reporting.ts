@@ -26,10 +26,23 @@ import {
   type ReportingCompany,
   type ReportingCompanyDetailResponse,
   type ReportingObservation,
+  type ReportingActivityPeriod,
+  type ReportingActivityResponse,
   type ReportingScope,
   type ReportingSummaryResponse,
+  type ResolutionStatus,
 } from "../contracts/api.js";
-import type { CompaniesCursor, CompanyActivitySummary, CompanyOrder, ObservationItem, ObservationsCursor, ReportingRepository } from "../contracts/db.js";
+import type {
+  CompaniesCursor,
+  CompanyActivitySummary,
+  CompanyOrder,
+  ObservationItem,
+  ObservationsCursor,
+  ReportingRepository,
+  UsageCounter,
+  UsagePeriodActivity,
+} from "../contracts/db.js";
+import { OUTCOME_COUNTERS } from "../contracts/db.js";
 import {
   compareFeedPositions,
   FEED_CONTRACT,
@@ -47,7 +60,7 @@ import {
   type ReportingFeedResponse,
 } from "../contracts/reporting-feed.js";
 import type { Logger } from "../log/index.js";
-import { CompaniesQuerySchema, CompanyIdParamSchema, ObservationsQuerySchema, SummaryQuerySchema } from "./schema.js";
+import { ActivityQuerySchema, CompaniesQuerySchema, CompanyIdParamSchema, ObservationsQuerySchema, SummaryQuerySchema } from "./schema.js";
 
 export const REPORTING_PREFIX = "/v1/reporting";
 export const FEED_ROUTE = `${REPORTING_PREFIX}/observations`;
@@ -64,6 +77,24 @@ export interface ReportingDeps {
   sendError: (reply: FastifyReply, error: ErrorCode) => FastifyReply;
   /** Enables GET /v1/reporting/observations. Absent: the route does not exist (fail closed). */
   feed?: ReportingFeedOptions;
+  /** The deployment's USAGE_PERIOD: the granularity GET /v1/reporting/activity reports in. */
+  usagePeriod: "day" | "month";
+}
+
+export function activityPeriodWire(p: UsagePeriodActivity): ReportingActivityPeriod {
+  const outcomes = {} as Record<ResolutionStatus, number>;
+  for (const [status, counter] of Object.entries(OUTCOME_COUNTERS) as [ResolutionStatus, UsageCounter][]) outcomes[status] = p[counter];
+  return {
+    period_key: p.periodKey,
+    visits_submitted: p.resolver_requests,
+    outcomes,
+    cache_hits: p.cache_hits,
+    provider_lookups: p.provider_attempts,
+    domains_found: p.domain_resolutions,
+    charged_lookups: p.providerChargeSlots,
+    company_visits: p.company_visits,
+    company_first_visits: p.company_first_visits,
+  };
 }
 
 const DAY_MS = 86_400_000;
@@ -373,6 +404,32 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
         previously_observed_companies: r.previouslyObservedCompanies,
       };
       logger.info("request_completed", { route, http_status: 200 });
+      return reply.code(200).send(body);
+    } catch {
+      return dbFailed(reply, route);
+    }
+  });
+
+  app.get(`${REPORTING_PREFIX}/activity`, async (req, reply) => {
+    const route = `${REPORTING_PREFIX}/activity`;
+    const q = ActivityQuerySchema.safeParse(req.query ?? {});
+    if (!q.success) return rejected(reply, route, "invalid_request", 400);
+    if (!dateRange(q.data.from, q.data.to)) return rejected(reply, route, "invalid_request", 400);
+    const keyLength = deps.usagePeriod === "month" ? 7 : 10;
+    try {
+      const rows = await reporting.activity(
+        { installationId: scope.installation_id, websiteId: scope.website_id },
+        { fromKey: q.data.from.slice(0, keyLength), toKey: q.data.to.slice(0, keyLength) },
+      );
+      const body: ReportingActivityResponse = {
+        version: REPORTING_API_VERSION,
+        scope,
+        period: deps.usagePeriod,
+        from: q.data.from,
+        to: q.data.to,
+        items: rows.map(activityPeriodWire),
+      };
+      logger.info("request_completed", { route, http_status: 200, count: body.items.length });
       return reply.code(200).send(body);
     } catch {
       return dbFailed(reply, route);
