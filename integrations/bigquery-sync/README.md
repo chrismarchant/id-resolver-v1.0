@@ -1,8 +1,8 @@
 # BigQuery sync
 
-A scheduled Cloud Run job that copies the resolver's company observations into one BigQuery table, so they can be charted and queried next to other website analytics (for example GA4 and PostHog exports in the same location).
+A scheduled Cloud Run job that copies the resolver's company observations and its daily visit counts into BigQuery, so they can be charted and queried next to other website analytics (for example GA4 and PostHog exports in the same location).
 
-It reads the read-only reporting feed (`reporting-feed.v1`, `GET /v1/reporting/observations`) with the reporting token. The resolver is unchanged and never calls out.
+It reads two read-only reporting routes with the reporting token: the feed (`reporting-feed.v1`, `GET /v1/reporting/observations`) and the daily activity counts (`reporting-activity.v1`, `GET /v1/reporting/activity`). The resolver is unchanged and never calls out.
 
 ## How it works
 
@@ -10,9 +10,12 @@ Every run:
 
 1. reads the whole feed from the oldest retained item, 500 per page;
 2. drops every observation of a company that has a `company_erased` item, matched by `company_id`;
-3. replaces the table in one `WRITE_TRUNCATE` load job, or truncates it when there are no rows.
+3. replaces the table in one `WRITE_TRUNCATE` load job, or truncates it when there are no rows;
+4. then reads the activity counts for the last 366 UTC days and replaces `<dataset>.daily_activity` the same way.
 
-Because the table is replaced in full, it always mirrors the resolver: its retention (`OBSERVATION_RETENTION_DAYS`) and its erasures carry over, and a missed run is repaired by the next one. No cursor or state is kept.
+A failed visit sync stops the run before the counts. A resolver that does not serve the activity route yet (HTTP 404) skips the counts and the run still succeeds; any other activity failure fails the run, with the visit table already replaced.
+
+Because the visit table is replaced in full, it always mirrors the resolver: its retention (`OBSERVATION_RETENTION_DAYS`) and its erasures carry over, and a missed run is repaired by the next one. No cursor or state is kept.
 
 A failed feed read writes nothing, so the previous table stays in place. Logs contain counts only: no company names, domains or tokens.
 
@@ -35,7 +38,7 @@ A failed feed read writes nothing, so the previous table stays in place. Logs co
 
 A visit is a page entrance, not a session or a person. The table holds no IP address, fingerprint or visitor identifier.
 
-Create the dataset and the table before the first run. The job uses `CREATE_NEVER` and does not create them:
+The job uses `CREATE_NEVER` and does not create tables; the setup script creates the dataset, both tables and the view when they are missing, and keeps existing data. By hand:
 
 ```sql
 CREATE SCHEMA `<project>.idr` OPTIONS (location = "EU");
@@ -46,6 +49,27 @@ CREATE TABLE `<project>.idr.company_visits` (
 );
 ```
 
+## Daily activity table
+
+`<dataset>.daily_activity`, one row per usage period with activity (the resolver's `USAGE_PERIOD`, `day` in production). Rows are sparse: a period with no visits has no row; treat it as zeros. Counts only: no address, company or visitor identifier.
+
+| column | type | notes |
+| --- | --- | --- |
+| `period_start` | DATE | the day, or the first day of the month |
+| `period` | STRING | `day` or `month` |
+| `visits_submitted` | INT64 | page entrances the website sent to the resolver (bots filtered before sending are not counted) |
+| `outcome_qualified` … `outcome_unavailable` | INT64 | each entrance once, by its final status; together they add up to `visits_submitted` |
+| `cache_hits` | INT64 | answered from the cache, no provider call |
+| `provider_lookups` | INT64 | Enrich calls |
+| `domains_found` | INT64 | calls that returned a domain (a company or a network owner) |
+| `charged_lookups` | INT64 | calls holding a charge slot (charged or possibly charged) |
+| `company_visits` | INT64 | company observations recorded |
+| `company_first_visits` | INT64 | of those, the company's first |
+| `company_returning_visits` | INT64 | `company_visits − company_first_visits` |
+| `synced_at` | TIMESTAMP | when the run wrote the row |
+
+The view `<dataset>.daily_activity_rates` adds `resolution_rate` (companies identified ÷ visits), `resolution_rate_eligible` (the same, leaving out private addresses and paused lookups) and `returning_share`. The outcome columns start at zero from the resolver's migration 0011, so the view leaves the rates empty for earlier days. The counts are best-effort (see the resolver's `reporting-activity.v1` contract, `docs/contracts/reporting-activity.v1.md`), and only the last 366 days are kept: each run replaces the table.
+
 ## Configuration
 
 | variable | |
@@ -54,6 +78,7 @@ CREATE TABLE `<project>.idr.company_visits` (
 | `IDR_REPORTING_TOKEN` | the resolver's `REPORTING_AUTH_TOKEN`, from Secret Manager |
 | `IDR_WEBSITE_ID` | the resolver's website id. Pages for any other website are refused |
 | `BQ_PROJECT`, `BQ_DATASET`, `BQ_TABLE`, `BQ_LOCATION` | destination |
+| `BQ_ACTIVITY_TABLE` | optional, default `daily_activity`; must differ from `BQ_TABLE` |
 | `IDR_MAX_PAGES` | optional, default 200, so at most 100,000 visits per run |
 
 ## Deploy
@@ -70,6 +95,7 @@ SOURCE_COMMIT=<40-character commit> bash setup-cloud-run.sh
 It:
 
 - enables the APIs;
+- creates the dataset, both tables and the `daily_activity_rates` view when missing (existing data is kept);
 - creates the service account `idr-bigquery-sync`, with BigQuery Job User on the project and BigQuery Data Editor on the dataset only;
 - stores the reporting token in Secret Manager, typed with hidden input;
 - deploys the job from the pinned commit;
@@ -84,4 +110,5 @@ No service-account key is created. It is safe to re-run; pass `SKIP_TOKEN=1` to 
 - Logs: Cloud Run > Jobs > `idr-bigquery-sync` > Logs. Each run logs one `idr_bigquery_sync` line.
 - Pause: `gcloud scheduler jobs pause idr-bigquery-sync --location europe-west2`
 - Rotate the token: re-run the setup script after the resolver's token changes.
+- Update the job to a newer commit: re-run the setup script with the new `SOURCE_COMMIT` and `SKIP_TOKEN=1`.
 - Remove: delete the scheduler job, the Cloud Run job, the secret and the service account, then drop the table if it is no longer wanted.

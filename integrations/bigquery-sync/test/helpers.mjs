@@ -52,3 +52,29 @@ export function recordingFetch(handler) {
   fn.calls = calls;
   return fn;
 }
+
+export function activityItem(periodKey, extra = {}) {
+  return {
+    period_key: periodKey,
+    visits_submitted: 81,
+    outcomes: { qualified: 3, no_match: 15, excluded: 0, unknown: 0, pending: 3, ineligible: 0, disabled: 60, uncertain: 0, unavailable: 0 },
+    cache_hits: 4,
+    provider_lookups: 14,
+    domains_found: 2,
+    charged_lookups: 2,
+    company_visits: 3,
+    company_first_visits: 2,
+    ...extra,
+  };
+}
+
+export function activityBody(items, { period = "day", websiteId = "example-website" } = {}) {
+  return {
+    version: "1",
+    scope: { installation_id: "example-installation", website_id: websiteId },
+    period,
+    from: "2025-11-06",
+    to: "2026-11-06",
+    items,
+  };
+}

@@ -18,6 +18,7 @@ const LOCATION_RE = /^[A-Za-z0-9-]{2,40}$/;
 const WEBSITE_ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export const PAGE_SIZE = 500;
+export const DEFAULT_ACTIVITY_TABLE = "daily_activity";
 export const DEFAULT_MAX_PAGES = 200;
 
 export function readConfig(env) {
@@ -50,6 +51,10 @@ export function readConfig(env) {
   if (!BQ_NAME_RE.test(table)) throw new ConfigError("BQ_TABLE is not a valid table id");
   if (!LOCATION_RE.test(location)) throw new ConfigError("BQ_LOCATION is not valid");
 
+  const activityTable = (env.BQ_ACTIVITY_TABLE ?? "").trim() || DEFAULT_ACTIVITY_TABLE;
+  if (!BQ_NAME_RE.test(activityTable)) throw new ConfigError("BQ_ACTIVITY_TABLE is not a valid table id");
+  if (activityTable === table) throw new ConfigError("BQ_ACTIVITY_TABLE must differ from BQ_TABLE");
+
   let maxPages = DEFAULT_MAX_PAGES;
   if (env.IDR_MAX_PAGES !== undefined && env.IDR_MAX_PAGES !== "") {
     maxPages = Number(env.IDR_MAX_PAGES);
@@ -65,6 +70,7 @@ export function readConfig(env) {
     project,
     dataset,
     table,
+    activityTable,
     location,
     pageSize: PAGE_SIZE,
     maxPages,
