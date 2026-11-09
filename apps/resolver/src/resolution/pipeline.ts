@@ -43,6 +43,7 @@ import type { ObservationActivity, OutcomeReason, PipelineConfig, ResolutionJob,
 import type { ProviderAdapter, ProviderOutcome } from "../contracts/provider.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../ip/fingerprint.js";
+import type { HostingRangeMatcher, HostingRangeProvider } from "../ip/hosting-ranges.js";
 import type { Logger } from "../log/index.js";
 import { qualify } from "./qualify.js";
 
@@ -54,6 +55,8 @@ export interface PipelineDeps {
   activity: ActivityRepository;
   provider: ProviderAdapter;
   logger: Logger;
+  /** Published cloud and crawler ranges, loaded at start-up when HOSTING_RANGES_MODE is not off. */
+  hostingRanges?: HostingRangeMatcher;
   sleep?: (ms: number) => Promise<void>;
   /**
    * Receives database operations that exceeded their budget and are still
@@ -299,12 +302,16 @@ export async function runJob(
       await repo(() => cache.release(key!, t));
     }
   };
+  // The provider whose published range holds the address (HOSTING_RANGES_MODE shadow or enforce).
+  // Logged by name only; the address itself never leaves this function.
+  let hostingRange: HostingRangeProvider | null = null;
   const finish = (o: ResolutionOutcome): ResolutionOutcome => {
     logger.info("job_finished", {
       status: o.status,
       ...(o.reason ? { reason: o.reason } : {}),
       source: o.source,
       duration_ms: now().getTime() - started,
+      ...(hostingRange ? { hosting_range: hostingRange } : {}),
     });
     countActivity(OUTCOME_COUNTERS[o.status]);
     return o;
@@ -385,6 +392,14 @@ export async function runJob(
     const ip = canonicaliseIp(job.ip, { allowDocumentationRanges: config.policy.allow_documentation_ranges === true });
     if (!ip.ok) return finish(outcome("ineligible", "ip_invalid"));
     if (!ip.eligible) return finish(outcome("ineligible", "ip_ineligible"));
+
+    // 1b. Published cloud and crawler ranges. shadow: note the match and carry on, so the
+    //     logs show what enforce would have saved; enforce: no cache, no lookup, no charge.
+    const hostingMode = policy.hosting_ranges_mode ?? "off";
+    if (hostingMode !== "off" && deps.hostingRanges) {
+      hostingRange = deps.hostingRanges.lookup(ip.canonical);
+      if (hostingRange !== null && hostingMode === "enforce") return finish(outcome("excluded", "ip_hosting_range"));
+    }
 
     // 2. Fingerprint.
     secret = decodeSecret(config.ip_hmac_secret);
@@ -471,7 +486,13 @@ export async function runJob(
     const providerSignal = job.signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), job.signal]) : AbortSignal.timeout(timeoutMs);
     const p = await provider.lookup(ip.canonical, { signal: providerSignal });
     logger.info("provider_call", { duration_ms: now().getTime() - t0 });
-    logger.info("provider_outcome", { outcome: p.kind, ...(p.kind === "error" ? { category: p.category } : {}) });
+    logger.info("provider_outcome", {
+      outcome: p.kind,
+      ...(p.kind === "error" ? { category: p.category } : {}),
+      // The network type the provider reported (ISP, DCH, COM...), never the domain or name.
+      ...(p.kind === "resolved" ? { usage_type: p.usageType ?? "none" } : {}),
+      ...(hostingRange ? { hosting_range: hostingRange } : {}),
+    });
 
     // 8. Qualify, persist (fenced), count.
     const checkedAt = now();

@@ -818,6 +818,99 @@ describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
   });
 });
 
+describe("runJob: published cloud and crawler ranges (HOSTING_RANGES_MODE)", () => {
+  // A stub matcher: IP is in a published range, every other address is not.
+  const matcher = () => {
+    const seen: string[] = [];
+    return {
+      seen,
+      generatedAt: "2026-11-09",
+      prefixCount: 1,
+      lookup: (canonical: string) => {
+        seen.push(canonical);
+        return canonical === IP ? ("aws" as const) : null;
+      },
+    };
+  };
+  const setupWith = (mode: "off" | "shadow" | "enforce", script: MockScript) => {
+    const t = setup(script);
+    const m = matcher();
+    const deps: PipelineDeps = { ...t.deps, hostingRanges: m };
+    const config = makeConfig({ policy: { hosting_ranges_mode: mode } });
+    return { ...t, m, deps, config };
+  };
+  const events = (t: { logger: { entries: Array<Record<string, unknown>> } }, name: string) => t.logger.entries.filter((e) => e["event"] === name);
+
+  it("shadow: a match is logged by provider name and the lookup still runs, with the network type", async () => {
+    const t = setupWith("shadow", { [IP]: { outcome: resolved("host.example", "DCH") } });
+    const o = await runJob(t.deps, t.config, job());
+    expect(o).toEqual({ status: "excluded", source: "provider", reason: "provider_excluded_usage_type" });
+    expect(t.mock.calls).toBe(1);
+    expect((await t.snapshot()).provider_attempts).toBe(1);
+    expect(events(t, "provider_outcome")[0]).toMatchObject({ outcome: "resolved", usage_type: "DCH", hosting_range: "aws" });
+    expect(events(t, "job_finished")[0]).toMatchObject({ status: "excluded", hosting_range: "aws" });
+    // The address itself is never logged.
+    expect(JSON.stringify(t.logger.entries)).not.toContain(IP);
+  });
+
+  it("shadow: no match leaves the logs as they were, apart from the network type", async () => {
+    const other = "203.0.113.20";
+    const t = setupWith("shadow", { [other]: { outcome: resolved("example.com", "COM") } });
+    const o = await runJob(t.deps, t.config, job(other));
+    expect(o.status).toBe("qualified");
+    expect(t.m.seen).toEqual([other]);
+    expect(events(t, "provider_outcome")[0]).toMatchObject({ usage_type: "COM" });
+    expect(t.logger.entries.some((e) => "hosting_range" in e)).toBe(false);
+  });
+
+  it("enforce: a match is excluded before the cache, the reservation and the provider", async () => {
+    const t = setupWith("enforce", { [IP]: { outcome: resolved("host.example", "DCH") } });
+    const o = await runJob(t.deps, t.config, job());
+    expect(o).toEqual({ status: "excluded", source: "none", reason: "ip_hosting_range" });
+    expect(t.mock.calls).toBe(0);
+    expect(t.repos.cache.calls.reserve + t.repos.cache.calls.readFresh + t.repos.cache.calls.commit).toBe(0);
+    const snap = await t.snapshot();
+    expect(snap.provider_attempts).toBe(0);
+    expect(snap.resolver_requests).toBe(1);
+    expect(events(t, "job_finished")[0]).toMatchObject({ status: "excluded", reason: "ip_hosting_range", hosting_range: "aws" });
+    expect(events(t, "provider_outcome")).toHaveLength(0);
+  });
+
+  it("enforce: an address outside every range is looked up as usual", async () => {
+    const other = "203.0.113.21";
+    const t = setupWith("enforce", { [other]: { outcome: resolved("example.com", "COM") } });
+    expect((await runJob(t.deps, t.config, job(other))).status).toBe("qualified");
+    expect(t.mock.calls).toBe(1);
+  });
+
+  it("off (the default): the matcher is never consulted, even when loaded", async () => {
+    for (const mode of ["off", undefined] as const) {
+      const t = setupWith("off", { [IP]: { outcome: resolved("host.example", "DCH") } });
+      const config = mode === undefined ? makeConfig() : t.config;
+      const o = await runJob(t.deps, config, job());
+      expect(o.reason).toBe("provider_excluded_usage_type");
+      expect(t.m.seen).toEqual([]);
+      expect(t.logger.entries.some((e) => "hosting_range" in e)).toBe(false);
+    }
+  });
+
+  it("an ineligible address is never matched", async () => {
+    const t = setupWith("enforce", {});
+    expect((await runJob(t.deps, t.config, job("10.0.0.1"))).reason).toBe("ip_ineligible");
+    expect(t.m.seen).toEqual([]);
+  });
+
+  it("the network type is logged only for a found domain, never the domain or the name", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", null, "Example Ltd") } });
+    await runJob(t.deps, t.config, job());
+    expect(events(t, "provider_outcome")[0]).toMatchObject({ outcome: "resolved", usage_type: "none" });
+    expect(JSON.stringify(t.logger.entries)).not.toMatch(/example\.com|Example Ltd/);
+    const n = setup({ [IP]: { outcome: { kind: "no_domain", creditsReported: 0 } } });
+    await runJob(n.deps, n.config, job());
+    expect(events(n, "provider_outcome")[0]).not.toHaveProperty("usage_type");
+  });
+});
+
 describe("runJob: activity counters (GET /v1/reporting/activity)", () => {
   const obsRef = (n: number) => `obsref-${String(n).padStart(16, "0")}`;
   it("counts every job once by its final status, so the outcomes add up to resolver_requests, and counts company visits", async () => {

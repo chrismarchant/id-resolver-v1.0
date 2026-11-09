@@ -60,6 +60,12 @@ describe("bounded configuration", () => {
     }
   });
 
+  it("HOSTING_RANGES_MODE is off by default and accepts only off, shadow or enforce", () => {
+    expect(loadConfig(REQUIRED).HOSTING_RANGES_MODE).toBe("off");
+    for (const mode of ["off", "shadow", "enforce"]) expect(loadConfig({ ...REQUIRED, HOSTING_RANGES_MODE: mode }).HOSTING_RANGES_MODE).toBe(mode);
+    for (const bad of ["on", "true", "SHADOW", ""]) expect(errorOf(() => loadConfig({ ...REQUIRED, HOSTING_RANGES_MODE: bad }))).toContain("HOSTING_RANGES_MODE");
+  });
+
   it("never describes secrets", () => {
     const text = JSON.stringify(describeConfig(testConfig()));
     expect(text).not.toContain(TEST_AUTH_TOKEN);
