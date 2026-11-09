@@ -35,6 +35,11 @@
  * `public-safety: allow-synthetic` and a reason, for deliberately synthetic
  * test inputs. Opt-outs are listed in the output so reviewers see them.
  *
+ * The published cloud and crawler ranges file (PUBLISHED_RANGE_FILES, exact
+ * path) is the one other exception: there, a line holding exactly one quoted
+ * IPv4 /8-/28 or IPv6 /16-/64 network prefix is not scanned, in tree and
+ * history mode. Any other line of that file, and every other file, is.
+ *
  * Modes:
  *   (default)   every file tracked by git (or untracked and not ignored)
  *   --staged    files staged for commit
@@ -86,6 +91,13 @@ const HISTORY_ALLOW_FILE = ".public-safety-history-allow";
 // paths only (never matched by basename, never at any other depth). The
 // history allow-list is NOT skipped: its entries hold hashes, not values.
 const SKIP_FILES = new Set(["package-lock.json", "packages/tanstack/verification/cf-lifecycle/package-lock.json"]);
+// Published cloud and crawler network ranges (exact paths), written only by
+// apps/resolver/scripts/update-hosting-ranges.mjs from the providers' own
+// lists. In these files a line that holds exactly one quoted network prefix
+// is exempt from the IP rules when the prefix is IPv4 /8 to /28 or IPv6 /16
+// to /64, with no host bits set: such a block covers at least 16 addresses,
+// so no single host can be listed. Every other line is scanned as usual.
+export const PUBLISHED_RANGE_FILES = new Set(["apps/resolver/data/hosting-ranges.json"]);
 // Text files over MAX_BYTES that a reviewer has accepted (exact paths). Empty
 // on purpose: any other large text file is a finding, not a silent skip.
 const REVIEWED_LARGE_TEXT = new Set([]);
@@ -280,6 +292,37 @@ function isPublicIpv6(text) {
   return true;
 }
 
+/** True when `line` is exactly one quoted network prefix allowed in a PUBLISHED_RANGE_FILES file. */
+export function isPublishedRangeLine(line) {
+  const m = /^\s*"([0-9a-f.:]+)\/(\d{1,3})",?\s*$/.exec(line);
+  if (!m) return false;
+  const [, address, lenText] = m;
+  if (lenText.length > 1 && lenText.startsWith("0")) return false;
+  const len = Number(lenText);
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(address)) {
+    const parts = address.split(".");
+    if (parts.some((p) => Number(p) > 255 || (p.length > 1 && p.startsWith("0")))) return false;
+    if (len < 8 || len > 28) return false;
+    const value = parts.reduce((acc, p) => acc * 256 + Number(p), 0);
+    return value % 2 ** (32 - len) === 0;
+  }
+  if (!address.includes(":") || address.includes(".")) return false;
+  const g = parseIpv6(address);
+  if (g === null || len < 16 || len > 64) return false;
+  // Host bits: every bit after `len` must be zero (len <= 64, so the last four hextets are all host bits).
+  for (let i = 0; i < 8; i++) {
+    const keep = Math.max(0, Math.min(16, len - i * 16));
+    const mask = keep === 0 ? 0 : (0xffff << (16 - keep)) & 0xffff;
+    if ((g[i] & ~mask & 0xffff) !== 0) return false;
+  }
+  return true;
+}
+
+/** The line exemption for `path`, or null: only exact PUBLISHED_RANGE_FILES paths have one. */
+function rangeLineExemption(path) {
+  return PUBLISHED_RANGE_FILES.has(path) ? isPublishedRangeLine : null;
+}
+
 function isPublicIpv4(text) {
   const parts = text.split(".").map((p) => Number(p));
   if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return false;
@@ -359,10 +402,12 @@ export function decodeText(buf) {
 /**
  * Applies every rule (except those in `skipRules`) to text. `report(rule, hit, lineNo, optedOut)`
  * is called per hit. Names (paths, refs) pass `honourMarker = false`: the opt-out marker is for content lines.
+ * `exemptLine`, from rangeLineExemption(path), skips the lines of a published-range file that hold one allowed prefix.
  */
-function scanText(text, report, skipRules = null, honourMarker = true) {
+function scanText(text, report, skipRules = null, honourMarker = true, exemptLine = null) {
   const lines = text.split(/\r\n|\n|\r|\u2028|\u2029/);
   lines.forEach((line, i) => {
+    if (exemptLine?.(line)) return;
     for (const rule of RULES) {
       if (skipRules?.has(rule.id)) continue;
       rule.re.lastIndex = 0;
@@ -403,10 +448,16 @@ function checkTree(staged) {
       findings.push(`${shown}: large-text-file: ${st.size} bytes exceeds ${MAX_BYTES}; split it or add its exact path to REVIEWED_LARGE_TEXT after review`);
       continue;
     }
-    scanText(dec.text, (rule, hit, line, optedOut) => {
-      if (optedOut) optOuts.push(`${shown}:${line}: ${rule.id} ${displayValue(hit)}`);
-      else findings.push(`${shown}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
-    });
+    scanText(
+      dec.text,
+      (rule, hit, line, optedOut) => {
+        if (optedOut) optOuts.push(`${shown}:${line}: ${rule.id} ${displayValue(hit)}`);
+        else findings.push(`${shown}:${line}: ${rule.id}: ${rule.why}: ${displayValue(hit)}`);
+      },
+      null,
+      true,
+      rangeLineExemption(file),
+    );
   }
   // Ref names (branches, tags, remote-tracking refs) are public on the host too. In tree mode a
   // hit cannot be waived: rename or delete the ref.
@@ -690,7 +741,7 @@ function checkHistory(allow) {
       }
     },
     scan(commit, path, text, skipRules = null, honourMarker = true, note = "") {
-      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut, note), skipRules, honourMarker);
+      scanText(text, (rule, hit, _n, optedOut) => ctx.emit(commit, path, rule, hit, optedOut, note), skipRules, honourMarker, rangeLineExemption(path));
     },
   };
   // Every path each commit adds or changes, read NUL-safely: an empty or binary .env or key file
