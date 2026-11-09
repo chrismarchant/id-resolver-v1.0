@@ -84,7 +84,8 @@ commercial-history retention. Only an explicit company erasure
 
 `GET /v1/reporting/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` (existing) returns
 per-range counts. A consumer compares them with its projection for the same
-UTC days inside the retained window.
+UTC days inside the retained window. Per-period visit and outcome counts are a
+separate route: `GET /v1/reporting/activity` ([reporting-activity.v1.md](reporting-activity.v1.md)).
 
 ## Clarifications (CHR-71 implementation)
 

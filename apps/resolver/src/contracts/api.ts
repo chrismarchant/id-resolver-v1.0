@@ -173,6 +173,38 @@ export interface ReportingCompanyDetailResponse {
   next_cursor: string | null;
 }
 
+/** One usage period of GET /v1/reporting/activity. Counts only. */
+export interface ReportingActivityPeriod {
+  /** "YYYY-MM-DD" (USAGE_PERIOD=day) or "YYYY-MM" (month), UTC. */
+  period_key: string;
+  /** Entrances the website sent to the resolver (every job, whatever its outcome). */
+  visits_submitted: number;
+  /** Each job once, by its final status; the values add up to visits_submitted (best effort). */
+  outcomes: Record<ResolutionStatus, number>;
+  /** Jobs answered from a fresh cache row. */
+  cache_hits: number;
+  /** Provider calls made (fresh lookups). */
+  provider_lookups: number;
+  /** Provider calls that returned a domain (company, network owner or unknown). */
+  domains_found: number;
+  /** Charge slots held against PERIOD_RESOLVED_CAP. */
+  charged_lookups: number;
+  /** Company observations newly recorded, and those that were the company's first in this scope. */
+  company_visits: number;
+  company_first_visits: number;
+}
+
+export interface ReportingActivityResponse {
+  version: typeof REPORTING_API_VERSION;
+  scope: ReportingScope;
+  period: "day" | "month";
+  /** Inclusive UTC calendar dates as requested. */
+  from: string;
+  to: string;
+  /** Periods with any activity, in key order; a period missing here had none. */
+  items: ReportingActivityPeriod[];
+}
+
 export interface ReportingSummaryResponse {
   version: typeof REPORTING_API_VERSION;
   scope: ReportingScope;

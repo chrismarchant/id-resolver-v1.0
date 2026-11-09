@@ -324,6 +324,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // potential continuity gap), otherwise 400 and an idempotent replay
       // (docs/contracts/reporting-feed.v1.md, CHR-66 N1).
       feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
+      usagePeriod: config.USAGE_PERIOD,
     });
   }
 

@@ -44,6 +44,20 @@ async function main(): Promise<void> {
               failures: s.failures,
               uncertain_outcomes: s.uncertain_outcomes,
             },
+            // Each job once, by its final status (adds up to resolver_requests, best effort).
+            outcomes: {
+              qualified: s.outcome_qualified,
+              no_match: s.outcome_no_match,
+              excluded: s.outcome_excluded,
+              unknown: s.outcome_unknown,
+              pending: s.outcome_pending,
+              ineligible: s.outcome_ineligible,
+              disabled: s.outcome_disabled,
+              uncertain: s.outcome_uncertain,
+              unavailable: s.outcome_unavailable,
+            },
+            company_visits: s.company_visits,
+            company_first_visits: s.company_first_visits,
             // Credits the provider itself reported in responses. Never inferred.
             provider_credits_reported: s.providerCreditsReported,
             // Locally estimated credits. An ESTIMATE, not a billing figure.

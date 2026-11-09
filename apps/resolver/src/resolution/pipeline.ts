@@ -38,7 +38,7 @@ import type {
   UsageRepository,
   UsageScope,
 } from "../contracts/db.js";
-import { usagePeriodKey } from "../contracts/db.js";
+import { OUTCOME_COUNTERS, usagePeriodKey } from "../contracts/db.js";
 import type { ObservationActivity, OutcomeReason, PipelineConfig, ResolutionJob, ResolutionOutcome } from "../contracts/runtime.js";
 import type { ProviderAdapter, ProviderOutcome } from "../contracts/provider.js";
 import { canonicaliseIp } from "../ip/canonical.js";
@@ -285,6 +285,16 @@ export async function runJob(
     }
   };
   const count = (counter: UsageCounter) => accounting("usage_counter", () => usage.increment(scope, counter));
+  /**
+   * Activity counters (one final outcome per job, company visits) start on
+   * every path, deadline included, and are never awaited: the answer is not
+   * delayed and the runner drains them on shutdown. Best effort, like every
+   * usage counter.
+   */
+  const countActivity = (counter: UsageCounter): void => {
+    const run = usage.increment(scope, counter).catch(() => logger.warn("db_error", { category: "usage_activity" }));
+    deps.onDeferred?.(run);
+  };
   const release = async () => {
     if (key && token) {
       const t = token;
@@ -303,6 +313,7 @@ export async function runJob(
       duration_ms: now().getTime() - started,
       ...(hostingRange ? { hosting_range: hostingRange } : {}),
     });
+    countActivity(OUTCOME_COUNTERS[o.status]);
     return o;
   };
 
@@ -356,6 +367,10 @@ export async function runJob(
         return { ...o, activity: base };
       }
       logger.info("activity_recorded", { company_id: companyId, recorded: r.kind === "recorded", previously_seen: r.previouslySeen, source });
+      if (r.kind === "recorded") {
+        countActivity("company_visits");
+        if (!r.previouslySeen) countActivity("company_first_visits");
+      }
       return { ...o, activity: { ...base, previously_seen: r.previouslySeen, recorded: true } };
     } catch (err) {
       logger.warn("activity_write_failed", { company_id: companyId, reason: err instanceof ActivityTimeoutError ? "deadline_exceeded" : "database_error", source });
