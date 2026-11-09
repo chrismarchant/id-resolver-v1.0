@@ -940,3 +940,102 @@ test("the IPv4 rule matches before a trailing dot or a file extension, not insid
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- published ranges file ---------------------------------------------------
+
+const RANGES_PATH = "apps/resolver/data/hosting-ranges.json";
+// Public blocks built at runtime, so this file holds no public literal.
+const v4Block = (len, last = 0) => `${[52, 0, 0, last].join(".")}/${len}`;
+const v6Block = (len) => `${["2600", "1f00"].join(":")}::/${len}`;
+const rangesFile = (lines) => `{\n  "providers": {\n    "aws": {\n      "v4": [\n${lines.map((l) => `        ${l}`).join("\n")}\n      ]\n    }\n  }\n}\n`;
+
+test("the published-range exemption names exactly one file", () => {
+  const m = /export const PUBLISHED_RANGE_FILES = new Set\(\[([^\]]*)\]\);/.exec(readFileSync(GATE, "utf8"));
+  assert.ok(m);
+  assert.equal(m[1], JSON.stringify(RANGES_PATH));
+});
+
+test("in the published-range file, only lines with one aligned IPv4 /8-/28 or IPv6 /16-/64 prefix are exempt", () => {
+  const ok = [`"${v4Block(8)}",`, `  "${v4Block(28)}",`, `"${v6Block(32)}",`, `"${v6Block(64)}",`, `"${["2600", "1f00", "0", "0"].join(":")}::/64"`];
+  const okDir = repoWith({ [RANGES_PATH]: rangesFile(ok) });
+  try {
+    const r = runGate(okDir);
+    assert.equal(r.code, 0, r.out);
+  } finally {
+    rmSync(okDir, { recursive: true, force: true });
+  }
+  const bad = [
+    `"${v4Block(29)}",`, // too small: could name a single host
+    `"${v4Block(32)}",`,
+    `"${v4Block(7)}",`, // too large
+    `"${v4Block(24, 1)}",`, // host bits set: an address, not a block
+    `"${v6Block(65)}",`,
+    `"${v6Block(128)}",`,
+    `"${v6Block(15)}",`,
+    `"${["2600", "1f00"].join(":")}::1/64",`, // host bits set
+    `"${v6Block(16)}",`, // bits set after the first 16
+    `"${[52, 0, 0, 0].join(".")}",`, // a bare address
+    `"ip": "${v4Block(8)}",`, // anything else on the line
+    `"${v4Block(8)}", "${v4Block(16)}",`,
+    `"${v4Block(8)}", // note`,
+    `"${v4Block("08")}",`,
+    `"${["2600", "1F00"].join(":")}::/32",`, // uppercase is not what the generator writes
+    `"::ffff:${[52, 0, 0, 0].join(".")}/120"`,
+  ];
+  const badDir = repoWith({ [RANGES_PATH]: rangesFile(bad) });
+  try {
+    const r = runGate(badDir);
+    assert.equal(r.code, 1, r.out);
+    // rangesFile puts the first array line on line 5.
+    bad.forEach((line, i) => assert.match(r.out, new RegExp(`hosting-ranges\\.json:${5 + i}: public-ipv[46]`), line));
+  } finally {
+    rmSync(badDir, { recursive: true, force: true });
+  }
+});
+
+test("published ranges pass only in their exact file; a single host or extra text there still fails", () => {
+  const good = rangesFile([`"${v4Block(11)}",`, `"${v4Block(28)}"`]);
+  const dir = repoWith({ [RANGES_PATH]: good, "apps/resolver/data/other.json": good });
+  try {
+    const r = runGate(dir);
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /other\.json/);
+    assert.doesNotMatch(r.out, /hosting-ranges\.json/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  for (const line of [`"${v4Block(32)}"`, `"${[52, 0, 0, 7].join(".")}"`, `"note": "${v4Block(16)}"`]) {
+    const bad = repoWith({ [RANGES_PATH]: rangesFile([`"${v4Block(11)}",`, line]) });
+    try {
+      const r = runGate(bad);
+      assert.equal(r.code, 1, `${line}\n${r.out}`);
+      assert.match(r.out, /hosting-ranges\.json:\d+: public-ipv4/);
+    } finally {
+      rmSync(bad, { recursive: true, force: true });
+    }
+  }
+});
+
+test("--history applies the same exemption to the published-range file only", () => {
+  const ok = historyRepo(RANGES_PATH, rangesFile([`"${v4Block(11)}",`, `"${v6Block(32)}"`]));
+  try {
+    const r = runGate(ok.dir, "--history");
+    assert.equal(r.code, 0, r.out);
+  } finally {
+    rmSync(ok.dir, { recursive: true, force: true });
+  }
+  const bad = historyRepo(RANGES_PATH, rangesFile([`"${v4Block(11)}",`, `"${v4Block(32)}"`]));
+  try {
+    const r = runGate(bad.dir, "--history");
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /public-ipv4/);
+  } finally {
+    rmSync(bad.dir, { recursive: true, force: true });
+  }
+  const elsewhere = historyRepo("data/ranges.json", rangesFile([`"${v4Block(11)}"`]));
+  try {
+    assert.equal(runGate(elsewhere.dir, "--history").code, 1);
+  } finally {
+    rmSync(elsewhere.dir, { recursive: true, force: true });
+  }
+});
