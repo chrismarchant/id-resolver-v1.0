@@ -40,14 +40,18 @@ export async function metadataAccessToken({ fetch = globalThis.fetch, timeoutMs 
   return body.access_token;
 }
 
+/**
+ * Replaces one table's content (WRITE_TRUNCATE load, or TRUNCATE when there are no rows).
+ * `opts.table` and `opts.schema` default to the company visits table.
+ */
 export async function replaceTable(cfg, rows, accessToken, opts = {}) {
-  const { fetch = globalThis.fetch, jobId = `idr_sync_${Date.now()}_${randomUUID().slice(0, 8)}` } = opts;
+  const { fetch = globalThis.fetch, jobId = `idr_sync_${Date.now()}_${randomUUID().slice(0, 8)}`, table = cfg.table, schema = SCHEMA } = opts;
   const auth = { authorization: `Bearer ${accessToken}` };
   const jobReference = { projectId: cfg.project, jobId, location: cfg.location };
   const labels = { source: "idr-bigquery-sync" };
 
   if (rows.length === 0) {
-    const query = `TRUNCATE TABLE \`${cfg.project}.${cfg.dataset}.${cfg.table}\``;
+    const query = `TRUNCATE TABLE \`${cfg.project}.${cfg.dataset}.${table}\``;
     const res = await fetch(`${API}/projects/${cfg.project}/jobs`, {
       method: "POST",
       headers: { ...auth, "content-type": "application/json" },
@@ -64,11 +68,11 @@ export async function replaceTable(cfg, rows, accessToken, opts = {}) {
       configuration: {
         labels,
         load: {
-          destinationTable: { projectId: cfg.project, datasetId: cfg.dataset, tableId: cfg.table },
+          destinationTable: { projectId: cfg.project, datasetId: cfg.dataset, tableId: table },
           sourceFormat: "NEWLINE_DELIMITED_JSON",
           writeDisposition: "WRITE_TRUNCATE",
           createDisposition: "CREATE_NEVER",
-          schema: { fields: SCHEMA },
+          schema: { fields: schema },
           maxBadRecords: 0,
           ignoreUnknownValues: false,
         },

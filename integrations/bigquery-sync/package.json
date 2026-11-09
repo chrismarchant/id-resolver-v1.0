@@ -2,7 +2,7 @@
   "name": "@idr/bigquery-sync",
   "version": "1.0.0-dev.0",
   "private": true,
-  "description": "Scheduled job that copies the ID Resolver reporting feed (reporting-feed.v1) into one BigQuery table, replacing it on every run",
+  "description": "Scheduled job that copies the ID Resolver reporting feed (reporting-feed.v1) and daily activity counts (reporting-activity.v1) into BigQuery, replacing both tables on every run",
   "type": "module",
   "engines": {
     "node": ">=22 <23"

@@ -10,6 +10,7 @@ REGION="${REGION:-europe-west2}"
 BQ_LOCATION="${BQ_LOCATION:-EU}"
 BQ_DATASET="${BQ_DATASET:-idr}"
 BQ_TABLE="${BQ_TABLE:-company_visits}"
+BQ_ACTIVITY_TABLE="${BQ_ACTIVITY_TABLE:-daily_activity}"
 SCHEDULE="${SCHEDULE:-*/30 * * * *}"
 REPO_URL="${REPO_URL:-https://github.com/chrismarchant/id-resolver-v1.0.git}"
 
@@ -20,6 +21,10 @@ SECRET="idr-reporting-token"
 
 case "$IDR_REPORTING_URL" in https://*) ;; *) echo "IDR_REPORTING_URL must start with https://" >&2; exit 1 ;; esac
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "SOURCE_COMMIT must be a full 40-character commit hash" >&2; exit 1; }
+for name in "$BQ_DATASET" "$BQ_TABLE" "$BQ_ACTIVITY_TABLE"; do
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]{0,1023}$ ]] || { echo "BQ_DATASET, BQ_TABLE and BQ_ACTIVITY_TABLE must be BigQuery names (letters, digits, underscores)" >&2; exit 1; }
+done
+[[ "$BQ_LOCATION" =~ ^[A-Za-z0-9-]{2,40}$ ]] || { echo "BQ_LOCATION is not valid" >&2; exit 1; }
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -34,6 +39,37 @@ PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNum
 step "Enabling APIs"
 gcloud services enable run.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com \
   cloudbuild.googleapis.com artifactregistry.googleapis.com bigquery.googleapis.com iam.googleapis.com
+
+step "Dataset, tables and view (created when missing; existing data is kept)"
+DS="\`${PROJECT}.${BQ_DATASET}\`"
+bq query --quiet --nouse_legacy_sql --location="$BQ_LOCATION" "
+CREATE SCHEMA IF NOT EXISTS ${DS} OPTIONS (location = '${BQ_LOCATION}');
+CREATE TABLE IF NOT EXISTS \`${PROJECT}.${BQ_DATASET}.${BQ_TABLE}\` (
+  observation_id STRING NOT NULL, company_id INT64 NOT NULL, domain STRING NOT NULL,
+  organisation_name STRING, observed_at TIMESTAMP NOT NULL, method STRING NOT NULL,
+  page_key STRING, acquisition STRING, entrance_contract STRING, synced_at TIMESTAMP NOT NULL);
+CREATE TABLE IF NOT EXISTS \`${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}\` (
+  period_start DATE NOT NULL, period STRING NOT NULL, visits_submitted INT64 NOT NULL,
+  outcome_qualified INT64 NOT NULL, outcome_no_match INT64 NOT NULL, outcome_excluded INT64 NOT NULL,
+  outcome_unknown INT64 NOT NULL, outcome_pending INT64 NOT NULL, outcome_ineligible INT64 NOT NULL,
+  outcome_disabled INT64 NOT NULL, outcome_uncertain INT64 NOT NULL, outcome_unavailable INT64 NOT NULL,
+  cache_hits INT64 NOT NULL, provider_lookups INT64 NOT NULL, domains_found INT64 NOT NULL,
+  charged_lookups INT64 NOT NULL, company_visits INT64 NOT NULL, company_first_visits INT64 NOT NULL,
+  company_returning_visits INT64 NOT NULL, synced_at TIMESTAMP NOT NULL);
+CREATE OR REPLACE VIEW \`${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}_rates\` AS
+SELECT
+  period_start, period, visits_submitted, outcome_qualified AS companies_identified,
+  -- Outcome counts start when the resolver's migration 0011 is deployed: no rate before then.
+  SAFE_DIVIDE(outcome_qualified, IF(outcomes = 0, NULL, visits_submitted)) AS resolution_rate,
+  SAFE_DIVIDE(outcome_qualified, IF(outcomes = 0, NULL, visits_submitted - outcome_ineligible - outcome_disabled)) AS resolution_rate_eligible,
+  company_visits, company_first_visits, company_returning_visits,
+  SAFE_DIVIDE(company_returning_visits, company_visits) AS returning_share,
+  provider_lookups, domains_found, charged_lookups
+FROM (
+  SELECT *, outcome_qualified + outcome_no_match + outcome_excluded + outcome_unknown + outcome_pending
+    + outcome_ineligible + outcome_disabled + outcome_uncertain + outcome_unavailable AS outcomes
+  FROM \`${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}\`);
+" >/dev/null
 
 step "Service account"
 if ! gcloud iam service-accounts describe "$SA" >/dev/null 2>&1; then
@@ -76,7 +112,7 @@ gcloud run jobs deploy "$JOB" \
   --region="$REGION" \
   --service-account="$SA" \
   --set-secrets="IDR_REPORTING_TOKEN=${SECRET}:latest" \
-  --set-env-vars="IDR_REPORTING_URL=${IDR_REPORTING_URL},IDR_WEBSITE_ID=${IDR_WEBSITE_ID},BQ_PROJECT=${PROJECT},BQ_DATASET=${BQ_DATASET},BQ_TABLE=${BQ_TABLE},BQ_LOCATION=${BQ_LOCATION}" \
+  --set-env-vars="IDR_REPORTING_URL=${IDR_REPORTING_URL},IDR_WEBSITE_ID=${IDR_WEBSITE_ID},BQ_PROJECT=${PROJECT},BQ_DATASET=${BQ_DATASET},BQ_TABLE=${BQ_TABLE},BQ_ACTIVITY_TABLE=${BQ_ACTIVITY_TABLE},BQ_LOCATION=${BQ_LOCATION}" \
   --labels="source=id-resolver,commit=${SOURCE_COMMIT:0:12}" \
   --tasks=1 --max-retries=1 --task-timeout=300s \
   --quiet
@@ -99,4 +135,4 @@ else
 fi
 
 step "Done"
-echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE}."
+echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}."

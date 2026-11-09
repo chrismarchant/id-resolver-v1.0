@@ -42,3 +42,11 @@ test("validates IDR_MAX_PAGES", () => {
   assert.equal(readConfig({ ...ENV, IDR_MAX_PAGES: "5" }).maxPages, 5);
   assert.throws(() => readConfig({ ...ENV, IDR_MAX_PAGES: "0" }), /IDR_MAX_PAGES/);
 });
+
+test("BQ_ACTIVITY_TABLE defaults to daily_activity and must be a different, valid table", () => {
+  assert.equal(readConfig(ENV).activityTable, "daily_activity");
+  assert.equal(readConfig({ ...ENV, BQ_ACTIVITY_TABLE: " visit_counts " }).activityTable, "visit_counts");
+  assert.equal(readConfig({ ...ENV, BQ_ACTIVITY_TABLE: "" }).activityTable, "daily_activity");
+  assert.throws(() => readConfig({ ...ENV, BQ_ACTIVITY_TABLE: "bad-name" }), /BQ_ACTIVITY_TABLE is not a valid/);
+  assert.throws(() => readConfig({ ...ENV, BQ_ACTIVITY_TABLE: "company_visits" }), /must differ/);
+});
