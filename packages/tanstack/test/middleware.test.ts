@@ -327,6 +327,14 @@ describe("middleware: construction and configuration", () => {
     ["blocking budget too high", { blockingBudgetMs: 5000 }],
     ["maxInFlight zero", { maxInFlight: 0 }],
     ["bad background mode", { onUnsupportedBackground: "wait" as never }],
+    // Three-database separation (docs/GUARDRAILS.md G3b): the resolver is never a Supabase host.
+    ["Supabase project URL", { resolverUrl: "https://example-project.supabase.co" }],
+    ["Supabase Edge Function URL", { resolverUrl: "https://example-project.supabase.co/functions/v1/idr" }],
+    ["Supabase host in upper case with a trailing dot", { resolverUrl: "https://EXAMPLE-PROJECT.SUPABASE.CO./" }],
+    ["supabase.in host", { resolverUrl: "https://example-project.supabase.in" }],
+    ["supabase.com host (the pooler domain)", { resolverUrl: "https://pooler.supabase.com" }],
+    ["percent-encoded Supabase host", { resolverUrl: "https://example-project.supabase%2Eco" }],
+    ["http Supabase host with allowInsecureHttp", { resolverUrl: "http://example-project.supabase.co", allowInsecureHttp: true }],
   ];
   it.each(bad)("rejects %s at creation, without echoing the token or URL", (_n, over) => {
     const o = { ...baseOptions(), ...over } as IdrOptions;
@@ -340,6 +348,37 @@ describe("middleware: construction and configuration", () => {
     expect(message).not.toContain(TEST_TOKEN);
     expect(message).not.toContain("resolver.example.com");
     expect(message).not.toContain("user:pw");
+  });
+
+  it("G3b: a Supabase resolverUrl is refused with a fixed message that names no host; look-alike hosts are accepted", () => {
+    for (const resolverUrl of ["https://example-project.supabase.co", "https://db.example-project.supabase.co:5432", "https://supabase.com"]) {
+      let message = "";
+      try {
+        createIdrServerMiddleware(baseOptions({ resolverUrl }));
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      expect(message).toBe("idr-tanstack: resolverUrl must be the ID Resolver service, never a Supabase host");
+    }
+    for (const resolverUrl of ["https://supabase.co.example.com", "https://notsupabase.example", "https://resolver.example.com/supabase.co"]) {
+      expect(() => createIdrServerMiddleware(baseOptions({ resolverUrl })), resolverUrl).not.toThrow();
+    }
+  });
+
+  it("G3b: a lazily resolved Supabase resolverUrl disables reporting (config_invalid), sends nothing and leaves the page untouched", async () => {
+    const results: DeliveryResult[] = [];
+    const sent: string[] = [];
+    const fetchSpy: typeof fetch = async (input) => {
+      sent.push(String(input));
+      return new Response("{}", { status: 200 });
+    };
+    const mw = createIdrServerMiddleware(() => baseOptions({ resolverUrl: "https://example-project.supabase.co", fetch: fetchSpy, onDeliveryResult: (r) => void results.push(r) }));
+    for (let i = 0; i < 2; i++) {
+      const page = html();
+      expect(await mw({ request: reqWithIp(), next: nextOf(page) })).toBe(page);
+    }
+    expect(sent).toEqual([]);
+    expect(results).toEqual([expect.objectContaining({ outcome: "skipped", reason: "config_invalid" })]);
   });
 
   it("accepts http only with allowInsecureHttp, https always", () => {

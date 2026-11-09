@@ -13,6 +13,33 @@ const pkgDir = resolve(import.meta.dirname, "..");
 const srcDir = join(pkgDir, "src");
 const probeDir = join(pkgDir, "verification", "cf-lifecycle");
 
+/**
+ * Three-database separation (docs/GUARDRAILS.md G2). The website (A) holds only IDR_RESOLVER_URL,
+ * IDR_RESOLVER_TOKEN and IDR_WEBSITE_ID: nothing of the private Insights Supabase project (C) or of the resolver's
+ * own database and reporting side (B). The server dist talks to the resolver's website routes only (/v1/entrances,
+ * /v1/events) and legitimately names the Supabase domains it refuses as a resolverUrl (G3b), so the bare word is
+ * allowed there; everything else below is not.
+ */
+const FORBIDDEN_IN_SERVER_DIST: ReadonlyArray<string | RegExp> = [
+  "SUPABASE_",
+  "sb_secret_",
+  "sb_publishable_",
+  "service_role",
+  "/v1/reporting",
+  "REPORTING_AUTH_TOKEN",
+  "IDR_REPORTING_TOKEN",
+  "DATABASE_URL",
+  /(?<![A-Za-z0-9])[a-z0-9]{20}\.supabase\.(?:co|in)/i,
+  /[a-z0-9-]\.pooler\.supabase\.com/i,
+];
+/** The browser bundle must not even know that Supabase, the reporting side or a database exists. */
+const FORBIDDEN_BACKEND_IN_CLIENT: ReadonlyArray<string | RegExp> = [...FORBIDDEN_IN_SERVER_DIST, /supabase/i];
+
+/** The needles found in `text`, as printable strings (empty = clean). */
+function forbiddenHits(text: string, needles: ReadonlyArray<string | RegExp>): string[] {
+  return needles.filter((n) => (typeof n === "string" ? text.includes(n) : n.test(text))).map(String);
+}
+
 function walk(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
@@ -26,9 +53,9 @@ function walk(dir: string): string[] {
 describe("package hygiene", () => {
   const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as Record<string, unknown>;
 
-  it("is the unpublished 0.1.0-dev.0 package with zero runtime dependencies", () => {
+  it("is the unpublished 0.1.0-dev.1 package with zero runtime dependencies", () => {
     expect(pkg["name"]).toBe("@salescrusader/idr-tanstack");
-    expect(pkg["version"]).toBe("0.1.0-dev.0");
+    expect(pkg["version"]).toBe("0.1.0-dev.1");
     expect(pkg["private"]).toBe(true);
     expect(pkg["dependencies"]).toBeUndefined();
     expect(pkg["peerDependencies"]).toBeUndefined();
@@ -77,9 +104,41 @@ describe("package hygiene", () => {
       expect(js).not.toMatch(/from\s+["']node:/);
       expect(js).not.toMatch(/\bprocess\b/);
       expect(js).not.toContain(TEST_TOKEN);
+      // G2: no Supabase key, project host, reporting route or database variable anywhere in the dist (.js and .d.ts).
+      const all = files.map((f) => readFileSync(f, "utf8")).join("\n");
+      expect(forbiddenHits(all, FORBIDDEN_IN_SERVER_DIST)).toEqual([]);
+      // Sanity: the scan is meaningful, the dist is the server adapter that reports entrances to the resolver.
+      expect(js).toContain("/v1/entrances");
     } finally {
       rmSync(out, { recursive: true, force: true });
     }
+  });
+});
+
+describe("G2 artifact scan: the detector itself (negative and positive controls)", () => {
+  const clean = 'export const endpoint = `${base}/v1/entrances`; const refused = ["supabase.co", "supabase.in", "supabase.com"];';
+  it("a clean server-side text has no hits; the refused-domain list is allowed in the server dist only", () => {
+    expect(forbiddenHits(clean, FORBIDDEN_IN_SERVER_DIST)).toEqual([]);
+    expect(forbiddenHits(clean, FORBIDDEN_BACKEND_IN_CLIENT)).toEqual(["/supabase/i"]);
+    expect(forbiddenHits("export function initCollector() {}", FORBIDDEN_BACKEND_IN_CLIENT)).toEqual([]);
+  });
+
+  // Synthetic values, assembled at runtime so this file passes the public-safety gate.
+  const planted: Array<[string, string]> = [
+    ["a SUPABASE_* variable name", "const u = env.SUPABASE_URL;"],
+    ["a secret key prefix", `const k = "${["sb", "secret", "x"].join("_")}";`],
+    ["a publishable key prefix", `const k = "${["sb", "publishable", "x"].join("_")}";`],
+    ["the service_role claim", 'const claims = { role: "service_role" };'],
+    ["the reporting route", 'fetch(`${base}/v1/reporting/observations`);'],
+    ["the reporting token variable", "const t = env.REPORTING_AUTH_TOKEN;"],
+    ["the Edge reporting token variable", "const t = env.IDR_REPORTING_TOKEN;"],
+    ["the database variable", "const d = env.DATABASE_URL;"],
+    ["a concrete project host", `const h = "https://${["qwertyuiop", "asdfghjklz"].join("")}.supabase.co";`],
+    ["a concrete pooler host", `const h = "${["aws-0-eu-west-2", "pooler", "supabase", "com"].join(".")}";`],
+  ];
+  it.each(planted)("detects %s planted in a server dist and in a client bundle", (_name, text) => {
+    expect(forbiddenHits(`${clean}\n${text}`, FORBIDDEN_IN_SERVER_DIST).length).toBeGreaterThan(0);
+    expect(forbiddenHits(text, FORBIDDEN_BACKEND_IN_CLIENT).length).toBeGreaterThan(0);
   });
 });
 
@@ -106,6 +165,8 @@ describe("bundle safety (TanStack Start probe build)", () => {
     expect(clientFiles.length).toBeGreaterThan(0);
     const clientText = clientFiles.map((f) => readFileSync(f, "utf8")).join("\n");
     for (const needle of FORBIDDEN_IN_CLIENT) expect(clientText, `client assets contain ${needle}`).not.toContain(needle);
+    // G2: nothing of the private Supabase project, the reporting side or a database in the browser assets.
+    expect(forbiddenHits(clientText, FORBIDDEN_BACKEND_IN_CLIENT)).toEqual([]);
 
     // Sanity: the scan is meaningful, the server bundle does hold the package and the token.
     const serverText = walk(serverDir).filter((f) => /\.(?:m?js|json)$/.test(f)).map((f) => readFileSync(f, "utf8")).join("\n");
@@ -114,6 +175,8 @@ describe("bundle safety (TanStack Start probe build)", () => {
     expect(serverText).toContain("event.v1");
     expect(serverText).toContain("/v1/events");
     expect(serverText).toContain("createCollectorRoute must only run on the server");
+    // G2: the website's server bundle holds no Supabase key, project host, reporting route or database variable.
+    expect(forbiddenHits(serverText, FORBIDDEN_IN_SERVER_DIST)).toEqual([]);
     // ...and the client half is really there (the collector is bundled into the client).
     expect(clientText).toContain("data-idr-event");
     expect(clientText).toContain("idr-collector:");

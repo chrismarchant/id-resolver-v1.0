@@ -20,6 +20,7 @@
  * TCP proxy, and compare it with a second reading (see RUNTIME.md).
  */
 import { pathToFileURL } from "node:url";
+import { assertNoSupabaseConfiguration, ConfigError } from "../config/index.js";
 import { DbTlsError, fetchServerCertificate, parseTlsPins } from "../db/tls.js";
 
 export interface FingerprintReport {
@@ -46,6 +47,9 @@ export function targetOf(databaseUrl: string): { host: string; port: number } {
 }
 
 export async function fingerprintReport(env: NodeJS.ProcessEnv): Promise<FingerprintReport> {
+  // Three-database separation (docs/GUARDRAILS.md G3a): the service's own check (ConfigError, fixed messages), so
+  // no SUPABASE_* variable, and never even a TLS handshake with a Supabase host.
+  assertNoSupabaseConfiguration(env);
   const databaseUrl = env["DATABASE_URL"];
   if (!databaseUrl) throw new Error("DATABASE_URL is required");
   const pins = env["DATABASE_TLS_PIN_SHA256"] !== undefined ? parseTlsPins(env["DATABASE_TLS_PIN_SHA256"]) : undefined;
@@ -69,7 +73,7 @@ async function main(): Promise<void> {
     const detail =
       err instanceof DbTlsError
         ? err.code
-        : err instanceof Error && /^(DATABASE_URL|DATABASE_TLS_PIN_SHA256)\b/.test(err.message)
+        : err instanceof ConfigError || (err instanceof Error && /^(DATABASE_URL|DATABASE_TLS_PIN_SHA256)\b/.test(err.message))
           ? err.message
           : "failed";
     console.error(`ops:db-tls-fingerprint: ${detail}`);

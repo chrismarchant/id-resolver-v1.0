@@ -28,10 +28,10 @@ const REPO = resolve(PKG, "../..");
 const WORK = process.env["E2E_WORK"] ?? `${process.env["TMPDIR"] ?? tmpdir()}/idr-supabase-e2e`;
 const INST = "idr-e2e";
 const DAY_MS = 86_400_000;
-const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "observations", "pages", "reconcile", "status", "tombstones"];
+const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "ignored_erased", "observations", "page_keys_cleared", "pages", "reconcile", "status", "tombstones"];
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
 /** idr_schema_version() of sql/0001_idr_projection.sql (PROJECTION_SCHEMA_VERSION in src/core/types.ts). */
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 /** No role but the owner holds EXECUTE: the trigger function (CHR-66 G4-L4) and the operator's resync (G5R1-L3). */
 const OWNER_ONLY_FUNCTIONS = ["idr_sync_gaps_guard", "idr_begin_resync"];
 /** Expected grantees of an idr_* function's ACL. */

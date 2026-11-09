@@ -4,7 +4,7 @@
  * validation reuses the service's ConfigSchema so semantics are identical.
  * Errors name variables only, never values.
  */
-import { ConfigSchema, loadDatabaseTls } from "../config/index.js";
+import { assertNoSupabaseConfiguration, ConfigSchema, loadDatabaseTls } from "../config/index.js";
 import type { DbTlsConfig } from "../db/tls.js";
 
 const OpsSchema = ConfigSchema.pick({
@@ -27,6 +27,13 @@ const RetentionSchema = ConfigSchema.pick({ OBSERVATION_RETENTION_DAYS: true });
 export type OpsConfig = ReturnType<typeof OpsSchema.parse> & { DATABASE_TLS: DbTlsConfig };
 
 export function loadOpsConfig(env: NodeJS.ProcessEnv = process.env): OpsConfig {
+  // Three-database separation (docs/GUARDRAILS.md G3a): the same refusal as the service and migrate.
+  try {
+    assertNoSupabaseConfiguration(env);
+  } catch (e) {
+    // ConfigError messages name variables only; rethrown as a plain Error so failOps prints them.
+    throw new Error((e as Error).message);
+  }
   const parsed = OpsSchema.safeParse(env);
   if (!parsed.success) {
     const names = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`);

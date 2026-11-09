@@ -40,11 +40,28 @@ function checkUrl(name: string, raw: string | undefined, allowInsecure: boolean,
   return raw.replace(/\/+$/, "");
 }
 
+/**
+ * Three-database separation (docs/GUARDRAILS.md G3c): IDR_BASE_URL is the ID
+ * Resolver service (Railway), never a Supabase project. A Supabase host there
+ * would send the reporting token to a Supabase project (the website's own, or
+ * this one) instead of the resolver. SUPABASE_URL is this project's own URL and
+ * is not affected.
+ */
+const SUPABASE_DOMAINS = ["supabase.co", "supabase.in", "supabase.com"] as const;
+
+export function isSupabaseHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.+$/, "");
+  return SUPABASE_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
+}
+
 /** Validates environment configuration. Problems name variables, never values. */
 export function loadConfig(env: Env): ConfigResult {
   const problems: string[] = [];
   const allowInsecure = env["IDR_ALLOW_INSECURE_HTTP"] === "true";
   const baseUrl = checkUrl("IDR_BASE_URL", env["IDR_BASE_URL"], allowInsecure, problems);
+  if (baseUrl !== "" && isSupabaseHost(new URL(baseUrl).hostname)) {
+    problems.push("IDR_BASE_URL must be the ID Resolver service, never a Supabase host");
+  }
   const supabaseUrl = checkUrl("SUPABASE_URL", env["SUPABASE_URL"], allowInsecure, problems);
 
   const need = (name: string, minLen: number): string => {

@@ -248,9 +248,13 @@ UTC days inside the retained window.
 * Limit: these are triggers. A table owner or superuser can still disable
   them, for example with `session_replication_role = replica`. They protect
   against application defects and unprivileged changes, not against a
-  compromised owner credential. Running the service under a non-owner
-  database role, distinct from the migration role, is a production hardening
-  step tracked for Gate 6.
+  compromised owner credential. Since Gate 5 (migration 0009 and
+  `apps/resolver/src/db/runtime-role.ts`) the service runs under a separate,
+  non-owner runtime role (`DATABASE_RUNTIME_ROLE`), distinct from the
+  migration owner, and `NODE_ENV=production` refuses to run as the owner
+  unless `ALLOW_OWNER_DATABASE_ROLE=true` (development deployment only); see
+  `apps/resolver/RUNTIME.md`, "Database roles". The owner credential is used
+  only by the migrate step and the ops commands.
 
 ### Bounds and deployment assumptions
 

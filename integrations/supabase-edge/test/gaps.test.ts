@@ -461,7 +461,7 @@ describe("R2-8 with an ordinary owner: the script applied by a role that is neit
 
   it("through the definer functions only: the engine's calls as service_role, the resync as the owner; apply, record, resync, a partial replay (no resolution), the final page, resolve", async () => {
     const item = { type: "observation", observation_id: "1", company_id: 7, domain: "example.com", organisation_name: null, observed_at: "2026-11-02T09:00:00.000Z", method: "cache", page_key: "/", acquisition: null, entrance_contract: null };
-    expect((await svc<{ r: unknown }>("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null, true) as r", [INSTALLATION, JSON.stringify([item])])).rows[0]!.r).toEqual({ applied: true, observations: 1, tombstones: 0 });
+    expect((await svc<{ r: unknown }>("select public.idr_apply_feed_page($1, null, 'c2', $2::jsonb, null, true) as r", [INSTALLATION, JSON.stringify([item])])).rows[0]!.r).toEqual({ applied: true, observations: 1, tombstones: 0, ignored_erased: 0, page_keys_cleared: 0 });
     expect(await recordGap()).toMatchObject({ recorded: true, new: true });
     await expect(svc("select public.idr_begin_resync($1)", [INSTALLATION])).rejects.toThrow(/permission denied/);
     await asRole(pool, OWNER, (c) => c.query("select public.idr_begin_resync($1)", [INSTALLATION]));

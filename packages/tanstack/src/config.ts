@@ -25,7 +25,10 @@ export interface DeliveryResult {
  * and how to build `page_key`.
  */
 export interface ResolverDeliveryOptions {
-  /** Base URL of the resolver, e.g. `https://resolver.example.com`. `/v1/entrances` (or `/v1/events`) is appended. https required. */
+  /**
+   * Base URL of the resolver, e.g. `https://resolver.example.com`. `/v1/entrances` (or `/v1/events`) is appended.
+   * https required. A host under a Supabase domain is refused (docs/GUARDRAILS.md G3b).
+   */
   resolverUrl: string;
   /** Resolver bearer token (server-side secret, at least 32 characters). */
   token: string;
@@ -117,6 +120,19 @@ export interface ResolvedConfig extends ResolvedDelivery {
 const WEBSITE_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const TOKEN = /^[\x21-\x7e]{32,512}$/;
 
+/**
+ * Three-database separation (docs/GUARDRAILS.md G3b): the website server reaches only the ID Resolver service. A
+ * resolverUrl on a Supabase-operated domain (a project, its database or its pooler) is a misconfiguration that could
+ * send the website's resolver token to a Supabase project, so it is refused like any other invalid option.
+ */
+const NOT_RESOLVER_DOMAINS = ["supabase.co", "supabase.in", "supabase.com"] as const;
+
+/** True for a Supabase-operated host name (WHATWG-normalised, so lower case; a trailing dot is ignored). */
+function isSupabaseHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/\.+$/, "");
+  return NOT_RESOLVER_DOMAINS.some((d) => h === d || h.endsWith(`.${d}`));
+}
+
 export function intIn(name: string, v: number | undefined, min: number, max: number, dflt: number): number {
   if (v === undefined) return dflt;
   if (typeof v !== "number" || !Number.isInteger(v) || v < min || v > max) throw new Error(`idr-tanstack: ${name} must be an integer between ${min} and ${max}`);
@@ -146,6 +162,9 @@ export function resolveDelivery(options: ResolverDeliveryOptions): ResolvedDeliv
   }
   if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") {
     throw new Error("idr-tanstack: resolverUrl must not contain credentials, a query string or a fragment");
+  }
+  if (isSupabaseHost(url.hostname)) {
+    throw new Error("idr-tanstack: resolverUrl must be the ID Resolver service, never a Supabase host");
   }
   const timeoutMs = intIn("timeoutMs", options.timeoutMs, 250, 10_000, 5_000);
   const blockingBudgetMs = intIn("blockingBudgetMs", options.blockingBudgetMs, 50, 1_000, 250);

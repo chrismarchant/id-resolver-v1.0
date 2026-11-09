@@ -79,6 +79,61 @@ describe("privacy static scan of the shipped bundle", () => {
   });
 });
 
+describe("three-database separation: nothing of the backends in the browser artifacts (docs/GUARDRAILS.md G2)", () => {
+  // The collector runs in the visitor's browser and posts only to the site's own first-party route. It must not
+  // carry anything of the private Insights Supabase project, the resolver's reporting side or a database, nor the
+  // resolver's own routes (the website's server forwards events; the browser never talks to the resolver).
+  const FORBIDDEN: ReadonlyArray<string | RegExp> = [
+    /supabase/i,
+    "sb_secret_",
+    "sb_publishable_",
+    "service_role",
+    "/v1/reporting",
+    "/v1/entrances",
+    "/v1/events",
+    "REPORTING_AUTH_TOKEN",
+    "IDR_REPORTING_TOKEN",
+    "IDR_RESOLVER_TOKEN",
+    "DATABASE_URL",
+  ];
+  const hits = (text: string) => FORBIDDEN.filter((n) => (typeof n === "string" ? text.includes(n) : n.test(text))).map(String);
+
+  it("the minified bundle holds none of them", () => {
+    expect(hits(code)).toEqual([]);
+  });
+
+  it("the tsc output (.js and .d.ts) holds none of them", () => {
+    const tsc = createRequire(import.meta.url).resolve("typescript/bin/tsc");
+    const out = mkdtempSync(join(tmpdir(), "idr-collector-g2-"));
+    try {
+      execFileSync(process.execPath, [tsc, "-p", join(pkgDir, "tsconfig.build.json"), "--outDir", out], { cwd: pkgDir, stdio: "pipe" });
+      const text = readdirSync(out).map((f) => readFileSync(join(out, f), "utf8")).join("\n");
+      expect(text).toContain("initCollector"); // the scan is meaningful
+      expect(hits(text)).toEqual([]);
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  // Negative controls: each needle planted into the real bundle is detected (synthetic values, assembled at runtime).
+  it.each([
+    ["a Supabase project URL", `fetch("https://${["example-project", "supabase", "co"].join(".")}/rest/v1/x")`],
+    ["a Supabase client import", 'import{createClient}from"@supabase/supabase-js"'],
+    ["a secret key prefix", ["sb", "secret", "x"].join("_")],
+    ["a publishable key prefix", ["sb", "publishable", "x"].join("_")],
+    ["the service_role claim", '{role:"service_role"}'],
+    ["the reporting route", 'fetch("/v1/reporting/observations")'],
+    ["the resolver entrance route", 'fetch("/v1/entrances")'],
+    ["the resolver events route", 'fetch("/v1/events")'],
+    ["the reporting token variable", "REPORTING_AUTH_TOKEN"],
+    ["the Edge reporting token variable", "IDR_REPORTING_TOKEN"],
+    ["the resolver token variable", "IDR_RESOLVER_TOKEN"],
+    ["the database variable", "DATABASE_URL"],
+  ])("detects %s planted into the bundle", (_name, planted) => {
+    expect(hits(`${code}\n${planted}`).length).toBeGreaterThan(0);
+  });
+});
+
 describe("package hygiene", () => {
   const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as Record<string, unknown>;
 

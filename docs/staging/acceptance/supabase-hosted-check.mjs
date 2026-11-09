@@ -39,7 +39,7 @@ const env = process.env;
 const CHECKS = ["seed", "auth", "sync", "concurrency", "rls", "catalog", "cron", "oracle"];
 const SEED_IPS = ["203.0.113.10", "203.0.113.11", "203.0.113.12", "2001:db8::10"]; // the mock provider's qualified documentation addresses
 const TABLES = ["idr_companies", "idr_observations", "idr_tombstones", "idr_sync_state", "idr_sync_gaps"];
-const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "observations", "pages", "reconcile", "status", "tombstones"];
+const SUMMARY_KEYS = ["gap_new", "gap_recorded", "gaps_resolved", "ignored_erased", "observations", "page_keys_cleared", "pages", "reconcile", "status", "tombstones"];
 const RPC_ARGS = {
   idr_get_sync_state: { p_installation_id: "x" },
   idr_begin_resync: { p_installation_id: "x" },
