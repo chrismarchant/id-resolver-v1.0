@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { runJob, LEASE_COMMIT_BUDGET_MS, type PipelineDeps } from "../../src/resolution/pipeline.js";
 import type { CacheKey, UsageScope } from "../../src/contracts/db.js";
-import { usagePeriodKey } from "../../src/contracts/db.js";
+import { OUTCOME_COUNTERS, USAGE_COUNTERS, usagePeriodKey } from "../../src/contracts/db.js";
+import { RESOLUTION_STATUSES } from "../../src/contracts/api.js";
 import type { PipelineConfig, ResolutionJob } from "../../src/contracts/runtime.js";
 import type { ProviderAdapter, ProviderOutcome } from "../../src/contracts/provider.js";
 import { canonicaliseIp } from "../../src/ip/canonical.js";
@@ -661,7 +662,8 @@ describe("runJob: company activity", () => {
     expect(activityLogs(t)).toEqual([expect.objectContaining({ event: "activity_write_failed", reason: "deadline_exceeded" })]);
     // At answer time nothing is stored; the write is handed to the runner, not cancelled ...
     expect(t.repos.activity.observations).toHaveLength(0);
-    expect(deferred).toHaveLength(1);
+    // The activity write and the job's outcome counter (activity counters are never awaited).
+    expect(deferred).toHaveLength(2);
     // ... and commits after the answer: recorded=false meant "not confirmed", not "not stored".
     await Promise.all(deferred);
     expect(t.repos.activity.observations).toHaveLength(1);
@@ -682,7 +684,8 @@ describe("runJob: company activity", () => {
     // resolver_requests and cache_hits both ran past their 250 ms budget: logged, tracked, still running.
     const timeouts = t.logger.entries.filter((l) => l["event"] === "db_error" && l["category"] === "usage_counter_timeout");
     expect(timeouts).toHaveLength(2);
-    expect(deferred).toHaveLength(2);
+    // Those two, plus the activity counters, which are never awaited: the outcome, the company visit and its first visit.
+    expect(deferred).toHaveLength(5);
     expect((await t.snapshot()).cache_hits).toBe(0); // not yet
     await Promise.all(deferred);
     expect((await t.snapshot()).cache_hits).toBe(1); // the tracked operation completed later
@@ -808,8 +811,79 @@ describe("runJob: deadline abort (in-process runner, CHR-70)", () => {
     const deferred: Promise<void>[] = [];
     const o = await runJob({ ...t.deps, onDeferred: (op) => deferred.push(op) }, t.config, job(IP, 500, ref(3)));
     expect(o).toMatchObject({ status: "qualified", activity: { recorded: false } });
-    expect(deferred).toHaveLength(1);
+    // The background activity write and the job's outcome counter.
+    expect(deferred).toHaveLength(2);
     await Promise.all(deferred);
     expect(t.repos.activity.observations).toHaveLength(1);
+  });
+});
+
+describe("runJob: activity counters (GET /v1/reporting/activity)", () => {
+  const obsRef = (n: number) => `obsref-${String(n).padStart(16, "0")}`;
+  it("counts every job once by its final status, so the outcomes add up to resolver_requests, and counts company visits", async () => {
+    const t = setup({
+      "203.0.113.101": { outcome: resolved("company.example", "COM") },
+      "203.0.113.103": { outcome: resolved("isp.example", "ISP") },
+    });
+    const deferred: Promise<void>[] = [];
+    const deps = { ...t.deps, onDeferred: (p: Promise<void>) => deferred.push(p) };
+    const statuses = [];
+    statuses.push((await runJob(deps, t.config, job("203.0.113.101", 4_000, obsRef(101)))).status);
+    statuses.push((await runJob(deps, t.config, job("203.0.113.101", 4_000, obsRef(102)))).status);
+    statuses.push((await runJob(deps, t.config, job("203.0.113.102", 4_000, obsRef(103)))).status);
+    statuses.push((await runJob(deps, t.config, job("203.0.113.103", 4_000, obsRef(104)))).status);
+    statuses.push((await runJob(deps, t.config, job("10.0.0.1", 4_000, obsRef(105)))).status);
+    await t.repos.controls.setEnrichmentEnabled(t.config.installation_id, false, "test");
+    statuses.push((await runJob(deps, t.config, job("203.0.113.106", 4_000, obsRef(106)))).status);
+    expect(statuses).toEqual(["qualified", "qualified", "no_match", "excluded", "ineligible", "disabled"]);
+    await Promise.all(deferred);
+
+    const s = await t.snapshot();
+    expect(s).toMatchObject({
+      resolver_requests: 6,
+      cache_hits: 1,
+      outcome_qualified: 2,
+      outcome_no_match: 1,
+      outcome_excluded: 1,
+      outcome_ineligible: 1,
+      outcome_disabled: 1,
+      outcome_unknown: 0,
+      outcome_pending: 0,
+      outcome_uncertain: 0,
+      outcome_unavailable: 0,
+      company_visits: 2,
+      company_first_visits: 1,
+    });
+    const outcomes = Object.values(OUTCOME_COUNTERS).reduce((sum, c) => sum + s[c], 0);
+    expect(outcomes).toBe(s.resolver_requests);
+  });
+
+  it("maps every resolution status to its own outcome counter", () => {
+    expect(Object.keys(OUTCOME_COUNTERS).sort()).toEqual([...RESOLUTION_STATUSES].sort());
+    expect(new Set(Object.values(OUTCOME_COUNTERS)).size).toBe(RESOLUTION_STATUSES.length);
+    for (const c of Object.values(OUTCOME_COUNTERS)) expect(USAGE_COUNTERS).toContain(c);
+  });
+
+  it("a replayed entrance (same reference) is not counted as another company visit", async () => {
+    const t = setup({ "203.0.113.111": { outcome: resolved("company.example", "COM") } });
+    const deferred: Promise<void>[] = [];
+    const deps = { ...t.deps, onDeferred: (p: Promise<void>) => deferred.push(p) };
+    await runJob(deps, t.config, job("203.0.113.111", 4_000, obsRef(111)));
+    await runJob(deps, t.config, job("203.0.113.111", 4_000, obsRef(111)));
+    await Promise.all(deferred);
+    const s = await t.snapshot();
+    expect(s.outcome_qualified).toBe(2);
+    expect(s.company_visits).toBe(1);
+    expect(s.company_first_visits).toBe(1);
+  });
+
+  it("a failing activity counter never changes the answer", async () => {
+    const t = setup();
+    t.repos.usage.failures.increment = true;
+    const deferred: Promise<void>[] = [];
+    const o = await runJob({ ...t.deps, onDeferred: (p) => deferred.push(p) }, t.config, job("203.0.113.121"));
+    await Promise.all(deferred);
+    expect(o.status).toBe("no_match");
+    expect(t.logger.entries.some((l) => l["event"] === "db_error" && l["category"] === "usage_activity")).toBe(true);
   });
 });

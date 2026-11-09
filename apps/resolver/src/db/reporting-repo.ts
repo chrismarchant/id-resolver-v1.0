@@ -6,15 +6,17 @@
  * Nothing here can return an IP, a fingerprint or a provider payload: those
  * tables are never joined.
  */
-import type {
-  ActivitySummary,
-  CompaniesCursor,
-  CompanyActivitySummary,
-  ObservationItem,
-  ObservationScope,
-  ObservationsCursor,
-  Page,
-  ReportingRepository,
+import {
+  USAGE_COUNTERS,
+  type ActivitySummary,
+  type CompaniesCursor,
+  type CompanyActivitySummary,
+  type ObservationItem,
+  type ObservationScope,
+  type ObservationsCursor,
+  type Page,
+  type ReportingRepository,
+  type UsagePeriodActivity,
 } from "../contracts/db.js";
 import {
   compareFeedPositions,
@@ -31,6 +33,24 @@ import { DbError, guarded, type Pool } from "./pool.js";
 import { queryFeedWatermark } from "./retention.js";
 
 export const MAX_PAGE_LIMIT = 100;
+
+/** One usage row per period: at most 366 daily rows, or a year and a bit of monthly ones. */
+export const MAX_ACTIVITY_PERIODS = 400;
+const PERIOD_KEY_PATTERN = /^\d{4}-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?$/;
+
+/**
+ * Usage rows of the scope in a key range. The key length pins the period
+ * granularity, so daily and monthly rows are never mixed after a change of
+ * USAGE_PERIOD. Counters only; usage_periods holds no identifier.
+ */
+export const ACTIVITY_SQL = `
+SELECT period_key, ${USAGE_COUNTERS.join(", ")}, provider_charge_slots
+FROM usage_periods
+WHERE installation_id = $1::text AND website_id = $2::text
+  AND length(period_key) = length($3::text)
+  AND period_key >= $3::text AND period_key <= $4::text
+ORDER BY period_key
+LIMIT ${MAX_ACTIVITY_PERIODS}`;
 
 /** Stable enumeration: immutable company id ascending. */
 const LIST_COMPANIES_BY_ID_SQL = `
@@ -346,6 +366,21 @@ export function createReportingRepository(pool: Pool, logger?: Logger): Reportin
         const observedCompanies = Number(r?.observed_companies ?? 0);
         const newlyObservedCompanies = Number(r?.newly_observed_companies ?? 0);
         return { observations, observedCompanies, newlyObservedCompanies, previouslyObservedCompanies: observedCompanies - newlyObservedCompanies };
+      });
+    },
+
+    async activity(scope, keys): Promise<UsagePeriodActivity[]> {
+      const { fromKey, toKey } = keys;
+      if (!PERIOD_KEY_PATTERN.test(fromKey) || !PERIOD_KEY_PATTERN.test(toKey) || fromKey.length !== toKey.length || fromKey > toKey) {
+        throw new DbError("INVALID_RANGE");
+      }
+      return guarded(logger, async () => {
+        const res = await pool.query<Record<string, string>>(ACTIVITY_SQL, [scope.installationId, scope.websiteId, fromKey, toKey]);
+        return res.rows.map((row) => {
+          const item = { periodKey: String(row["period_key"]), providerChargeSlots: Number(row["provider_charge_slots"]) } as UsagePeriodActivity;
+          for (const c of USAGE_COUNTERS) item[c] = Number(row[c]);
+          return item;
+        });
       });
     },
 
