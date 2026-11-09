@@ -4,7 +4,7 @@
  * fingerprint. Implementations must be safe under concurrent callers in
  * separate processes.
  */
-import type { Acquisition } from "./api.js";
+import type { Acquisition, ResolutionStatus } from "./api.js";
 import type { FeedPage, FeedPosition } from "./reporting-feed.js";
 
 export const CACHE_STATUSES = [
@@ -111,9 +111,33 @@ export const USAGE_COUNTERS = [
   "unknown_results",
   "failures",
   "uncertain_outcomes",
+  "outcome_qualified",
+  "outcome_no_match",
+  "outcome_excluded",
+  "outcome_unknown",
+  "outcome_pending",
+  "outcome_ineligible",
+  "outcome_disabled",
+  "outcome_uncertain",
+  "outcome_unavailable",
+  "company_visits",
+  "company_first_visits",
 ] as const;
 
 export type UsageCounter = (typeof USAGE_COUNTERS)[number];
+
+/** The counter each job's final status is counted under (once per job). */
+export const OUTCOME_COUNTERS: Readonly<Record<ResolutionStatus, UsageCounter>> = Object.freeze({
+  qualified: "outcome_qualified",
+  no_match: "outcome_no_match",
+  excluded: "outcome_excluded",
+  unknown: "outcome_unknown",
+  pending: "outcome_pending",
+  ineligible: "outcome_ineligible",
+  disabled: "outcome_disabled",
+  uncertain: "outcome_uncertain",
+  unavailable: "outcome_unavailable",
+});
 
 export interface UsageScope {
   installationId: string;
@@ -272,6 +296,11 @@ export interface ActivitySummary {
   previouslyObservedCompanies: number;
 }
 
+export interface UsagePeriodActivity extends Record<UsageCounter, number> {
+  periodKey: string;
+  providerChargeSlots: number;
+}
+
 export interface ReportingRepository {
   listCompanies(scope: ObservationScope, page: { limit: number; cursor: CompaniesCursor | null; order: CompanyOrder }): Promise<Page<CompanyActivitySummary, CompaniesCursor>>;
   getCompany(scope: ObservationScope, companyId: number): Promise<CompanyActivitySummary | null>;
@@ -282,6 +311,12 @@ export interface ReportingRepository {
   ): Promise<Page<ObservationItem, ObservationsCursor>>;
   /** Half-open range [from, to). */
   summary(scope: ObservationScope, range: { from: Date; to: Date }): Promise<ActivitySummary>;
+  /**
+   * Usage periods whose key lies in [fromKey, toKey] (inclusive), with the
+   * key length of the configured period ("YYYY-MM-DD" or "YYYY-MM"), in key
+   * order. Counts only.
+   */
+  activity(scope: ObservationScope, keys: { fromKey: string; toKey: string }): Promise<UsagePeriodActivity[]>;
   /**
    * reporting-feed.v1: up to `limit` (1..FEED_MAX_LIMIT) observations and
    * erasure tombstones strictly after `after` (null = the start of the

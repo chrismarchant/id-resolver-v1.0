@@ -80,4 +80,5 @@ const order = z.enum(["id", "recent"]).default("id");
 export const CompaniesQuerySchema = z.object({ limit, cursor, order }).strict();
 export const ObservationsQuerySchema = z.object({ limit, cursor }).strict();
 export const SummaryQuerySchema = z.object({ from: date, to: date }).strict();
+export const ActivityQuerySchema = SummaryQuerySchema;
 export const CompanyIdParamSchema = z.object({ id: z.string().regex(/^[1-9]\d{0,15}$/) }).strict();
