@@ -13,7 +13,7 @@
 # sha256 of the index body served for node:22-bookworm-slim.
 
 # ---- Stage 1: build ---------------------------------------------------------
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS build
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS build
 WORKDIR /app
 COPY . .
 RUN npm ci --workspace @idr/resolver --include-workspace-root=false --ignore-scripts
@@ -25,7 +25,7 @@ RUN mkdir -p /manifests && cp package.json package-lock.json /manifests/ \
     | xargs -r -I{} cp --parents {} /manifests/
 
 # ---- Stage 2: runtime -------------------------------------------------------
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da AS runtime
+FROM node:26-bookworm-slim@sha256:add5c17c14752c54d2f3d519ec46a3815684d41c33f198bcb09fb998f7dcbf68 AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
     NODE_OPTIONS=--max-old-space-size=256
