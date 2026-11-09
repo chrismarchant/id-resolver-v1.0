@@ -23,6 +23,7 @@ import { checkConnectedRolePrivileges, RuntimeRoleError } from "./db/runtime-rol
 import { assertSchemaCurrent, PendingMigrationsError } from "./db/migrate.js";
 import { createFeedRetention } from "./db/retention.js";
 import { createProvider } from "./provider/index.js";
+import { HostingRangesError, loadHostingRanges } from "./ip/hosting-ranges.js";
 import { buildServer } from "./api/server.js";
 import { EVENT_WRITES_MAX_IN_FLIGHT } from "./api/events.js";
 import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner.js";
@@ -35,6 +36,8 @@ async function main(): Promise<void> {
   scrubSecretEnv();
   const logger = createLogger({ level: config.LOG_LEVEL, component: "resolver" });
   const guards = installProcessGuards({ logger });
+  // Read once, before anything connects: a damaged ranges file fails the start (HostingRangesError).
+  const hostingRanges = config.HOSTING_RANGES_MODE === "off" ? undefined : loadHostingRanges();
   const safe = describeConfig(config);
   logger.info("config_loaded", {
     installation_id: String(safe["INSTALLATION_ID"]),
@@ -47,6 +50,8 @@ async function main(): Promise<void> {
     event_consent_mode: config.EVENT_CONSENT_MODE,
     tls_mode: config.DATABASE_SSL,
     db_role: config.DATABASE_RUNTIME_PASSWORD !== undefined ? "runtime" : "owner",
+    hosting_ranges_mode: config.HOSTING_RANGES_MODE,
+    ...(hostingRanges ? { hosting_ranges_date: hostingRanges.generatedAt } : {}),
   });
   // Dev-only overrides (names only): "active" relaxes a production control now, "inert" is set without effect.
   for (const o of configOverrides(config)) logger.warn("config_override", { variable: o.variable, outcome: o.state });
@@ -89,6 +94,7 @@ async function main(): Promise<void> {
       companies: db.companies,
       activity: db.activity,
       provider: createProvider(pipelineConfig.provider),
+      ...(hostingRanges ? { hostingRanges } : {}),
     },
     logger,
     capacity: config.MAX_CONCURRENT_JOBS,
@@ -162,6 +168,7 @@ async function main(): Promise<void> {
 /** Startup failure text: names variables, files or fixed codes, never a value, a host or a URL. */
 function startupFailureDetail(err: unknown): string {
   if (err instanceof ConfigError || err instanceof PendingMigrationsError) return err.message;
+  if (err instanceof HostingRangesError) return `${err.message} in data/hosting-ranges.json (HOSTING_RANGES_MODE is not off): regenerate it with scripts/update-hosting-ranges.mjs, or set HOSTING_RANGES_MODE=off`;
   if (err instanceof RuntimeRoleError) {
     const settings = err.reasons.includes("role_settings") ? "; role_settings are session defaults stored on the role (ALTER ROLE ... SET): the migrate step resets them, so redeploy" : "";
     return `the runtime database role is not least-privilege (${err.reasons.join(", ")}): check DATABASE_RUNTIME_ROLE; it must be the role the migrate step provisions, never the owner${settings}`;

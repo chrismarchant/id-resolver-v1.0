@@ -9,6 +9,7 @@ import { IDENTIFIER_PATTERN } from "../contracts/api.js";
 import { EVENT_CONSENT_MODES } from "../contracts/event.js";
 import { parseCaCert, parseTlsPins, SSL_MODES, type DbTlsConfig } from "../db/tls.js";
 import { DEFAULT_RUNTIME_ROLE, RUNTIME_PASSWORD_PATTERN, RUNTIME_ROLE_PATTERN } from "../db/runtime-role.js";
+import { HOSTING_RANGES_MODES } from "../ip/hosting-ranges.js";
 
 const intInRange = (min: number, max: number, def: number) =>
   z.coerce.number().int().min(min).max(max).default(def);
@@ -137,6 +138,12 @@ export const ConfigSchema = z.object({
   DENIED_DOMAINS: csv([]),
   /** RFC 5737/3849 documentation ranges are ineligible in production; tests enable them. */
   ALLOW_DOCUMENTATION_RANGES: boolFromString(false),
+  /**
+   * Published cloud and crawler ranges (data/hosting-ranges.json, RUNTIME.md "Hosting ranges").
+   * off (default): not loaded. shadow: a match is logged (hosting_range) and the lookup goes ahead.
+   * enforce: a match is answered excluded with no provider call.
+   */
+  HOSTING_RANGES_MODE: z.enum(HOSTING_RANGES_MODES).default("off"),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

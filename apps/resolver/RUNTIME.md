@@ -102,6 +102,56 @@ name variables, never values. See `.env.example` for every variable.
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
 
+## Hosting ranges
+
+Cloud providers and search crawlers publish the network ranges of their own
+servers. A visit from one of those ranges comes from a server, not from a
+person at a company, and when Enrich finds a domain for it, it is the host's
+(usage type `DCH` or `SES`) and is excluded after a charged lookup.
+`HOSTING_RANGES_MODE` checks the address against those lists first, right
+after the private-address check and before the cache, the charge slot and
+the provider call:
+
+| mode | effect |
+| --- | --- |
+| `off` (default) | the list is not loaded; nothing changes |
+| `shadow` | a match is logged and the lookup goes ahead: `job_finished` and `provider_outcome` carry `hosting_range` (the provider's name, e.g. `aws`) |
+| `enforce` | a match is answered `excluded` (reason `ip_hosting_range`) with no cache read, no reservation and no provider call |
+
+Every `provider_outcome` for a found domain also carries `usage_type`, the
+network type Enrich reported (`COM`, `ISP`, `DCH`... or `none`), whatever the
+mode. Neither field holds the address, the domain or the company name.
+
+**Reading shadow results.** In the Railway logs, filter
+`@event:provider_outcome`. Lookups with `hosting_range` set are the ones
+`enforce` would have skipped; `outcome: resolved` among them were charged.
+Their `usage_type` shows what Enrich made of them: `DCH`, `CDN` or `SES`
+confirms the match, while `COM` or another qualifying type would have been a
+company that `enforce` turns away. Switch to `enforce` only when the second
+group is empty or acceptable.
+
+**The list.** `data/hosting-ranges.json` is in the image; nothing is
+downloaded at run time. It holds, per provider: AWS (EC2), Google Cloud,
+Azure (`AzureCloud`), Oracle Cloud, DigitalOcean, Googlebot and Bingbot,
+each from the provider's own published list. Ranges are merged and kept to
+IPv4 /8-/28 and IPv6 /16-/64 (smaller pieces are dropped). The service checks
+the file at start-up whenever the mode is not `off` and refuses to start if
+it is damaged; `config_loaded` logs `hosting_ranges_mode` and
+`hosting_ranges_date`.
+
+**Refreshing it.** `node apps/resolver/scripts/update-hosting-ranges.mjs`
+(from the repository root) downloads the lists and rewrites the file only
+when a prefix changed. It stops without writing if a download fails or a
+provider would lose more than half its IPv4 coverage (`--accept-shrink`
+after checking the provider's announcement). The `hosting-ranges` workflow
+runs it every Monday and opens a pull request when something changed; a
+refresh reaches production only through review, merge and redeploy. A list a
+few weeks old just means some newer cloud ranges are looked up as before.
+
+The public-safety gate exempts exactly this file's single-prefix lines
+(`PUBLISHED_RANGE_FILES` in `scripts/check-public-safety.mjs`): the bounds
+mean no line can name a single address.
+
 ## Database TLS
 
 `DATABASE_SSL` governs **every** database connection: the service pool,

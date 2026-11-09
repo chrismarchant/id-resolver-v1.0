@@ -8,6 +8,7 @@
  * text, a raw provider payload or company identity beyond the internal
  * company id: only allowlisted statuses and reasons (owner decision D2).
  */
+import type { HostingRangesMode } from "../ip/hosting-ranges.js";
 import type { ResolutionSource, ResolutionStatus } from "./api.js";
 import type { ObservationContext } from "./db.js";
 
@@ -48,6 +49,8 @@ export interface PipelineConfig {
     denied_domains: string[];
     /** Treat RFC 5737/3849 documentation ranges as eligible (tests only; default false). */
     allow_documentation_ranges?: boolean;
+    /** Published cloud and crawler ranges: off (default), shadow (log only) or enforce (exclude without a lookup). */
+    hosting_ranges_mode?: HostingRangesMode;
   };
 }
 
@@ -111,6 +114,7 @@ export const OUTCOME_REASONS = [
   "provider_disabled",
   "ip_ineligible",
   "ip_invalid",
+  "ip_hosting_range",
   "deadline_exceeded",
   "database_error",
   "internal_error",

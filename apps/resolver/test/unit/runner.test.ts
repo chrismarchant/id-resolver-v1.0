@@ -263,6 +263,15 @@ describe("buildPipelineConfig", () => {
     expect(JSON.stringify(rc)).not.toContain(SECRETS.RESOLVER_AUTH_TOKEN);
   });
 
+  it("passes HOSTING_RANGES_MODE through, off by default", () => {
+    expect(buildPipelineConfig(makeConfig()).policy.hosting_ranges_mode).toBe("off");
+    expect(buildPipelineConfig(makeConfig({ HOSTING_RANGES_MODE: "shadow" })).policy.hosting_ranges_mode).toBe("shadow");
+  });
+
+  it("keeps an enforce-mode exclusion through the outcome allowlist", () => {
+    expect(sanitiseOutcome({ status: "excluded", source: "none", reason: "ip_hosting_range" })).toEqual({ status: "excluded", source: "none", reason: "ip_hosting_range" });
+  });
+
   it("uses PERIOD_RESOLVED_CAP when set and PERIOD_CALL_CAP otherwise", () => {
     expect(buildPipelineConfig(makeConfig({ PERIOD_CALL_CAP: "2000", PERIOD_RESOLVED_CAP: "50" })).policy).toMatchObject({
       period_call_cap: 2000,

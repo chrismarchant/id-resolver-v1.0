@@ -120,3 +120,6 @@ jobs:
           echo "$out"
           test $code -eq 1
           echo "$out" | grep -q "DATABASE_URL is required"
+      - name: The published cloud and crawler ranges ship in the image and load from dist
+        run: |
+          docker run --rm id-resolver:ci node -e 'import("./dist/ip/hosting-ranges.js").then((m) => { const r = m.loadHostingRanges(); if (r.prefixCount < 1000) process.exit(1); console.log("hosting ranges", r.generatedAt, r.prefixCount); })'

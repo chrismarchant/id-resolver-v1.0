@@ -34,6 +34,7 @@ COPY --from=build /manifests/ ./
 RUN npm ci --workspace @idr/resolver --include-workspace-root=false --omit=dev --ignore-scripts && npm cache clean --force
 COPY --from=build /app/apps/resolver/dist apps/resolver/dist
 COPY apps/resolver/migrations apps/resolver/migrations
+COPY apps/resolver/data apps/resolver/data
 COPY apps/resolver/scripts/entrypoint.sh apps/resolver/scripts/entrypoint.sh
 RUN chmod 0755 apps/resolver/scripts/entrypoint.sh
 WORKDIR /app/apps/resolver

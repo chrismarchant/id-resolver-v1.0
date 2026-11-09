@@ -80,6 +80,10 @@ export const LOG_FIELDS = [
   "variable",
   "tls_mode",
   "db_role",
+  "hosting_range",
+  "hosting_ranges_mode",
+  "hosting_ranges_date",
+  "usage_type",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];
