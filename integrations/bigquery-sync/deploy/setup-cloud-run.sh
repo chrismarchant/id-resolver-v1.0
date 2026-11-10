@@ -12,6 +12,7 @@ BQ_DATASET="${BQ_DATASET:-idr}"
 BQ_TABLE="${BQ_TABLE:-company_visits}"
 BQ_ACTIVITY_TABLE="${BQ_ACTIVITY_TABLE:-daily_activity}"
 BQ_BOT_VISITS_TABLE="${BQ_BOT_VISITS_TABLE:-bot_visits}"
+BQ_EVENTS_TABLE="${BQ_EVENTS_TABLE:-browser_events}"
 SCHEDULE="${SCHEDULE:-*/30 * * * *}"
 REPO_URL="${REPO_URL:-https://github.com/chrismarchant/id-resolver-v1.0.git}"
 
@@ -22,8 +23,8 @@ SECRET="idr-reporting-token"
 
 case "$IDR_REPORTING_URL" in https://*) ;; *) echo "IDR_REPORTING_URL must start with https://" >&2; exit 1 ;; esac
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "SOURCE_COMMIT must be a full 40-character commit hash" >&2; exit 1; }
-for name in "$BQ_DATASET" "$BQ_TABLE" "$BQ_ACTIVITY_TABLE" "$BQ_BOT_VISITS_TABLE"; do
-  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]{0,1023}$ ]] || { echo "BQ_DATASET, BQ_TABLE, BQ_ACTIVITY_TABLE and BQ_BOT_VISITS_TABLE must be BigQuery names (letters, digits, underscores)" >&2; exit 1; }
+for name in "$BQ_DATASET" "$BQ_TABLE" "$BQ_ACTIVITY_TABLE" "$BQ_BOT_VISITS_TABLE" "$BQ_EVENTS_TABLE"; do
+  [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]{0,1023}$ ]] || { echo "BQ_DATASET, BQ_TABLE, BQ_ACTIVITY_TABLE, BQ_BOT_VISITS_TABLE and BQ_EVENTS_TABLE must be BigQuery names (letters, digits, underscores)" >&2; exit 1; }
 done
 [[ "$BQ_LOCATION" =~ ^[A-Za-z0-9-]{2,40}$ ]] || { echo "BQ_LOCATION is not valid" >&2; exit 1; }
 
@@ -63,6 +64,12 @@ CREATE TABLE IF NOT EXISTS \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}\` (
   bot_category STRING NOT NULL, user_agent_family STRING NOT NULL, synced_at TIMESTAMP NOT NULL)
 PARTITION BY DATE(observed_at)
 CLUSTER BY bot_category, bot_name;
+-- Browser events from the site's own consent-gated collector: no identifier of any kind, never linked to companies.
+CREATE TABLE IF NOT EXISTS \`${PROJECT}.${BQ_DATASET}.${BQ_EVENTS_TABLE}\` (
+  occurred_at TIMESTAMP NOT NULL, page_key STRING NOT NULL, event_type STRING NOT NULL,
+  event_name STRING NOT NULL, consent STRING NOT NULL, synced_at TIMESTAMP NOT NULL)
+PARTITION BY DATE(occurred_at)
+CLUSTER BY event_type, event_name;
 CREATE OR REPLACE VIEW \`${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}_rates\` AS
 SELECT
   period_start, period, visits_submitted, outcome_qualified AS companies_identified,
@@ -119,7 +126,7 @@ gcloud run jobs deploy "$JOB" \
   --region="$REGION" \
   --service-account="$SA" \
   --set-secrets="IDR_REPORTING_TOKEN=${SECRET}:latest" \
-  --set-env-vars="IDR_REPORTING_URL=${IDR_REPORTING_URL},IDR_WEBSITE_ID=${IDR_WEBSITE_ID},BQ_PROJECT=${PROJECT},BQ_DATASET=${BQ_DATASET},BQ_TABLE=${BQ_TABLE},BQ_ACTIVITY_TABLE=${BQ_ACTIVITY_TABLE},BQ_BOT_VISITS_TABLE=${BQ_BOT_VISITS_TABLE},BQ_LOCATION=${BQ_LOCATION}" \
+  --set-env-vars="IDR_REPORTING_URL=${IDR_REPORTING_URL},IDR_WEBSITE_ID=${IDR_WEBSITE_ID},BQ_PROJECT=${PROJECT},BQ_DATASET=${BQ_DATASET},BQ_TABLE=${BQ_TABLE},BQ_ACTIVITY_TABLE=${BQ_ACTIVITY_TABLE},BQ_BOT_VISITS_TABLE=${BQ_BOT_VISITS_TABLE},BQ_EVENTS_TABLE=${BQ_EVENTS_TABLE},BQ_LOCATION=${BQ_LOCATION}" \
   --labels="source=id-resolver,commit=${SOURCE_COMMIT:0:12}" \
   --tasks=1 --max-retries=1 --task-timeout=300s \
   --quiet
@@ -142,4 +149,4 @@ else
 fi
 
 step "Done"
-echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}; once a day it loads ${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}."
+echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}; once a day it loads ${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_EVENTS_TABLE}."

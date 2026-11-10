@@ -30,6 +30,7 @@ function world({ pages = [botPage([])], botStatus = 200, tableModified = Date.pa
     if (url.startsWith("https://resolver.example.test/")) return json(200, page([observation(1, 7)]));
     if (url === METADATA_TOKEN_URL) return json(200, { access_token: "ya29.x" });
     if (url.endsWith("/datasets/idr/tables/bot_visits")) return tableStatus === 200 ? json(200, { lastModifiedTime: String(tableModified) }) : json(tableStatus, { error: { status: "NOT_FOUND" } });
+    if (url.endsWith("/datasets/idr/tables/browser_events")) return json(200, { lastModifiedTime: String(Date.parse("2026-11-10T00:20:00Z")) });
     if (url.includes("uploadType=multipart") || url.endsWith("/jobs")) return json(200, {});
     return json(200, { status: { state: "DONE" } });
   });
@@ -114,7 +115,7 @@ test("the daily run loads each complete day with rows into its own partition, re
     ],
   });
   const result = await run({ env: ENV, fetch, log: (e) => logs.push(e), now: () => new Date("2026-11-10T00:30:00Z"), bigQueryOptions: fast });
-  assert.deepEqual(result, { ok: true, rows: 1, activity_rows: 1, bot_visit_rows: 3 });
+  assert.deepEqual(result, { ok: true, rows: 1, activity_rows: 1, bot_visit_rows: 3, event_rows: null });
   const reads = fetch.calls.filter((c) => c.url.includes("/v1/reporting/bot-visits")).map((c) => new URL(c.url).searchParams);
   assert.deepEqual([reads[0].get("from"), reads[0].get("to")], ["2026-11-07", "2026-11-09"]);
   const botLoads = loads(fetch).filter((l) => l.load.destinationTable.tableId.startsWith("bot_visits"));

@@ -2,7 +2,7 @@
 
 A scheduled Cloud Run job that copies the resolver's company observations and its daily visit counts into BigQuery, so they can be charted and queried next to other website analytics (for example GA4 and PostHog exports in the same location).
 
-It reads three read-only reporting routes with the reporting token: the feed (`reporting-feed.v1`, `GET /v1/reporting/observations`), the daily activity counts (`reporting-activity.v1`, `GET /v1/reporting/activity`) and, once a day, bot and crawler visits (`bot-visit.v1`, `GET /v1/reporting/bot-visits`). The resolver never calls out.
+It reads four read-only reporting routes with the reporting token: the feed (`reporting-feed.v1`, `GET /v1/reporting/observations`), the daily activity counts (`reporting-activity.v1`, `GET /v1/reporting/activity`) and, once a day, bot and crawler visits (`bot-visit.v1`, `GET /v1/reporting/bot-visits`) and browser events (`event.v1`, `GET /v1/reporting/events`). The resolver never calls out.
 
 ## How it works
 
@@ -87,6 +87,21 @@ No IP address, full user agent or cookie exists anywhere in this path.
 
 This table is loaded **daily**, not every run. The first run after 00:15 UTC (visits can reach the resolver up to five minutes late) checks the table's last-modified time (metadata only, no query) and, when the table has not been written since midnight UTC, reads the last `BQ_BOT_VISITS_DAYS` complete UTC days and replaces each of those day partitions (`WRITE_TRUNCATE` into `bot_visits$YYYYMMDD`). Later runs that day skip the step. Re-loading a day replaces it, so nothing is duplicated, and days older than the window are never touched: the table keeps the full history, beyond the resolver's retention window. When a day had no bot visits nothing is written, and the step is simply tried again on the next run. A resolver without the route (HTTP 404) skips the step; any other failure fails the run after the other two tables were replaced.
 
+## Browser events
+
+`<dataset>.browser_events`, one row per event from the website's own consent-gated collector (`@salescrusader/idr-collector` through the site's `/idr/e` route, `event.v1`), partitioned by day on `occurred_at` and clustered by `event_type`, `event_name`:
+
+| column | type | notes |
+| --- | --- | --- |
+| `occurred_at` | TIMESTAMP | when the event happened in the browser (UTC) |
+| `page_key` | STRING | path only, identifiers replaced as for company visits |
+| `event_type` | STRING | `page_view`, `engagement` or `conversion_intent` |
+| `event_name` | STRING | e.g. `page_view`, `scroll_50`, `scroll_90`, `engaged_30s`, `cta_click`, `form_start`, `form_submit` |
+| `consent` | STRING | `granted` (the site sends events only after the visitor allows analytics) |
+| `synced_at` | TIMESTAMP | when the sync wrote the row |
+
+There is no session, visitor, cookie, address or company column, and none can be added from this data: events are never linked to companies (owner decision D4). Counts are indicative telemetry, not evidence (`docs/contracts/event.v1.md`). Loaded daily exactly like bot visits (same `BQ_BOT_VISITS_DAYS` window, `browser_events$YYYYMMDD` partitions); a resolver without the route skips the step.
+
 ## Configuration
 
 | variable | |
@@ -97,7 +112,8 @@ This table is loaded **daily**, not every run. The first run after 00:15 UTC (vi
 | `BQ_PROJECT`, `BQ_DATASET`, `BQ_TABLE`, `BQ_LOCATION` | destination |
 | `BQ_ACTIVITY_TABLE` | optional, default `daily_activity`; must differ from `BQ_TABLE` |
 | `BQ_BOT_VISITS_TABLE` | optional, default `bot_visits`; must differ from the other two |
-| `BQ_BOT_VISITS_DAYS` | optional, default 3 (1 to 31): complete UTC days reloaded by each daily bot visits load. Raise it for one run to backfill after an outage |
+| `BQ_BOT_VISITS_DAYS` | optional, default 3 (1 to 31): complete UTC days reloaded by each daily load (bot visits and browser events). Raise it for one run to backfill after an outage |
+| `BQ_EVENTS_TABLE` | optional, default `browser_events`; must differ from the other three |
 | `IDR_MAX_PAGES` | optional, default 200, so at most 100,000 visits per run |
 
 ## Deploy
@@ -114,7 +130,7 @@ SOURCE_COMMIT=<40-character commit> bash setup-cloud-run.sh
 It:
 
 - enables the APIs;
-- creates the dataset, the three tables and the `daily_activity_rates` view when missing (existing data is kept);
+- creates the dataset, the four tables and the `daily_activity_rates` view when missing (existing data is kept);
 - creates the service account `idr-bigquery-sync`, with BigQuery Job User on the project and BigQuery Data Editor on the dataset only;
 - stores the reporting token in Secret Manager, typed with hidden input;
 - deploys the job from the pinned commit;

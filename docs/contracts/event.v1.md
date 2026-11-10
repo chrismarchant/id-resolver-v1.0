@@ -92,6 +92,18 @@ Errors use the existing mapping: `400 invalid_request`, `401 unauthorized`,
   `reporting-feed.v1`. How they reach Insights (for example an aggregate-only
   summary) is a separate owner decision. It is not part of this contract.
 
+## Reporting: `GET /v1/reporting/events`
+
+Read-only, for the BigQuery sync (`integrations/bigquery-sync`, table `browser_events`):
+`GET /v1/reporting/events?from=YYYY-MM-DD&to=YYYY-MM-DD[&limit=1-1000][&cursor=...]`.
+
+* The reporting credential only (the website credential is refused). Served whatever `EVENTS_ENABLED` says: it only
+  reads what is stored.
+* `from` and `to` are inclusive UTC dates of `occurred_at`, at most 31 days; `limit` defaults to 500; keyset pages on
+  `(occurred_at, id)`, follow `next_cursor` until it is `null`.
+* Each item is exactly `{occurred_at, page_key, type, name, consent}`. The `event_id` is not returned. The statements
+  read `browser_events` alone (index `browser_events_report_idx`, migration 0013), never a company-side table (D4).
+
 ## Vocabulary `event-vocabulary.v1` (approved by the owner, 3 Nov 2026, CHR-59)
 
 The canonical list is

@@ -225,6 +225,26 @@ export interface ReportingBotVisitsResponse {
   next_cursor: string | null;
 }
 
+/** One stored browser event, GET /v1/reporting/events (event.v1). Never linked to a company (D4). */
+export interface ReportingBrowserEvent {
+  occurred_at: string;
+  page_key: string;
+  type: string;
+  name: string;
+  consent: string;
+}
+
+export interface ReportingEventsResponse {
+  version: typeof REPORTING_API_VERSION;
+  scope: ReportingScope;
+  /** Inclusive UTC calendar dates as requested (by occurred_at). */
+  from: string;
+  to: string;
+  /** Ordered by occurred_at, then storage order. */
+  items: ReportingBrowserEvent[];
+  next_cursor: string | null;
+}
+
 export interface ReportingSummaryResponse {
   version: typeof REPORTING_API_VERSION;
   scope: ReportingScope;

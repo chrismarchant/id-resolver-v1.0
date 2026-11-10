@@ -351,6 +351,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
       usagePeriod: config.USAGE_PERIOD,
       ...(deps.botVisits ? { botVisits: deps.botVisits } : {}),
+      // Read-only listing of browser_events, whether or not POST /v1/events is enabled.
+      ...(deps.events ? { events: deps.events } : {}),
     });
   }
 

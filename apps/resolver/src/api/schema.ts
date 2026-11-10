@@ -93,4 +93,6 @@ export const BotVisitsQuerySchema = z
     cursor,
   })
   .strict();
+/** Browser events: the same range, page size and cursor rules as bot visits. */
+export const EventsQuerySchema = BotVisitsQuerySchema;
 export const CompanyIdParamSchema = z.object({ id: z.string().regex(/^[1-9]\d{0,15}$/) }).strict();

@@ -14,7 +14,7 @@
  * trigger, so a batch never moves the feed's retention watermark or writes a
  * tombstone.
  */
-import type { BrowserEventRecord, EventRepository } from "../contracts/event.js";
+import type { BrowserEventRecord, EventRepository, StoredBrowserEvent } from "../contracts/event.js";
 import type { Logger } from "../log/index.js";
 import { DbError, guarded, type Pool } from "./pool.js";
 
@@ -38,8 +38,54 @@ WHERE ctid IN (
   FOR UPDATE SKIP LOCKED)
 RETURNING 1`;
 
+/** Rows per read: the reporting route asks for at most 1000 plus one look-ahead row. */
+export const MAX_EVENT_PAGE = 1_001;
+
+const LIST_COLUMNS = "id, occurred_at, page_key, type, name, consent";
+
+/** $1 installation, $2 website, $3 from, $4 to, $5 limit. */
+export const LIST_BROWSER_EVENTS_SQL = `
+SELECT ${LIST_COLUMNS} FROM browser_events
+WHERE installation_id = $1::text AND website_id = $2::text
+  AND occurred_at >= $3::timestamptz AND occurred_at < $4::timestamptz
+ORDER BY occurred_at ASC, id ASC
+LIMIT $5::integer`;
+
+/** $1 installation, $2 website, $3 from, $4 to, $5 limit, $6 cursor occurred_at, $7 cursor id. */
+export const LIST_BROWSER_EVENTS_AFTER_SQL = `
+SELECT ${LIST_COLUMNS} FROM browser_events
+WHERE installation_id = $1::text AND website_id = $2::text
+  AND occurred_at >= $3::timestamptz AND occurred_at < $4::timestamptz
+  AND (occurred_at, id) > ($6::timestamptz, $7::bigint)
+ORDER BY occurred_at ASC, id ASC
+LIMIT $5::integer`;
+
+interface BrowserEventRow {
+  id: string | number;
+  occurred_at: Date;
+  page_key: string;
+  type: string;
+  name: string;
+  consent: StoredBrowserEvent["consent"];
+}
+
+const validDate = (d: unknown): d is Date => d instanceof Date && !Number.isNaN(d.getTime());
+
 export function createEventRepository(pool: Pick<Pool, "query">, logger?: Logger): EventRepository {
   return {
+    async list(scope, range, page): Promise<StoredBrowserEvent[]> {
+      if (!validDate(range.from) || !validDate(range.to)) throw new DbError("INVALID_RANGE");
+      if (!Number.isSafeInteger(page.limit) || page.limit < 1 || page.limit > MAX_EVENT_PAGE) throw new DbError("INVALID_LIMIT");
+      const after = page.after;
+      if (after && (!validDate(after.occurredAt) || !Number.isSafeInteger(after.id) || after.id < 0)) throw new DbError("INVALID_CURSOR");
+      return guarded(logger, async () => {
+        const base = [scope.installationId, scope.websiteId, range.from, range.to, page.limit];
+        const res = after
+          ? await pool.query<BrowserEventRow>(LIST_BROWSER_EVENTS_AFTER_SQL, [...base, after.occurredAt, after.id])
+          : await pool.query<BrowserEventRow>(LIST_BROWSER_EVENTS_SQL, base);
+        return res.rows.map((r) => ({ id: Number(r.id), occurredAt: r.occurred_at, pageKey: r.page_key, type: r.type, name: r.name, consent: r.consent }));
+      });
+    },
     async record(e: BrowserEventRecord): Promise<boolean> {
       return guarded(logger, async () => {
         const res = await pool.query(INSERT_BROWSER_EVENT_SQL, [e.installationId, e.websiteId, e.eventId, e.type, e.name, e.pageKey, e.consent, e.occurredAt]);
