@@ -95,6 +95,65 @@ export async function replaceTable(cfg, rows, accessToken, opts = {}) {
   return jobId;
 }
 
+/**
+ * The table's lastModifiedTime in epoch milliseconds (tables.get, metadata only:
+ * no query, no cost). The table must exist (the setup script creates it).
+ */
+export async function tableLastModified(cfg, table, accessToken, { fetch = globalThis.fetch } = {}) {
+  const url = `${API}/projects/${cfg.project}/datasets/${cfg.dataset}/tables/${encodeURIComponent(table)}?selectedFields=lastModifiedTime`;
+  const res = await fetch(url, { headers: { authorization: `Bearer ${accessToken}` } });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new BigQueryError(`BigQuery table ${cfg.dataset}.${table} lookup answered HTTP ${res.status}${reason(body?.error)}`);
+  }
+  const body = await res.json().catch(() => null);
+  const ms = Number(body?.lastModifiedTime);
+  if (!Number.isFinite(ms)) throw new BigQueryError(`BigQuery table ${cfg.dataset}.${table} has no lastModifiedTime`);
+  return ms;
+}
+
+const PARTITION_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Replaces one day partition of a table partitioned by DAY (WRITE_TRUNCATE load
+ * into `<table>$YYYYMMDD`): every row must fall on that day. Other days are untouched.
+ */
+export async function replacePartition(cfg, table, day, rows, accessToken, opts = {}) {
+  if (!PARTITION_DAY.test(day)) throw new BigQueryError("partition day must be YYYY-MM-DD");
+  if (rows.length === 0) throw new BigQueryError("a partition load needs at least one row");
+  const { fetch = globalThis.fetch, jobId = `idr_sync_${Date.now()}_${randomUUID().slice(0, 8)}`, schema } = opts;
+  const decorator = day.split("-").join("");
+  const metadata = {
+    jobReference: { projectId: cfg.project, jobId, location: cfg.location },
+    configuration: {
+      labels: { source: "idr-bigquery-sync" },
+      load: {
+        destinationTable: { projectId: cfg.project, datasetId: cfg.dataset, tableId: `${table}$${decorator}` },
+        sourceFormat: "NEWLINE_DELIMITED_JSON",
+        writeDisposition: "WRITE_TRUNCATE",
+        createDisposition: "CREATE_NEVER",
+        schema: { fields: schema },
+        maxBadRecords: 0,
+        ignoreUnknownValues: false,
+      },
+    },
+  };
+  const boundary = `idr-${randomUUID()}`;
+  const ndjson = rows.map((r) => JSON.stringify(r)).join("\n");
+  const body =
+    `--${boundary}\r\ncontent-type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\ncontent-type: application/octet-stream\r\n\r\n${ndjson}\r\n` +
+    `--${boundary}--\r\n`;
+  const res = await fetch(`${UPLOAD_API}/projects/${cfg.project}/jobs?uploadType=multipart`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${accessToken}`, "content-type": `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  await checkJobResponse(res, "load");
+  await waitForJob(cfg, jobId, accessToken, opts);
+  return jobId;
+}
+
 async function checkJobResponse(res, kind) {
   if (res.ok) return;
   const body = await res.json().catch(() => null);

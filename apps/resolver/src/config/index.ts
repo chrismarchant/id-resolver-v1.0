@@ -132,6 +132,10 @@ export const ConfigSchema = z.object({
   /** `required` (default): an event with consent `not_required` is refused with 403 consent_required. `not_required` accepts both values. */
   EVENT_CONSENT_MODE: z.enum(EVENT_CONSENT_MODES).default("required"),
 
+  // Bot and crawler visits (contract bot-visit.v1)
+  /** POST /v1/bot-visits exists unless false; then it answers 404 like any unknown route. Default on. */
+  BOT_VISITS_ENABLED: boolFromString(true),
+
   // Qualification policy
   QUALIFIED_USAGE_TYPES: csv(["COM", "ORG", "GOV", "EDU", "MIL", "LIB"]),
   EXCLUDED_USAGE_TYPES: csv(["ISP", "MOB", "DCH", "CDN", "SES", "AIC", "RSV"]),

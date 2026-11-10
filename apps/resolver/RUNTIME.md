@@ -20,6 +20,11 @@ POST /v1/events (only when EVENTS_ENABLED=true; see "Browser events")
                    ─▶ auth ─▶ strict schema + vocabulary ─▶ website_id ─▶ occurred_at ±300 s ─▶ consent policy
                    ─▶ one INSERT into browser_events (never the runner, cache, company tables or provider, D4)
                    ◀─ { version, recorded }
+
+POST /v1/bot-visits (unless BOT_VISITS_ENABLED=false; contract bot-visit.v1, docs/contracts/bot-visit.v1.md)
+                   ─▶ auth ─▶ strict schema ─▶ website_id ─▶ occurred_at ±300 s ─▶ write slot (4)
+                   ─▶ one INSERT into bot_visits (never the runner, cache, company tables or provider)
+                   ◀─ { version, recorded }
 ```
 
 Entry point: `node dist/main.js` (Dockerfile `CMD`; `npm start`; `npm run dev`

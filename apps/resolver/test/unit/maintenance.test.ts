@@ -69,6 +69,47 @@ describe("drainBatches", () => {
 });
 
 describe("createMaintenance", () => {
+  it("prunes bot visits with the same cutoff as browser events, within the events' share, and reports them", async () => {
+    const events = fakeTable(25);
+    const bots = fakeTable(15);
+    const eventCutoffs: Date[] = [];
+    const botCutoffs: Date[] = [];
+    const logger = createMemoryLogger();
+    const m = createMaintenance(
+      options({
+        pruneEventsBefore: fakeEvents(events, eventCutoffs),
+        pruneBotVisitsBefore: (cutoff, limit) => {
+          botCutoffs.push(cutoff);
+          return bots.step(limit);
+        },
+        logger,
+      }),
+    );
+    const run = await m.runOnce();
+    expect(run).toMatchObject({ eventRows: 25, botVisitRows: 15, backlog: false, reason: null });
+    expect(bots.rows).toBe(0);
+    expect(botCutoffs.length).toBeGreaterThan(0);
+    expect(botCutoffs[0]!.getTime()).toBe(eventCutoffs[0]!.getTime());
+    expect(logger.entries.find((e) => e["event"] === "maintenance_run")).toMatchObject({ event_rows: 25, bot_visit_rows: 15 });
+  });
+
+  it("reports a bot-visit backlog and a database error when bot pruning fails, without stopping observation retention", async () => {
+    const observations = fakeTable(5);
+    const logger = createMemoryLogger();
+    const m = createMaintenance(
+      options({
+        retention: fakeRetention(observations),
+        pruneBotVisitsBefore: async () => {
+          throw new Error("db down");
+        },
+        logger,
+      }),
+    );
+    const run = await m.runOnce();
+    expect(run).toMatchObject({ observationRows: 5, botVisitRows: 0, backlog: true, reason: "database_error" });
+    expect(logger.entries.find((e) => e["event"] === "maintenance_backlog")).toMatchObject({ category: "bot_visits" });
+  });
+
   it("splits the budget: expired cache rows may use half, observation retention always gets the rest", async () => {
     const cache = fakeTable(10_000);
     const observations = fakeTable(10_000);

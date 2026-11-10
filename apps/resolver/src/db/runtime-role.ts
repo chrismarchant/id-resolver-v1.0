@@ -65,7 +65,7 @@ export interface TableGrant {
  *
  *  - SELECT ... FOR UPDATE (cache lease, company lock, the SKIP LOCKED
  *    retention batches) needs UPDATE on at least one column, hence the
- *    single-column UPDATE (id) on company_observations and browser_events:
+ *    single-column UPDATE (id) on company_observations, browser_events and bot_visits:
  *    on company_observations the 0006/0007 triggers reject any change of id
  *    anyway (a no-op SET id = id is the most it allows).
  *  - feed_retention_watermarks is SELECT only: the 0006 watermark trigger
@@ -93,6 +93,7 @@ export const RUNTIME_GRANTS: Readonly<Record<string, TableGrant>> = {
   feed_tombstones: { select: true },
   feed_retention_watermarks: { select: true },
   browser_events: { select: true, insert: true, update: ["id"], delete: true },
+  bot_visits: { select: true, insert: true, update: ["id"], delete: true },
 };
 
 /** USAGE (nextval) on the sequences behind the tables the runtime role inserts into; false = none. */
@@ -100,6 +101,7 @@ export const RUNTIME_SEQUENCE_GRANTS: Readonly<Record<string, boolean>> = {
   companies_id_seq: true,
   company_observations_id_seq: true,
   browser_events_id_seq: true,
+  bot_visits_id_seq: true,
   feed_tombstones_id_seq: false,
 };
 
