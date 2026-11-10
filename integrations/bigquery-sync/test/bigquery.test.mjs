@@ -68,3 +68,25 @@ test("a job that never finishes is an error", async () => {
   const fetch = recordingFetch(() => json(200, { status: { state: "RUNNING" } }));
   await assert.rejects(replaceTable(cfg, [row], "ya29.x", { fetch, ...fast, maxPolls: 3 }), /did not finish/);
 });
+
+test("tableLastModified reads the table resource with a plain tables.get (no selectedFields: that selects schema columns)", async () => {
+  const { tableLastModified } = await import("../src/bigquery.mjs");
+  const calls = [];
+  const fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify({ lastModifiedTime: "1794304172587", schema: { fields: [] } }), { status: 200 });
+  };
+  const cfg = { project: "example-project", dataset: "idr" };
+  assert.equal(await tableLastModified(cfg, "bot_visits", "ya29.x", { fetch }), 1794304172587);
+  assert.equal(calls[0].url, "https://bigquery.googleapis.com/bigquery/v2/projects/example-project/datasets/idr/tables/bot_visits");
+  assert.equal(calls[0].init.headers.authorization, "Bearer ya29.x");
+});
+
+test("tableLastModified names the table and the HTTP status on a refusal, and refuses a body without lastModifiedTime", async () => {
+  const { tableLastModified } = await import("../src/bigquery.mjs");
+  const cfg = { project: "example-project", dataset: "idr" };
+  const refused = async () => new Response(JSON.stringify({ error: { status: "INVALID_ARGUMENT", message: "bad" } }), { status: 400 });
+  await assert.rejects(tableLastModified(cfg, "bot_visits", "t", { fetch: refused }), /idr\.bot_visits lookup answered HTTP 400/);
+  const empty = async () => new Response(JSON.stringify({}), { status: 200 });
+  await assert.rejects(tableLastModified(cfg, "bot_visits", "t", { fetch: empty }), /has no lastModifiedTime/);
+});

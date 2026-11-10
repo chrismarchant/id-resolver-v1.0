@@ -29,7 +29,7 @@ function world({ pages = [botPage([])], botStatus = 200, tableModified = Date.pa
     if (url.startsWith("https://resolver.example.test/v1/reporting/activity")) return json(200, activityBody([activityItem("2026-11-09")]));
     if (url.startsWith("https://resolver.example.test/")) return json(200, page([observation(1, 7)]));
     if (url === METADATA_TOKEN_URL) return json(200, { access_token: "ya29.x" });
-    if (url.includes("/tables/bot_visits?")) return tableStatus === 200 ? json(200, { lastModifiedTime: String(tableModified) }) : json(tableStatus, { error: { status: "NOT_FOUND" } });
+    if (url.endsWith("/datasets/idr/tables/bot_visits")) return tableStatus === 200 ? json(200, { lastModifiedTime: String(tableModified) }) : json(tableStatus, { error: { status: "NOT_FOUND" } });
     if (url.includes("uploadType=multipart") || url.endsWith("/jobs")) return json(200, {});
     return json(200, { status: { state: "DONE" } });
   });
