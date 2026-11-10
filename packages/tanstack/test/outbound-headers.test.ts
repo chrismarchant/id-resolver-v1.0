@@ -92,7 +92,10 @@ describe("outbound headers are built from scratch (G4-I8, code-side evidence for
     // from the request headers.
     const body = JSON.parse(String(r.calls[0]!.init.body)) as Record<string, unknown>;
     expect(body["ip"]).toBe(visitorIp);
-    const rest = JSON.stringify({ ...body, ip: undefined });
+    // entrance_id is random base64url, so it can contain a marker such as "GB" by chance (about 1 run in 100):
+    // check its shape on its own and leave it out of the text scanned for request-header values.
+    expect(body["entrance_id"]).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    const rest = JSON.stringify({ ...body, ip: undefined, entrance_id: undefined });
     expect(rest).not.toContain(visitorIp);
     for (const m of [...MARKERS, "GB", "203.0.113.9"]) expect(rest).not.toContain(m);
   });
