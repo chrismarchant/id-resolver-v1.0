@@ -107,6 +107,42 @@ name variables, never values. See `.env.example` for every variable.
   `MAX_CONCURRENT_CHILDREN` (use `MAX_CONCURRENT_JOBS`),
   `CHILD_HARD_KILL_GRACE_MS` and `RUN_MIGRATIONS_ON_START`.
 
+## Network-owner guard
+
+A domain qualifies only with an allowlisted usage type (`QUALIFIED_USAGE_TYPES`,
+default `COM,ORG,GOV,EDU,MIL,LIB`); `EXCLUDED_USAGE_TYPES` (`ISP`, `MOB`, `DCH`,
+...) are network owners. Providers sometimes label an ISP's business-line
+address `COM`, with the ISP's own name as the organisation and a domain that is
+someone else's (a customer of the block, or its reverse DNS). Example from
+production (7 Nov 2026): organisation "Micronova Helios Networking Solutions
+Private Limited" (an Indian network, AS132507) with an unrelated domain.
+
+`NETWORK_OWNER_GUARD` (default `true`) excludes such a result, reason
+`provider_network_owner` (counted as excluded, cached for `TTL_EXCLUDED_S`),
+when both hold:
+
+* the organisation is a network operator: its name has a network word as a
+  whole word (network(s), networking, broadband, telecom, telecommunications,
+  communications, internet, ISP, hosting, data centre, colocation, cable,
+  wireless, fibre, infocomm, transit, backbone), or Enrich's ISP field names the
+  same organisation (the adapter compares the two; the ISP name itself is
+  discarded there, as before);
+* the name does not belong to the domain: no distinctive name word inside a
+  domain label, no domain label inside the joined name, and the name's
+  initials are not a domain label (legal forms such as Ltd, Pvt, GmbH are
+  ignored).
+
+So "Juniper Networks" with juniper.net or "Tata Communications" with
+tatacommunications.com still qualify. The known blind spot: an organisation that
+runs its own network under a domain unrelated to its name (e.g. a holding
+company name with a brand domain) is excluded when Enrich names it as its own
+ISP. `job_finished` and `request_completed` log the reason; `provider_outcome`
+logs the usage type.
+
+A company already recorded before the guard (or let through by it) is removed
+with `npm run ops:erase-company -- --domain <domain>` after adding the domain to
+`DENIED_DOMAINS`.
+
 ## Hosting ranges
 
 Cloud providers and search crawlers publish the network ranges of their own

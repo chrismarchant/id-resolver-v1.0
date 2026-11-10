@@ -171,7 +171,10 @@ function planFor(p: ProviderOutcome, policy: PipelineConfig["policy"], checkedAt
         estimated: ESTIMATED_CREDITS_PER_DOMAIN,
         ...(p.creditsReported !== null ? { reported: p.creditsReported } : {}),
       };
-      const q = qualify({ domain: p.domain, usageType: p.usageType }, policy);
+      const q = qualify(
+        { domain: p.domain, usageType: p.usageType, organisationName: p.organisationName, organisationIsNetworkOperator: p.organisationIsNetworkOperator === true },
+        policy,
+      );
       if (q.kind === "qualified") {
         const company: CacheCompany = { domain: p.domain, organisationName: p.organisationName, qualificationCategory: q.category };
         return {

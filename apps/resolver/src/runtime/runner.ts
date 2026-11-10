@@ -109,6 +109,7 @@ export function buildPipelineConfig(config: Config): PipelineConfig {
       qualified_usage_types: upper(config.QUALIFIED_USAGE_TYPES),
       excluded_usage_types: upper(config.EXCLUDED_USAGE_TYPES),
       denied_domains: config.DENIED_DOMAINS.map((d) => d.trim().toLowerCase()),
+      network_owner_guard: config.NETWORK_OWNER_GUARD,
       allow_documentation_ranges: config.ALLOW_DOCUMENTATION_RANGES,
       hosting_ranges_mode: config.HOSTING_RANGES_MODE,
     },

@@ -3,7 +3,11 @@ import {
   canonicaliseDomain,
   canonicaliseOrganisationName,
   canonicaliseUsageType,
+  isNetworkOperatorName,
+  isNetworkOwner,
+  organisationMatchesDomain,
   qualify,
+  sameOrganisation,
   type QualificationPolicy,
 } from "../../src/resolution/qualify.js";
 
@@ -122,5 +126,75 @@ describe("qualify", () => {
 
   it("never qualifies an invalid domain", () => {
     expect(qualify({ domain: "not a domain", usageType: "COM" }, policy).kind).toBe("unknown");
+  });
+});
+
+describe("network-owner guard", () => {
+  it("excludes a qualifying result whose organisation is a network operator and does not own the domain (the reported case)", () => {
+    expect(
+      qualify({ domain: "valley-review.example", usageType: "COM", organisationName: "Example Helios Networking Solutions Private Limited" }, policy),
+    ).toEqual({ kind: "excluded", reason: "provider_network_owner" });
+  });
+
+  it("excludes when the provider names the organisation as the network's operator, whatever the name", () => {
+    expect(qualify({ domain: "customer-shop.example", usageType: "COM", organisationName: "Example Online GmbH", organisationIsNetworkOperator: true }, policy)).toEqual({
+      kind: "excluded",
+      reason: "provider_network_owner",
+    });
+  });
+
+  it.each([
+    ["Juniper Networks", "juniper.example"],
+    ["Palo Alto Networks Inc", "paloaltonetworks.example"],
+    ["Extreme Networks", "extremenetworks.example"],
+    ["Example Communications Ltd", "examplepr.co.uk"],
+    ["British Telecommunications PLC", "bt.example"],
+    ["International Business Machines", "ibm.example"],
+    ["Tata Communications", "tatacommunications.example"],
+  ])("keeps a network company that owns its domain: %s / %s", (organisationName, domain) => {
+    expect(qualify({ domain, usageType: "COM", organisationName, organisationIsNetworkOperator: true }, policy)).toMatchObject({ kind: "qualified", category: "COM" });
+  });
+
+  it("keeps an ordinary company even when its name does not match the domain", () => {
+    expect(qualify({ domain: "brand.example", usageType: "COM", organisationName: "Example Holdings Ltd" }, policy)).toMatchObject({ kind: "qualified" });
+  });
+
+  it("needs an organisation name, and never changes an excluded or unknown usage type", () => {
+    expect(qualify({ domain: "valley-review.example", usageType: "COM", organisationName: null, organisationIsNetworkOperator: true }, policy)).toMatchObject({ kind: "qualified" });
+    expect(qualify({ domain: "valley-review.example", usageType: "ISP", organisationName: "Example Broadband" }, policy)).toEqual({ kind: "excluded", reason: "provider_excluded_usage_type" });
+    expect(qualify({ domain: "valley-review.example", usageType: "XYZ", organisationName: "Example Broadband" }, policy)).toEqual({ kind: "unknown", reason: "provider_unknown_usage_type" });
+    expect(qualify({ domain: "denied.example", usageType: "COM", organisationName: "Example Broadband" }, policy)).toEqual({ kind: "unknown", reason: "provider_denied_domain" });
+  });
+
+  it("is switched off by network_owner_guard: false", () => {
+    expect(
+      qualify({ domain: "valley-review.example", usageType: "COM", organisationName: "Example Helios Networking Solutions Private Limited" }, { ...policy, network_owner_guard: false }),
+    ).toMatchObject({ kind: "qualified" });
+  });
+
+  it("isNetworkOperatorName matches whole words and phrases only", () => {
+    for (const n of ["Example Broadband", "Example Telecom SA", "Example Internet Services", "Example Data Centre Ltd", "Example Web Hosting", "EXAMPLE NETWORKS", "Example Telecomunicações"]) {
+      expect(isNetworkOperatorName(n), n).toBe(true);
+    }
+    for (const n of ["Networkly Ltd", "Telecomix Media", "Example Holdings", "Hostess Brands"]) expect(isNetworkOperatorName(n), n).toBe(false);
+  });
+
+  it("organisationMatchesDomain: distinctive word, joined name, or initials; legal forms and descriptive words never match", () => {
+    expect(organisationMatchesDomain("Example Helios Networking Solutions Private Limited", "valley-review.example")).toBe(false);
+    expect(organisationMatchesDomain("Example Helios Networking Solutions Private Limited", "helios.example")).toBe(true);
+    expect(organisationMatchesDomain("Networking Solutions Private Limited", "solutions.example")).toBe(true);
+    expect(organisationMatchesDomain("Networking Solutions Private Limited", "limited.example")).toBe(false);
+    expect(organisationMatchesDomain("Example Widgets", "shop.example-widgets.co.uk")).toBe(true);
+    expect(organisationMatchesDomain("Acme Widgets", "aw.co.uk")).toBe(true);
+  });
+
+  it("sameOrganisation ignores case, punctuation and legal forms", () => {
+    expect(sameOrganisation("Example Helios Networking Solutions Private Limited", "EXAMPLE HELIOS NETWORKING SOLUTIONS PVT. LTD.")).toBe(true);
+    expect(sameOrganisation("Example Ltd", "Example Transit Networks")).toBe(false);
+    expect(sameOrganisation("Ltd", "Limited")).toBe(false);
+  });
+
+  it("isNetworkOwner is false without a name", () => {
+    expect(isNetworkOwner("valley-review.example", { organisationName: "   ", organisationIsNetworkOperator: true })).toBe(false);
   });
 });
