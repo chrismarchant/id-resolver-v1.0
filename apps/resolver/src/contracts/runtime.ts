@@ -47,6 +47,12 @@ export interface PipelineConfig {
     excluded_usage_types: string[];
     /** Domains never associated (case-insensitive exact match). */
     denied_domains: string[];
+    /**
+     * Network-owner guard (src/resolution/qualify.ts): a qualifying usage type is excluded when the organisation is
+     * the network operator (by name, or by the provider's ISP field) and its name does not belong to the domain.
+     * Default true.
+     */
+    network_owner_guard?: boolean;
     /** Treat RFC 5737/3849 documentation ranges as eligible (tests only; default false). */
     allow_documentation_ranges?: boolean;
     /** Published cloud and crawler ranges: off (default), shadow (log only) or enforce (exclude without a lookup). */
@@ -100,6 +106,7 @@ export const OUTCOME_REASONS = [
   "provider_excluded_usage_type",
   "provider_unknown_usage_type",
   "provider_denied_domain",
+  "provider_network_owner",
   "provider_timeout",
   "provider_error_auth",
   "provider_error_credits",

@@ -136,6 +136,11 @@ export const ConfigSchema = z.object({
   QUALIFIED_USAGE_TYPES: csv(["COM", "ORG", "GOV", "EDU", "MIL", "LIB"]),
   EXCLUDED_USAGE_TYPES: csv(["ISP", "MOB", "DCH", "CDN", "SES", "AIC", "RSV"]),
   DENIED_DOMAINS: csv([]),
+  /**
+   * Network-owner guard: a qualifying result is excluded when its organisation is the network operator (by name,
+   * or by the provider's ISP field) and the name does not belong to the domain (src/resolution/qualify.ts). Default on.
+   */
+  NETWORK_OWNER_GUARD: boolFromString(true),
   /** RFC 5737/3849 documentation ranges are ineligible in production; tests enable them. */
   ALLOW_DOCUMENTATION_RANGES: boolFromString(false),
   /**

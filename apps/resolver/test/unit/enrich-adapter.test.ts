@@ -35,8 +35,24 @@ afterAll(async () => {
 describe("enrich adapter against the mock server", () => {
   it("maps a 200 with domain to resolved, keeping only allowlisted fields", async () => {
     const o = await lookup("203.0.113.10");
-    expect(o).toEqual({ kind: "resolved", domain: "example.com", organisationName: "Example Ltd", usageType: "COM", creditsReported: 100 });
+    expect(o).toEqual({ kind: "resolved", domain: "example.com", organisationName: "Example Ltd", organisationIsNetworkOperator: false, usageType: "COM", creditsReported: 100 });
     assertClean(o, "203.0.113.10");
+  });
+
+  it("reads ipIsp only to tell whether the organisation is the network's operator; the ISP name never leaves the adapter", async () => {
+    const o = await lookup("203.0.113.16");
+    expect(o).toEqual({
+      kind: "resolved",
+      domain: "valley-review.example",
+      organisationName: "Example Helios Networking Solutions Private Limited",
+      organisationIsNetworkOperator: true,
+      usageType: "COM",
+      creditsReported: 100,
+    });
+    expect(JSON.stringify(o)).not.toContain("Pvt");
+    assertClean(o, "203.0.113.16");
+    // A different ISP from the organisation is not an operator record.
+    expect(await lookup("203.0.113.10")).toMatchObject({ organisationIsNetworkOperator: false });
   });
 
   it("reads the documented credit field names and ignores a bare credits value (could be a balance)", async () => {

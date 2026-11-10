@@ -53,10 +53,11 @@ const job = (ip = IP, deadlineInMs = 4_000, observationRef = REF): ResolutionJob
   observation_ref: observationRef,
 });
 
-const resolved = (domain: string, usageType: string | null, organisationName: string | null = "Example Ltd"): ProviderOutcome => ({
+const resolved = (domain: string, usageType: string | null, organisationName: string | null = "Example Ltd", organisationIsNetworkOperator?: boolean): ProviderOutcome => ({
   kind: "resolved",
   domain,
   organisationName,
+  ...(organisationIsNetworkOperator !== undefined ? { organisationIsNetworkOperator } : {}),
   usageType,
   creditsReported: 100,
 });
@@ -125,6 +126,13 @@ describe("runJob: provider outcomes", () => {
     });
   });
 
+  it("NETWORK_OWNER_GUARD off: a network operator's result qualifies as before", async () => {
+    const t = setup({ [IP]: { outcome: resolved("valley-review.example", "COM", "Example Helios Networking Solutions Private Limited") } });
+    const config = makeConfig({ policy: { network_owner_guard: false } });
+    const o = await runJob(t.deps, config, job());
+    expect(o).toMatchObject({ status: "qualified", source: "provider", reason: "provider_resolved" });
+  });
+
   it("fresh cache hit returns the cached company without a provider call", async () => {
     const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
     await runJob(t.deps, t.config, job());
@@ -141,6 +149,8 @@ describe("runJob: provider outcomes", () => {
     ["unknown usage", resolved("example.org", null), "unknown", "provider_unknown_usage_type", "ttl_unknown_ms", "unknown_results"],
     ["unrecognised usage", resolved("example.org", "XYZ"), "unknown", "provider_unknown_usage_type", "ttl_unknown_ms", "unknown_results"],
     ["denied domain", resolved("denied.example", "COM"), "unknown", "provider_denied_domain", "ttl_unknown_ms", "unknown_results"],
+    ["network owner by name", resolved("valley-review.example", "COM", "Example Helios Networking Solutions Private Limited"), "excluded", "provider_network_owner", "ttl_excluded_ms", "excluded_results"],
+    ["network owner by ISP field", resolved("customer-shop.example", "COM", "Example Online GmbH", true), "excluded", "provider_network_owner", "ttl_excluded_ms", "excluded_results"],
   ] as const)("%s -> %s", async (_label, outcome, status, reason, ttlKey, counter) => {
     const t = setup({ [IP]: { outcome } });
     const o = await runJob(t.deps, t.config, job());

@@ -2,13 +2,15 @@
  * Live Enrich v3 adapter: POST {base}/ip-to-company with {"ip": "<canonical>"}.
  *
  * This is the only code that sees a raw provider response. It keeps ipDomain,
- * ipOrganization, ipUsageType and a numeric credit count; everything else
- * (ISP, IP range, geolocation, the raw body) is discarded and never logged,
- * returned or embedded in an error. lookup() never throws.
+ * ipOrganization, ipUsageType and a numeric credit count, and reads ipIsp only
+ * to answer one yes/no question (is the organisation the network's operator?);
+ * everything else (the ISP name, IP range, geolocation, the raw body) is
+ * discarded and never logged, returned or embedded in an error. lookup()
+ * never throws.
  */
 import { z } from "zod";
 import type { ProviderAdapter, ProviderErrorCategory, ProviderOutcome } from "../contracts/provider.js";
-import { canonicaliseDomain, canonicaliseOrganisationName, canonicaliseUsageType } from "../resolution/qualify.js";
+import { canonicaliseDomain, canonicaliseOrganisationName, canonicaliseUsageType, sameOrganisation } from "../resolution/qualify.js";
 
 export const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
@@ -30,6 +32,7 @@ const BodySchema = z.object({
     .object({
       ipDomain: z.string().max(1024).nullish(),
       ipOrganization: z.string().max(4096).nullish(),
+      ipIsp: z.string().max(4096).nullish(),
       ipUsageType: z.string().max(256).nullish(),
     })
     .optional(),
@@ -109,10 +112,14 @@ function interpret(text: string): ProviderOutcome {
   if (!success) throw new MalformedBody();
   const domain = canonicaliseDomain(data.ipDomain);
   if (domain === null) return { kind: "no_domain", creditsReported };
+  const organisationName = canonicaliseOrganisationName(data.ipOrganization);
+  const isp = canonicaliseOrganisationName(data.ipIsp);
   return {
     kind: "resolved",
     domain,
-    organisationName: canonicaliseOrganisationName(data.ipOrganization),
+    organisationName,
+    // Only the comparison leaves the adapter, never the ISP name.
+    organisationIsNetworkOperator: organisationName !== null && isp !== null && sameOrganisation(organisationName, isp),
     usageType: canonicaliseUsageType(data.ipUsageType),
     creditsReported,
   };

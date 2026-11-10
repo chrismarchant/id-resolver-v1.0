@@ -1,0 +1,19 @@
+{
+  "description": "Synthetic: a business usage type on an address whose organisation is the network operator itself (ISP field equals the organisation) and whose domain belongs to someone else. Documentation address (RFC 5737); fake names.",
+  "ip": "203.0.113.16",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "ipDomain": "valley-review.example",
+      "ipOrganization": "Example Helios Networking Solutions Private Limited",
+      "ipIsp": "Example Helios Networking Solutions Pvt. Ltd.",
+      "ipRange": "203.0.113.0/24",
+      "ipUsageType": "COM",
+      "country": "Exampleland",
+      "latitude": 1.5,
+      "longitude": 2.5
+    },
+    "meta": { "credits_used": 100 }
+  }
+}

@@ -18,6 +18,11 @@ export type ProviderOutcome =
       /** Canonical lowercase domain from the provider (not yet qualified). */
       domain: string;
       organisationName: string | null;
+      /**
+       * True when the provider names the organisation as the operator of the address's network (its ISP field
+       * equals the organisation). Computed in the adapter; the ISP name itself never leaves it. Absent = false.
+       */
+      organisationIsNetworkOperator?: boolean;
       /** Provider usage-type code (e.g. "COM", "ISP", "DCH") or null when absent. */
       usageType: string | null;
       /** Credits the provider reported for this call, if present in the response. */
