@@ -1,14 +1,14 @@
 /**
  * Periodic data maintenance (CHR-66 F1; owner decision D3): deletes expired
  * cache rows (pseudonymous IP fingerprints past their TTL), and observations
- * and browser events (event.v1, CHR-64) older than OBSERVATION_RETENTION_DAYS
- * (the bounded synchronisation buffer).
+ * and browser events (event.v1, CHR-64) and bot visits (bot-visit.v1) older
+ * than OBSERVATION_RETENTION_DAYS (the bounded synchronisation buffer).
  *
  * A run DRAINS: it repeats bounded batches (CACHE_PRUNE_BATCH rows, one
  * statement each) until a batch comes back short, within a per-run time
  * budget (CACHE_PRUNE_BUDGET_MS). In order: expired cache rows may use up to
- * half of the budget; browser events may then use up to a quarter of it, and
- * never past three quarters of the budget; observation retention gets the
+ * half of the budget; browser events, then bot visits, may then use up to a
+ * quarter of it together, and never past three quarters of the budget; observation retention gets the
  * rest (the last quarter at least, and all of what the others leave unused),
  * so none of the three can starve another.
  *
@@ -32,7 +32,7 @@
  * batch is its own statement.
  *
  * Every run logs `maintenance_run{cache_rows, observation_rows, event_rows,
- * backlog, duration_ms, outcome}`. When due rows may remain (budget exhausted,
+ * bot_visit_rows, backlog, duration_ms, outcome}`. When due rows may remain (budget exhausted,
  * stopped or a database error) it also logs the warning
  * `maintenance_backlog{reason, category}`;
  * a backlog that persists across runs means the budget or batch size is too
@@ -49,6 +49,8 @@ export interface MaintenanceOptions {
   retention: Pick<FeedRetention, "pruneAllBefore">;
   /** One bounded batch of browser events received before `cutoff` (EventRepository.pruneBefore, event.v1). */
   pruneEventsBefore: (cutoff: Date, limit: number) => Promise<number>;
+  /** One bounded batch of bot visits received before `cutoff` (BotVisitRepository.pruneBefore, bot-visit.v1). Optional. */
+  pruneBotVisitsBefore?: (cutoff: Date, limit: number) => Promise<number>;
   logger: Logger;
   /** Rows per batch (CACHE_PRUNE_BATCH). */
   batch: number;
@@ -66,6 +68,7 @@ export interface MaintenanceRun {
   cacheRows: number;
   observationRows: number;
   eventRows: number;
+  botVisitRows: number;
   /** True when due rows may remain; the next run continues. */
   backlog: boolean;
   /** Why rows may remain; null when the run drained everything that was due. */
@@ -125,6 +128,10 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
       failed = true;
     }
 
+    // Up to a quarter of the budget for browser events and bot visits together,
+    // but never into the last quarter, which belongs to observation retention (CHR-66 G4-L1).
+    const eventDeadlineAtMs = Math.min(retentionStartedAt + Math.floor(opts.budgetMs / 4), startedAt + opts.budgetMs - Math.floor(opts.budgetMs / 4));
+
     let eventRows = 0;
     let eventBacklog = false;
     try {
@@ -136,9 +143,7 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
           eventRows += n;
           return n;
         },
-        // Up to a quarter of the budget, but never into the last quarter, which
-        // belongs to observation retention (CHR-66 G4-L1).
-        { batch: opts.batch, deadlineAtMs: Math.min(retentionStartedAt + Math.floor(opts.budgetMs / 4), startedAt + opts.budgetMs - Math.floor(opts.budgetMs / 4)), now, signal },
+        { batch: opts.batch, deadlineAtMs: eventDeadlineAtMs, now, signal },
       );
       eventBacklog = r.backlog;
       if (r.deleted > 0) logger.info("event_prune", { rows: r.deleted, count: r.batches });
@@ -146,6 +151,29 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
       // The repository already logged db_error{category}; rows not deleted now are retried next run.
       failed = true;
       eventBacklog = true;
+    }
+
+    let botVisitRows = 0;
+    let botVisitBacklog = false;
+    const pruneBotVisits = opts.pruneBotVisitsBefore;
+    if (pruneBotVisits) {
+      try {
+        if (cutoff === null) throw new Error("no cutoff");
+        const before = cutoff;
+        const r = await drainBatches(
+          async (limit) => {
+            const n = await pruneBotVisits(before, limit);
+            botVisitRows += n;
+            return n;
+          },
+          { batch: opts.batch, deadlineAtMs: eventDeadlineAtMs, now, signal },
+        );
+        botVisitBacklog = r.backlog;
+        if (r.deleted > 0) logger.info("bot_visit_prune", { rows: r.deleted, count: r.batches });
+      } catch {
+        failed = true;
+        botVisitBacklog = true;
+      }
     }
 
     let observationRows = 0;
@@ -160,16 +188,23 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
       observationBacklog = true;
     }
 
-    const backlog = cacheBacklog || observationBacklog || eventBacklog;
+    const backlog = cacheBacklog || observationBacklog || eventBacklog || botVisitBacklog;
     const reason: MaintenanceBacklogReason | null = !backlog ? null : failed ? "database_error" : signal.aborted ? "stopped" : "budget_exhausted";
     const durationMs = Math.max(0, now() - startedAt);
-    const fields = { cache_rows: cacheRows, observation_rows: observationRows, event_rows: eventRows, backlog, duration_ms: durationMs };
+    const fields = {
+      cache_rows: cacheRows,
+      observation_rows: observationRows,
+      event_rows: eventRows,
+      ...(pruneBotVisits ? { bot_visit_rows: botVisitRows } : {}),
+      backlog,
+      duration_ms: durationMs,
+    };
     logger.info("maintenance_run", { ...fields, outcome: failed ? "partial_failure" : "completed" });
     if (reason !== null) {
-      const kinds = [cacheBacklog ? "cache" : null, observationBacklog ? "observations" : null, eventBacklog ? "events" : null].filter((k) => k !== null);
+      const kinds = [cacheBacklog ? "cache" : null, observationBacklog ? "observations" : null, eventBacklog ? "events" : null, botVisitBacklog ? "bot_visits" : null].filter((k) => k !== null);
       logger.warn("maintenance_backlog", { ...fields, reason, category: kinds.join("_and_") });
     }
-    return { cacheRows, observationRows, eventRows, backlog, reason, durationMs };
+    return { cacheRows, observationRows, eventRows, botVisitRows, backlog, reason, durationMs };
   };
 
   const runOnce = (): Promise<MaintenanceRun | null> => {
@@ -180,7 +215,7 @@ export function createMaintenance(opts: MaintenanceOptions): Maintenance {
     const run = execute()
       // execute() catches every database failure; this only guards against a
       // defect, because a rejected scheduled run would be an unhandled rejection.
-      .catch((): MaintenanceRun => ({ cacheRows: 0, observationRows: 0, eventRows: 0, backlog: true, reason: "database_error", durationMs: 0 }))
+      .catch((): MaintenanceRun => ({ cacheRows: 0, observationRows: 0, eventRows: 0, botVisitRows: 0, backlog: true, reason: "database_error", durationMs: 0 }))
       .finally(() => {
         current = null;
       });

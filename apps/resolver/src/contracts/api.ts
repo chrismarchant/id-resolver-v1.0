@@ -205,6 +205,26 @@ export interface ReportingActivityResponse {
   items: ReportingActivityPeriod[];
 }
 
+/** One stored bot or crawler visit, GET /v1/reporting/bot-visits (bot-visit.v1). */
+export interface ReportingBotVisit {
+  observed_at: string;
+  page_key: string;
+  bot_name: string;
+  bot_category: string;
+  user_agent_family: string;
+}
+
+export interface ReportingBotVisitsResponse {
+  version: typeof REPORTING_API_VERSION;
+  scope: ReportingScope;
+  /** Inclusive UTC calendar dates as requested (by observed_at). */
+  from: string;
+  to: string;
+  /** Ordered by observed_at, then storage order. */
+  items: ReportingBotVisit[];
+  next_cursor: string | null;
+}
+
 export interface ReportingSummaryResponse {
   version: typeof REPORTING_API_VERSION;
   scope: ReportingScope;

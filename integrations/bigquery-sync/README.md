@@ -2,7 +2,7 @@
 
 A scheduled Cloud Run job that copies the resolver's company observations and its daily visit counts into BigQuery, so they can be charted and queried next to other website analytics (for example GA4 and PostHog exports in the same location).
 
-It reads two read-only reporting routes with the reporting token: the feed (`reporting-feed.v1`, `GET /v1/reporting/observations`) and the daily activity counts (`reporting-activity.v1`, `GET /v1/reporting/activity`). The resolver is unchanged and never calls out.
+It reads three read-only reporting routes with the reporting token: the feed (`reporting-feed.v1`, `GET /v1/reporting/observations`), the daily activity counts (`reporting-activity.v1`, `GET /v1/reporting/activity`) and, once a day, bot and crawler visits (`bot-visit.v1`, `GET /v1/reporting/bot-visits`). The resolver never calls out.
 
 ## How it works
 
@@ -70,6 +70,23 @@ CREATE TABLE `<project>.idr.company_visits` (
 
 The view `<dataset>.daily_activity_rates` adds `resolution_rate` (companies identified ÷ visits), `resolution_rate_eligible` (the same, leaving out private addresses and paused lookups) and `returning_share`. The outcome columns start at zero from the resolver's migration 0011, so the view leaves the rates empty for earlier days. The counts are best-effort (see the resolver's `reporting-activity.v1` contract, `docs/contracts/reporting-activity.v1.md`), and only the last 366 days are kept: each run replaces the table.
 
+## Bot and crawler visits
+
+`<dataset>.bot_visits`, one row per request from a known bot or crawler (`bot-visit.v1`, `GET /v1/reporting/bot-visits`), partitioned by day on `observed_at` and clustered by `bot_category`, `bot_name`:
+
+| column | type | notes |
+| --- | --- | --- |
+| `observed_at` | TIMESTAMP | when the bot requested the page (UTC) |
+| `page_key` | STRING | path only, identifiers replaced as for company visits |
+| `bot_name` | STRING | from the website's bot list, e.g. `GPTBot`, `Googlebot`, `Generic crawler` |
+| `bot_category` | STRING | `ai_crawler`, `search_engine`, `seo_tool`, `social_preview`, `monitoring` or `other` |
+| `user_agent_family` | STRING | the product token that identified the bot, without its version, e.g. `Googlebot-Image` |
+| `synced_at` | TIMESTAMP | when the sync wrote the row |
+
+No IP address, full user agent or cookie exists anywhere in this path.
+
+This table is loaded **daily**, not every run. The first run after 00:15 UTC (visits can reach the resolver up to five minutes late) checks the table's last-modified time (metadata only, no query) and, when the table has not been written since midnight UTC, reads the last `BQ_BOT_VISITS_DAYS` complete UTC days and replaces each of those day partitions (`WRITE_TRUNCATE` into `bot_visits$YYYYMMDD`). Later runs that day skip the step. Re-loading a day replaces it, so nothing is duplicated, and days older than the window are never touched: the table keeps the full history, beyond the resolver's retention window. When a day had no bot visits nothing is written, and the step is simply tried again on the next run. A resolver without the route (HTTP 404) skips the step; any other failure fails the run after the other two tables were replaced.
+
 ## Configuration
 
 | variable | |
@@ -79,6 +96,8 @@ The view `<dataset>.daily_activity_rates` adds `resolution_rate` (companies iden
 | `IDR_WEBSITE_ID` | the resolver's website id. Pages for any other website are refused |
 | `BQ_PROJECT`, `BQ_DATASET`, `BQ_TABLE`, `BQ_LOCATION` | destination |
 | `BQ_ACTIVITY_TABLE` | optional, default `daily_activity`; must differ from `BQ_TABLE` |
+| `BQ_BOT_VISITS_TABLE` | optional, default `bot_visits`; must differ from the other two |
+| `BQ_BOT_VISITS_DAYS` | optional, default 3 (1 to 31): complete UTC days reloaded by each daily bot visits load. Raise it for one run to backfill after an outage |
 | `IDR_MAX_PAGES` | optional, default 200, so at most 100,000 visits per run |
 
 ## Deploy
@@ -95,7 +114,7 @@ SOURCE_COMMIT=<40-character commit> bash setup-cloud-run.sh
 It:
 
 - enables the APIs;
-- creates the dataset, both tables and the `daily_activity_rates` view when missing (existing data is kept);
+- creates the dataset, the three tables and the `daily_activity_rates` view when missing (existing data is kept);
 - creates the service account `idr-bigquery-sync`, with BigQuery Job User on the project and BigQuery Data Editor on the dataset only;
 - stores the reporting token in Secret Manager, typed with hidden input;
 - deploys the job from the pinned commit;

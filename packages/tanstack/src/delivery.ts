@@ -1,5 +1,5 @@
 import type { DeliveryResult, ResolvedConfig, ResolvedDelivery } from "./config.js";
-import type { EntrancePayload, EventPayload } from "./types.js";
+import type { BotVisitPayload, EntrancePayload, EventPayload } from "./types.js";
 
 type Mode = DeliveryResult["mode"];
 
@@ -22,7 +22,7 @@ function timeoutSignal(ms: number): { signal: AbortSignal; cancel: () => void } 
 
 type DeliveryConfig = Pick<ResolvedDelivery, "token" | "fetch" | "retry" | "retryDelayMs">;
 
-async function attempt(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload, timeoutMs: number): Promise<AttemptResult> {
+async function attempt(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload | BotVisitPayload, timeoutMs: number): Promise<AttemptResult> {
   const { signal, cancel } = timeoutSignal(timeoutMs);
   try {
     const doFetch = cfg.fetch ?? globalThis.fetch;
@@ -84,7 +84,15 @@ export function deliverEvent(cfg: ResolvedDelivery, payload: EventPayload, opts:
   return deliverJson(cfg, `${cfg.resolverBase}/v1/events`, payload, opts);
 }
 
-async function deliverJson(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload, opts: DeliverOptions): Promise<DeliveryResult> {
+/**
+ * Sends one `bot-visit.v1` body to `<resolverBase>/v1/bot-visits`, with the same
+ * guarantees as `deliverEntrance` (the visit_id makes the retry idempotent).
+ */
+export function deliverBotVisit(cfg: ResolvedDelivery, payload: BotVisitPayload, opts: DeliverOptions): Promise<DeliveryResult> {
+  return deliverJson(cfg, `${cfg.resolverBase}/v1/bot-visits`, payload, opts);
+}
+
+async function deliverJson(cfg: DeliveryConfig, url: string, payload: EntrancePayload | EventPayload | BotVisitPayload, opts: DeliverOptions): Promise<DeliveryResult> {
   const started = Date.now();
   let attempts = 0;
   let last: AttemptResult = { kind: "network" };
