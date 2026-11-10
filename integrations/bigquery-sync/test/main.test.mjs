@@ -11,7 +11,7 @@ const fast = { pollMs: 0, sleep: async () => {} };
 function world({ feedStatus = 200, items = [observation(1, 7), observation(2, 8)], activityStatus = 200, activity = [activityItem("2026-11-04"), activityItem("2026-11-05")], botTableModified = Date.parse("2026-11-06T00:30:00Z") } = {}) {
   return recordingFetch(({ url }) => {
     if (url.startsWith("https://resolver.example.test/v1/reporting/activity")) return activityStatus === 200 ? json(200, activityBody(activity)) : json(activityStatus, {});
-    if (url.includes("/tables/bot_visits?")) return json(200, { lastModifiedTime: String(botTableModified) });
+    if (url.endsWith("/datasets/idr/tables/bot_visits")) return json(200, { lastModifiedTime: String(botTableModified) });
     if (url.startsWith("https://resolver.example.test/")) return feedStatus === 200 ? json(200, page(items)) : json(feedStatus, {});
     if (url === METADATA_TOKEN_URL) return json(200, { access_token: "ya29.x" });
     if (url.includes("uploadType=multipart") || url.endsWith("/jobs")) return json(200, {});

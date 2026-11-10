@@ -98,9 +98,13 @@ export async function replaceTable(cfg, rows, accessToken, opts = {}) {
 /**
  * The table's lastModifiedTime in epoch milliseconds (tables.get, metadata only:
  * no query, no cost). The table must exist (the setup script creates it).
+ *
+ * Plain tables.get, no query parameters: its `selectedFields` parameter selects
+ * table *schema columns*, not resource fields, so `selectedFields=lastModifiedTime`
+ * named a column that does not exist and failed the first production run.
  */
 export async function tableLastModified(cfg, table, accessToken, { fetch = globalThis.fetch } = {}) {
-  const url = `${API}/projects/${cfg.project}/datasets/${cfg.dataset}/tables/${encodeURIComponent(table)}?selectedFields=lastModifiedTime`;
+  const url = `${API}/projects/${cfg.project}/datasets/${cfg.dataset}/tables/${encodeURIComponent(table)}`;
   const res = await fetch(url, { headers: { authorization: `Bearer ${accessToken}` } });
   if (!res.ok) {
     const body = await res.json().catch(() => null);
