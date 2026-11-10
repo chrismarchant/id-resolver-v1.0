@@ -81,4 +81,16 @@ export const CompaniesQuerySchema = z.object({ limit, cursor, order }).strict();
 export const ObservationsQuerySchema = z.object({ limit, cursor }).strict();
 export const SummaryQuerySchema = z.object({ from: date, to: date }).strict();
 export const ActivityQuerySchema = SummaryQuerySchema;
+/** Bot visits: one inclusive UTC date range (at most 31 days), keyset cursor, up to 1000 rows a page. */
+export const BOT_VISITS_MAX_RANGE_DAYS = 31;
+export const BOT_VISITS_DEFAULT_LIMIT = 500;
+export const BOT_VISITS_MAX_LIMIT = 1_000;
+export const BotVisitsQuerySchema = z
+  .object({
+    from: date,
+    to: date,
+    limit: z.coerce.number().int().min(1).max(BOT_VISITS_MAX_LIMIT).default(BOT_VISITS_DEFAULT_LIMIT),
+    cursor,
+  })
+  .strict();
 export const CompanyIdParamSchema = z.object({ id: z.string().regex(/^[1-9]\d{0,15}$/) }).strict();

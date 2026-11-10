@@ -35,6 +35,7 @@ export const RESET_TABLE_NAMES = [
   "usage_periods",
   "deployment_controls",
   "browser_events",
+  "bot_visits",
 ] as const;
 
 export interface LockHolder {

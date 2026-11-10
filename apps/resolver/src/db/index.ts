@@ -6,9 +6,11 @@ import type {
   ReportingRepository,
   UsageRepository,
 } from "../contracts/db.js";
+import type { BotVisitRepository } from "../contracts/bot-visit.js";
 import type { EventRepository } from "../contracts/event.js";
 import type { Logger } from "../log/index.js";
 import { createActivityRepository } from "./activity-repo.js";
+import { createBotVisitRepository } from "./bot-visit-repo.js";
 import { createCacheRepository } from "./cache-repo.js";
 import { createCompanyRepository } from "./company-repo.js";
 import { createControlsRepository } from "./controls-repo.js";
@@ -29,6 +31,8 @@ export interface Db {
   reporting: ReportingRepository;
   /** Browser events (event.v1): statements on browser_events only. */
   events: EventRepository;
+  /** Bot and crawler visits (bot-visit.v1): statements on bot_visits only. */
+  botVisits: BotVisitRepository;
   /** SELECT 1 with a 1 s timeout; false on any error. */
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -51,6 +55,7 @@ export function createDb(opts: { databaseUrl: string; ssl: DbTlsInput; credentia
     activity: createActivityRepository(pool, logger),
     reporting: createReportingRepository(pool, logger),
     events: createEventRepository(pool, logger),
+    botVisits: createBotVisitRepository(pool, logger),
     async ping() {
       let timer: NodeJS.Timeout | undefined;
       try {

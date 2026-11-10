@@ -60,3 +60,21 @@ export interface EventPayload {
   page_key: string;
   consent: "granted" | "not_required";
 }
+
+export const BOT_VISIT_CONTRACT = "bot-visit.v1";
+
+/**
+ * Body of `POST /v1/bot-visits` (docs/contracts/bot-visit.v1.md). It has no IP, full user-agent, referrer, cookie,
+ * header, session or visitor field: only the bot's name and category from the package's bot list, one short product
+ * token, the page key and the time.
+ */
+export interface BotVisitPayload {
+  contract: typeof BOT_VISIT_CONTRACT;
+  website_id: string;
+  visit_id: string;
+  occurred_at: string;
+  page_key: string;
+  bot_name: string;
+  bot_category: string;
+  user_agent_family: string;
+}

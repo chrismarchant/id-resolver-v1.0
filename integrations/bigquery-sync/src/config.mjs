@@ -19,6 +19,9 @@ const WEBSITE_ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 
 export const PAGE_SIZE = 500;
 export const DEFAULT_ACTIVITY_TABLE = "daily_activity";
+export const DEFAULT_BOT_VISITS_TABLE = "bot_visits";
+export const DEFAULT_BOT_VISITS_DAYS = 3;
+export const MAX_BOT_VISITS_DAYS = 31;
 export const DEFAULT_MAX_PAGES = 200;
 
 export function readConfig(env) {
@@ -55,6 +58,18 @@ export function readConfig(env) {
   if (!BQ_NAME_RE.test(activityTable)) throw new ConfigError("BQ_ACTIVITY_TABLE is not a valid table id");
   if (activityTable === table) throw new ConfigError("BQ_ACTIVITY_TABLE must differ from BQ_TABLE");
 
+  const botVisitsTable = (env.BQ_BOT_VISITS_TABLE ?? "").trim() || DEFAULT_BOT_VISITS_TABLE;
+  if (!BQ_NAME_RE.test(botVisitsTable)) throw new ConfigError("BQ_BOT_VISITS_TABLE is not a valid table id");
+  if (botVisitsTable === table || botVisitsTable === activityTable) throw new ConfigError("BQ_BOT_VISITS_TABLE must differ from BQ_TABLE and BQ_ACTIVITY_TABLE");
+
+  let botVisitsDays = DEFAULT_BOT_VISITS_DAYS;
+  if (env.BQ_BOT_VISITS_DAYS !== undefined && env.BQ_BOT_VISITS_DAYS !== "") {
+    botVisitsDays = Number(env.BQ_BOT_VISITS_DAYS);
+    if (!Number.isInteger(botVisitsDays) || botVisitsDays < 1 || botVisitsDays > MAX_BOT_VISITS_DAYS) {
+      throw new ConfigError(`BQ_BOT_VISITS_DAYS must be a whole number from 1 to ${MAX_BOT_VISITS_DAYS}`);
+    }
+  }
+
   let maxPages = DEFAULT_MAX_PAGES;
   if (env.IDR_MAX_PAGES !== undefined && env.IDR_MAX_PAGES !== "") {
     maxPages = Number(env.IDR_MAX_PAGES);
@@ -71,6 +86,8 @@ export function readConfig(env) {
     dataset,
     table,
     activityTable,
+    botVisitsTable,
+    botVisitsDays,
     location,
     pageSize: PAGE_SIZE,
     maxPages,

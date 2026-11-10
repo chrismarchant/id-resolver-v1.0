@@ -12,6 +12,11 @@
  * Optional website route: POST /v1/events (contract event.v1, owner decision
  * D4), registered only when EVENTS_ENABLED=true (src/api/events.ts). It
  * stores browser events in browser_events only and never reaches the runner.
+ *
+ * Website route: POST /v1/bot-visits (contract bot-visit.v1), registered
+ * unless BOT_VISITS_ENABLED=false (src/api/bot-visits.ts). It stores one row
+ * per known bot or crawler request in bot_visits only and never reaches the
+ * runner.
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import rateLimit from "@fastify/rate-limit";
@@ -29,10 +34,12 @@ import {
   type ErrorResponse,
 } from "../contracts/api.js";
 import type { ReportingRepository } from "../contracts/db.js";
+import type { BotVisitRepository } from "../contracts/bot-visit.js";
 import type { EventRepository } from "../contracts/event.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
 import { canonicaliseIp } from "../ip/canonical.js";
 import { createCredentialChecker, createFailureLimiter } from "./auth.js";
+import { BOT_VISITS_ROUTE, registerBotVisitRoute } from "./bot-visits.js";
 import { EVENTS_ROUTE, registerEventRoute } from "./events.js";
 import { createCachedProbe, READINESS_CACHE_MS } from "./readiness.js";
 import { deriveFeedCursorKey, registerReportingRoutes, REPORTING_PREFIX } from "./reporting.js";
@@ -52,6 +59,8 @@ export interface ServerDeps {
   reporting?: ReportingRepository;
   /** Browser event store (event.v1). Required when EVENTS_ENABLED=true; POST /v1/events is registered only then. */
   events?: EventRepository;
+  /** Bot visit store (bot-visit.v1). POST /v1/bot-visits is registered only with it and BOT_VISITS_ENABLED; GET /v1/reporting/bot-visits only with it and reporting. */
+  botVisits?: BotVisitRepository;
   now?: () => number;
 }
 
@@ -160,9 +169,11 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // RATE_LIMIT_PER_MINUTE: their volume is driven by page activity that
     // anyone can generate through the site's public collector route, so it
     // must never exhaust the budget entrance resolution depends on.
+    // Bot visits (bot-visit.v1) likewise: their volume is set by crawlers.
     keyGenerator: (req) => {
       const matched = req.routeOptions?.url;
       if (isReportingRoute(matched)) return "reporting";
+      if (matched === BOT_VISITS_ROUTE) return "bot_visits";
       return matched === EVENTS_ROUTE ? "events" : "deployment";
     },
     addHeaders: { "x-ratelimit-limit": false, "x-ratelimit-remaining": false, "x-ratelimit-reset": false, "retry-after": true },
@@ -311,6 +322,20 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     });
   }
 
+  // bot-visit.v1: on unless BOT_VISITS_ENABLED=false, whenever a store is
+  // supplied (src/main.ts always supplies one). Website credential only; never
+  // reaches the runner, the cache, the company tables or the provider.
+  if (config.BOT_VISITS_ENABLED && deps.botVisits) {
+    registerBotVisitRoute(app, {
+      scope: { installationId: config.INSTALLATION_ID, websiteId: config.WEBSITE_ID },
+      botVisits: deps.botVisits,
+      logger,
+      now,
+      sendError,
+      statusOf: (error) => STATUS_BY_ERROR[error],
+    });
+  }
+
   if (deps.reporting && config.REPORTING_AUTH_TOKEN) {
     registerReportingRoutes(app, {
       scope: { installation_id: config.INSTALLATION_ID, website_id: config.WEBSITE_ID },
@@ -325,6 +350,7 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       // (docs/contracts/reporting-feed.v1.md, CHR-66 N1).
       feed: { cursorKey: deriveFeedCursorKey(config.IP_HMAC_SECRET) },
       usagePeriod: config.USAGE_PERIOD,
+      ...(deps.botVisits ? { botVisits: deps.botVisits } : {}),
     });
   }
 

@@ -1,4 +1,6 @@
 export { createIdrServerMiddleware, type IdrMiddlewareArgs } from "./middleware.js";
+export { createBotVisitMiddleware, type BotVisitMiddlewareArgs, type BotVisitOptions } from "./bot-visits.js";
+export { BOT_CATEGORIES, KNOWN_BOTS, matchBot, type BotCategory, type BotMatch, type KnownBot } from "./known-bots.js";
 export { buildEntrance, type BuildResult } from "./build.js";
 export { selectClientIp } from "./trust.js";
 export { DEFAULT_COLLECTOR_PATH } from "./collector-path.js";
@@ -7,6 +9,6 @@ export { classifyAcquisition, normalisePageKey, compileRouteTemplates, composePa
 export { parsePublicIp, type ParsedIp } from "./ip.js";
 export { checkConnectivity, type ConnectivityResult } from "./connectivity.js";
 export { resolveConfig, type IdrOptions, type ResolverDeliveryOptions, type DeliveryResult } from "./config.js";
-export { ACQUISITION_VALUES, ELIGIBILITY_RULE_SET_ID, ENTRANCE_CONTRACT, EVENT_CONTRACT, type Acquisition, type EntrancePayload, type EventPayload, type IpRejectReason, type IpSelection, type TrustPolicy } from "./types.js";
+export { ACQUISITION_VALUES, BOT_VISIT_CONTRACT, ELIGIBILITY_RULE_SET_ID, ENTRANCE_CONTRACT, EVENT_CONTRACT, type Acquisition, type BotVisitPayload, type EntrancePayload, type EventPayload, type IpRejectReason, type IpSelection, type TrustPolicy } from "./types.js";
 export { createCollectorRoute, COLLECTOR_MAX_BODY_BYTES, type CollectorConsentMode, type CollectorRouteHandler, type CollectorRouteOptions } from "./collector-route.js";
 export { EVENT_VOCABULARY, type EventName, type EventType } from "./vocabulary.js";

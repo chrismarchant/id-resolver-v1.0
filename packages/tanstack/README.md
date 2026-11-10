@@ -1,6 +1,6 @@
 # @salescrusader/idr-tanstack
 
-ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.0`, not published).
+ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.1`, not published).
 
 For each eligible **document request** the website's **server** reports one small, anonymous "entrance" to the
 resolver (`entrance.v1`). It never touches the page response, sets no cookie, adds no script and sends nothing from the
@@ -294,6 +294,63 @@ ops usage tooling) or your `onDeliveryResult` log: expect `delivered` with `reso
 **Fail-open.** In a preview deployment set `IDR_RESOLVER_URL` to an unreachable `https://resolver.invalid` (and, in a
 second pass, a wrong token). Pages must render exactly as before with unchanged timing, and the hook must show
 `dropped/network` (or `dropped/http_4xx`). Nothing else changes. Restore the real values afterwards.
+
+## Bot and crawler visits: `createBotVisitMiddleware` (optional)
+
+Records visits from known bots and crawlers for reporting, without changing anything for human visitors. Register
+it **before** the entrance middleware, with the same resolver URL, token and website id:
+
+```ts
+import { createStart, createMiddleware } from "@tanstack/react-start";
+import { createBotVisitMiddleware, createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+
+const resolver = () => ({
+  resolverUrl: process.env.IDR_RESOLVER_URL ?? "",
+  token: process.env.IDR_RESOLVER_TOKEN ?? "",
+  websiteId: process.env.IDR_WEBSITE_ID ?? "",
+});
+const bots = createMiddleware().server(createBotVisitMiddleware(resolver));
+const idr = createMiddleware().server(createIdrServerMiddleware(() => ({ ...resolver(), trustPolicy: { mode: "cloudflare" } })));
+
+export const startInstance = createStart(() => ({ requestMiddleware: [bots, idr] }));
+```
+
+**The bot list.** One list, `KNOWN_BOTS` in `src/known-bots.ts`; each entry has a name and a category. To add a bot,
+add one entry there (the resolver needs no change).
+
+| category | names |
+|---|---|
+| `ai_crawler` | GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-User, PerplexityBot, Perplexity-User, Google-Extended, Applebot-Extended, CCBot, Bytespider, Meta-ExternalAgent, Amazonbot |
+| `search_engine` | Googlebot, Bingbot, DuckDuckBot, YandexBot, Applebot |
+| `seo_tool` | AhrefsBot, SemrushBot, MJ12bot, DotBot |
+| `social_preview` | facebookexternalhit, LinkedInBot, Twitterbot, Slackbot, WhatsApp, Discordbot |
+| `monitoring` | UptimeRobot, Pingdom |
+| `other` | Generic bot, Generic crawler, Generic spider: any other product token ending in "bot", "crawler" or "spider" |
+
+Names match case-insensitively on a token boundary, in list order (so `Applebot-Extended` is tried before `Applebot`).
+`Google-Extended` and `Applebot-Extended` are robots.txt control tokens: Google and Apple crawl as `Googlebot` and
+`Applebot`, so those two entries normally match nothing. `matchBot(userAgent)` is exported for tests and tooling.
+
+**What is recorded.** A known bot's GET or HEAD request answered with 2xx or 304, as one `bot-visit.v1` row:
+`occurred_at`, `page_key` (path only, mapped exactly like entrances), `bot_name`, `bot_category` and
+`user_agent_family` (the one product token that identified the bot, without its version, e.g. `Googlebot-Image`).
+Never the IP, the full user agent, cookies or any other header. Not recorded: other methods, redirects and errors,
+server functions, framework paths, page resources (scripts, styles, images, fonts, media) and the collector route.
+robots.txt, sitemaps and llms.txt are recorded.
+
+**Human traffic is untouched.** For a request that is not a known bot the middleware only calls `next()` and returns
+its result: nothing is sent, no hook is called, and the entrance middleware after it sees exactly the same request.
+A bot request still reaches the entrance middleware, whose own bot rule (`tsa-1`) keeps known bots out of entrances.
+
+**Never slower.** The send is scheduled after `next()` returns, exactly like entrance reports: `waitUntil` where one
+exists (one retry), detached on Node, dropped on an edge isolate with neither. It never blocks: there is no
+`onUnsupportedBackground: "await"` for bot visits. At most `maxInFlight` (default 50) sends per instance; more are
+dropped. At the resolver, bot visits have their own rate-limit bucket and write slots, so a crawler burst cannot
+slow entrance resolution; an excess visit is dropped.
+
+`onDeliveryResult` receives a result for every bot request (never for other requests). Skips use the reasons
+`bot:method`, `bot:not_served`, `bot:internal_path`, `bot:resource`, `bot:collector_path` and `bot:bad_url`, plus the
+shared `config_invalid`, `no_background_context` and `overload`.
 
 ## Browser events: `createCollectorRoute` (optional)
 

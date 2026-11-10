@@ -10,10 +10,19 @@ styling, head/meta, or analytics code.
 1. Install the package: <PACKAGE_SOURCE>   (for example "@salescrusader/idr-tanstack" once published, or the tarball
    URL I give you). It has no dependencies.
 
-2. Open src/start.ts. Keep every existing request middleware and add this one to the requestMiddleware array:
+2. Open src/start.ts. Keep every existing request middleware and add these two to the end of the requestMiddleware
+   array, bots first, then idr:
 
    import { createMiddleware } from "@tanstack/react-start";
-   import { createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+   import { createBotVisitMiddleware, createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+
+   const bots = createMiddleware().server(
+     createBotVisitMiddleware(() => ({
+       resolverUrl: process.env.IDR_RESOLVER_URL ?? "",
+       token: process.env.IDR_RESOLVER_TOKEN ?? "",
+       websiteId: process.env.IDR_WEBSITE_ID ?? "",
+     })),
+   );
 
    const idr = createMiddleware().server(
      createIdrServerMiddleware(() => ({
@@ -24,7 +33,7 @@ styling, head/meta, or analytics code.
      })),
    );
 
-   If src/start.ts does not exist, create it with createStart(() => ({ requestMiddleware: [idr] })).
+   If src/start.ts does not exist, create it with createStart(() => ({ requestMiddleware: [bots, idr] })).
 
 3. Add three SERVER-ONLY environment variables (no VITE_ prefix, never referenced from client code, never logged):
    IDR_RESOLVER_URL = <RESOLVER_URL>

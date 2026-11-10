@@ -26,6 +26,7 @@ import { createProvider } from "./provider/index.js";
 import { HostingRangesError, loadHostingRanges } from "./ip/hosting-ranges.js";
 import { buildServer } from "./api/server.js";
 import { EVENT_WRITES_MAX_IN_FLIGHT } from "./api/events.js";
+import { BOT_VISIT_WRITES_MAX_IN_FLIGHT } from "./api/bot-visits.js";
 import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner.js";
 import { createMaintenance } from "./runtime/maintenance.js";
 import { installProcessGuards } from "./runtime/process-guards.js";
@@ -48,6 +49,7 @@ async function main(): Promise<void> {
     ready: safe["REPORTING_ENABLED"] === true,
     events_enabled: config.EVENTS_ENABLED,
     event_consent_mode: config.EVENT_CONSENT_MODE,
+    bot_visits_enabled: config.BOT_VISITS_ENABLED,
     tls_mode: config.DATABASE_SSL,
     db_role: config.DATABASE_RUNTIME_PASSWORD !== undefined ? "runtime" : "owner",
     hosting_ranges_mode: config.HOSTING_RANGES_MODE,
@@ -56,8 +58,9 @@ async function main(): Promise<void> {
   // Dev-only overrides (names only): "active" relaxes a production control now, "inert" is set without effect.
   for (const o of configOverrides(config)) logger.warn("config_override", { variable: o.variable, outcome: o.state });
 
-  // Browser-event writes (event.v1) get their own connections when enabled, so they never compete with resolution jobs.
-  const eventWriteSlots = config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0;
+  // Browser-event writes (event.v1) and bot-visit writes (bot-visit.v1) get their own connections when
+  // enabled, so they never compete with resolution jobs.
+  const eventWriteSlots = (config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0) + (config.BOT_VISITS_ENABLED ? BOT_VISIT_WRITES_MAX_IN_FLIGHT : 0);
   // Role separation: with DATABASE_RUNTIME_PASSWORD the service logs in as the
   // least-privilege runtime role (same host and database as DATABASE_URL);
   // DATABASE_URL's own user (the owner) is used only by migrate and ops.
@@ -102,7 +105,7 @@ async function main(): Promise<void> {
     // a job still running there means the process state can no longer be trusted.
     onStuck: () => guards.fatal("job_stuck"),
   });
-  const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting, events: db.events });
+  const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting, events: db.events, botVisits: db.botVisits });
 
   // Expired cache rows, browser events and observation retention (the bounded
   // sync buffer, D3), drained in bounded batches within a per-run budget.
@@ -114,6 +117,9 @@ async function main(): Promise<void> {
     // Browser events (event.v1) share the observation window; pruned even while
     // EVENTS_ENABLED=false, so rows from an earlier enabled period still age out.
     pruneEventsBefore: (cutoff, limit) => db.events.pruneBefore(cutoff, limit),
+    // Bot visits (bot-visit.v1) share the same window and the events' share of the budget;
+    // pruned even while BOT_VISITS_ENABLED=false.
+    pruneBotVisitsBefore: (cutoff, limit) => db.botVisits.pruneBefore(cutoff, limit),
     logger,
     batch: config.CACHE_PRUNE_BATCH,
     retentionDays: config.OBSERVATION_RETENTION_DAYS,
