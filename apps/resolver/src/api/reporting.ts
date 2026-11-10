@@ -11,6 +11,10 @@
  * UTC calendar dates, converted to the half-open instant range
  * [from 00:00:00Z, to + 1 day 00:00:00Z); at most REPORTING_MAX_RANGE_DAYS days.
  *
+ * Browser events (event.v1, GET /v1/reporting/events) likewise, only when an
+ * event store is supplied: events are read from browser_events alone and are
+ * never joined to company data (owner decision D4).
+ *
  * Bot visits (bot-visit.v1, GET /v1/reporting/bot-visits) are registered only
  * when a bot visit store is supplied: one date range of at most
  * BOT_VISITS_MAX_RANGE_DAYS, keyset-paginated on (observed_at, id).
@@ -34,6 +38,8 @@ import {
   type ReportingActivityResponse,
   type ReportingBotVisit,
   type ReportingBotVisitsResponse,
+  type ReportingBrowserEvent,
+  type ReportingEventsResponse,
   type ReportingScope,
   type ReportingSummaryResponse,
   type ResolutionStatus,
@@ -67,11 +73,13 @@ import {
 } from "../contracts/reporting-feed.js";
 import type { Logger } from "../log/index.js";
 import type { BotVisitCursor, BotVisitRepository, StoredBotVisit } from "../contracts/bot-visit.js";
-import { ActivityQuerySchema, BOT_VISITS_MAX_RANGE_DAYS, BotVisitsQuerySchema, CompaniesQuerySchema, CompanyIdParamSchema, ObservationsQuerySchema, SummaryQuerySchema } from "./schema.js";
+import type { BrowserEventCursor, EventRepository, StoredBrowserEvent } from "../contracts/event.js";
+import { ActivityQuerySchema, BOT_VISITS_MAX_RANGE_DAYS, BotVisitsQuerySchema, EventsQuerySchema, CompaniesQuerySchema, CompanyIdParamSchema, ObservationsQuerySchema, SummaryQuerySchema } from "./schema.js";
 
 export const REPORTING_PREFIX = "/v1/reporting";
 export const FEED_ROUTE = `${REPORTING_PREFIX}/observations`;
 export const BOT_VISITS_REPORTING_ROUTE = `${REPORTING_PREFIX}/bot-visits`;
+export const EVENTS_REPORTING_ROUTE = `${REPORTING_PREFIX}/events`;
 
 export interface ReportingFeedOptions {
   /** 32-byte key for the cursor MAC; derive it with deriveFeedCursorKey from a server-only secret. */
@@ -89,6 +97,8 @@ export interface ReportingDeps {
   usagePeriod: "day" | "month";
   /** Enables GET /v1/reporting/bot-visits. Absent: the route does not exist. */
   botVisits?: BotVisitRepository;
+  /** Enables GET /v1/reporting/events (browser events, read-only). Absent: the route does not exist. */
+  events?: Pick<EventRepository, "list">;
 }
 
 export function activityPeriodWire(p: UsagePeriodActivity): ReportingActivityPeriod {
@@ -187,6 +197,22 @@ function toBotVisit(v: StoredBotVisit): ReportingBotVisit {
     bot_category: v.botCategory,
     user_agent_family: v.userAgentFamily,
   };
+}
+
+export function eventsCursorFrom(raw: string | undefined): BrowserEventCursor | null | undefined {
+  const c = decodeCursor(raw, ["t", "e"]);
+  if (!c) return c;
+  const t = cursorInstant(c["t"]!);
+  if (!t || c["e"]! < 1) return undefined;
+  return { occurredAt: t, id: c["e"]! };
+}
+
+export function encodeEventsCursor(e: { occurredAt: Date; id: number }): string {
+  return encodeCursor({ t: e.occurredAt.getTime(), e: e.id });
+}
+
+function toBrowserEvent(e: StoredBrowserEvent): ReportingBrowserEvent {
+  return { occurred_at: e.occurredAt.toISOString(), page_key: e.pageKey, type: e.type, name: e.name, consent: e.consent };
 }
 
 // ---- date ranges -----------------------------------------------------------
@@ -495,6 +521,38 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
           to: q.data.to,
           items: page.map(toBotVisit),
           next_cursor: more && last ? encodeBotVisitsCursor(last) : null,
+        };
+        logger.info("request_completed", { route, http_status: 200, count: body.items.length });
+        return reply.code(200).send(body);
+      } catch {
+        return dbFailed(reply, route);
+      }
+    });
+  }
+
+  if (deps.events) {
+    const events = deps.events;
+    app.get(EVENTS_REPORTING_ROUTE, async (req, reply) => {
+      const route = EVENTS_REPORTING_ROUTE;
+      const q = EventsQuerySchema.safeParse(req.query ?? {});
+      if (!q.success) return rejected(reply, route, "invalid_request", 400);
+      const range = dateRange(q.data.from, q.data.to);
+      if (!range || range.to.getTime() - range.from.getTime() > BOT_VISITS_MAX_RANGE_DAYS * DAY_MS) return rejected(reply, route, "invalid_request", 400);
+      const after = eventsCursorFrom(q.data.cursor);
+      if (after === undefined) return rejected(reply, route, "invalid_request", 400);
+      try {
+        // One extra row tells whether another page exists.
+        const rows = await events.list({ installationId: scope.installation_id, websiteId: scope.website_id }, range, { ...(after ? { after } : {}), limit: q.data.limit + 1 });
+        const more = rows.length > q.data.limit;
+        const page = more ? rows.slice(0, q.data.limit) : rows;
+        const last = page[page.length - 1];
+        const body: ReportingEventsResponse = {
+          version: REPORTING_API_VERSION,
+          scope,
+          from: q.data.from,
+          to: q.data.to,
+          items: page.map(toBrowserEvent),
+          next_cursor: more && last ? encodeEventsCursor(last) : null,
         };
         logger.info("request_completed", { route, http_status: 200, count: body.items.length });
         return reply.code(200).send(body);

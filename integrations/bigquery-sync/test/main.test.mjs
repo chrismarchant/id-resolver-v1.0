@@ -11,7 +11,7 @@ const fast = { pollMs: 0, sleep: async () => {} };
 function world({ feedStatus = 200, items = [observation(1, 7), observation(2, 8)], activityStatus = 200, activity = [activityItem("2026-11-04"), activityItem("2026-11-05")], botTableModified = Date.parse("2026-11-06T00:30:00Z") } = {}) {
   return recordingFetch(({ url }) => {
     if (url.startsWith("https://resolver.example.test/v1/reporting/activity")) return activityStatus === 200 ? json(200, activityBody(activity)) : json(activityStatus, {});
-    if (url.endsWith("/datasets/idr/tables/bot_visits")) return json(200, { lastModifiedTime: String(botTableModified) });
+    if (url.endsWith("/datasets/idr/tables/bot_visits") || url.endsWith("/datasets/idr/tables/browser_events")) return json(200, { lastModifiedTime: String(botTableModified) });
     if (url.startsWith("https://resolver.example.test/")) return feedStatus === 200 ? json(200, page(items)) : json(feedStatus, {});
     if (url === METADATA_TOKEN_URL) return json(200, { access_token: "ya29.x" });
     if (url.includes("uploadType=multipart") || url.endsWith("/jobs")) return json(200, {});
@@ -23,8 +23,9 @@ test("a successful run logs counts only", async () => {
   const logs = [];
   const fetch = world();
   const result = await run({ env: ENV, fetch, log: (e) => logs.push(e), now: () => new Date("2026-11-06T10:00:00Z"), bigQueryOptions: fast });
-  assert.deepEqual(result, { ok: true, rows: 2, activity_rows: 2, bot_visit_rows: null });
-  assert.equal(logs.length, 3);
+  assert.deepEqual(result, { ok: true, rows: 2, activity_rows: 2, bot_visit_rows: null, event_rows: null });
+  assert.equal(logs.length, 4);
+  assert.deepEqual([logs[3].event, logs[3].outcome, logs[3].reason], ["idr_bigquery_events_sync", "skipped", "already_synced_today"]);
   assert.deepEqual([logs[2].event, logs[2].outcome, logs[2].reason], ["idr_bigquery_bot_visits_sync", "skipped", "already_synced_today"]);
   assert.equal(logs[0].outcome, "ok");
   assert.equal(logs[0].rows, 2);
@@ -80,7 +81,7 @@ test("a resolver without the activity route still syncs visits and succeeds", as
   const logs = [];
   const fetch = world({ activityStatus: 404 });
   const result = await run({ env: ENV, fetch, log: (e) => logs.push(e), now: () => new Date("2026-11-06T10:00:00Z"), bigQueryOptions: fast });
-  assert.deepEqual(result, { ok: true, rows: 2, activity_rows: null, bot_visit_rows: null });
+  assert.deepEqual(result, { ok: true, rows: 2, activity_rows: null, bot_visit_rows: null, event_rows: null });
   assert.deepEqual([logs[1].outcome, logs[1].reason], ["skipped", "activity_route_not_deployed"]);
   assert.equal(loads(fetch).length, 1);
 });

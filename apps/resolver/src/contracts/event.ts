@@ -70,6 +70,22 @@ export interface BrowserEventRecord {
   occurredAt: Date;
 }
 
+/** One stored event as the reporting API returns it: no event_id, installation or website id. */
+export interface StoredBrowserEvent {
+  id: number;
+  occurredAt: Date;
+  pageKey: string;
+  type: string;
+  name: string;
+  consent: EventConsent;
+}
+
+/** Keyset position: rows strictly after (occurred_at, id). */
+export interface BrowserEventCursor {
+  occurredAt: Date;
+  id: number;
+}
+
 /**
  * Persistence for browser events. The implementation (src/db/event-repo.ts)
  * issues statements on `browser_events` only.
@@ -77,6 +93,8 @@ export interface BrowserEventRecord {
 export interface EventRepository {
   /** Inserts the event once per (installation, website, event_id). true when this call stored it, false for a repeat. */
   record(event: BrowserEventRecord): Promise<boolean>;
+  /** Events that occurred in [from, to), ordered by (occurred_at, id), strictly after `after` when given. Reporting only. */
+  list(scope: { installationId: string; websiteId: string }, range: { from: Date; to: Date }, page: { after?: BrowserEventCursor; limit: number }): Promise<StoredBrowserEvent[]>;
   /** One bounded retention batch: deletes at most `limit` events received before `cutoff`. Returns rows deleted. */
   pruneBefore(cutoff: Date, limit: number): Promise<number>;
 }
