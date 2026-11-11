@@ -191,7 +191,12 @@ describe("real stack: the probe app under local workerd (G5-D-F1)", () => {
       sink.listen(SINK_PORT, "127.0.0.1", () => resolve());
     });
     const port = await freePort();
-    const wrangler = spawn(join(probeDir, "node_modules", ".bin", "wrangler"), ["dev", "-c", ".output/server/wrangler.json", "--port", String(port), "--ip", "127.0.0.1", "--local"], {
+    // The build stamps today's date as the Worker's compatibility date, but the pinned workerd binary only accepts
+    // dates up to its own release, so from the day after that the Worker would refuse to start. Run it at the date
+    // the pinned workerd package declares instead: it moves only when the probe's wrangler pin moves.
+    const workerdDate = (createRequire(join(probeDir, "package.json"))("workerd") as { compatibilityDate: string }).compatibilityDate;
+    expect(workerdDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    const wrangler = spawn(join(probeDir, "node_modules", ".bin", "wrangler"), ["dev", "-c", ".output/server/wrangler.json", "--compatibility-date", workerdDate, "--port", String(port), "--ip", "127.0.0.1", "--local"], {
       cwd: probeDir,
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
