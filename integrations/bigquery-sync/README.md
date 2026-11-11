@@ -89,7 +89,7 @@ This table is loaded **daily**, not every run. The first run after 00:15 UTC (vi
 
 ## Browser events
 
-`<dataset>.browser_events`, one row per event from the website's own consent-gated collector (`@salescrusader/idr-collector` through the site's `/idr/e` route, `event.v1`), partitioned by day on `occurred_at` and clustered by `event_type`, `event_name`:
+`<dataset>.browser_events`, one row per event from the website's own consent-gated collector (`@id-resolver/collector` through the site's `/idr/e` route, `event.v1`), partitioned by day on `occurred_at` and clustered by `event_type`, `event_name`:
 
 | column | type | notes |
 | --- | --- | --- |

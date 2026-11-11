@@ -26,9 +26,9 @@ function walk(dir: string): string[] {
 describe("package hygiene", () => {
   const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as Record<string, unknown>;
 
-  it("is the unpublished 0.1.0-dev.1 package with zero runtime dependencies", () => {
-    expect(pkg["name"]).toBe("@salescrusader/idr-tanstack");
-    expect(pkg["version"]).toBe("0.1.0-dev.1");
+  it("is the unpublished 0.1.0-dev.2 package with zero runtime dependencies", () => {
+    expect(pkg["name"]).toBe("@id-resolver/tanstack");
+    expect(pkg["version"]).toBe("0.1.0-dev.2");
     expect(pkg["private"]).toBe(true);
     expect(pkg["dependencies"]).toBeUndefined();
     expect(pkg["peerDependencies"]).toBeUndefined();

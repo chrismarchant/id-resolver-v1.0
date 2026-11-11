@@ -1,8 +1,8 @@
-# @salescrusader/idr-collector
+# @id-resolver/collector
 
-Optional browser collector for ID Resolver V1 (version `0.1.0-dev.0`, not published). It sends a small, closed set
+Optional browser collector for ID Resolver V1 (version `0.1.0-dev.1`, not published). It sends a small, closed set
 of page events to **your own website's first-party route**. That route is `createCollectorRoute` in
-`@salescrusader/idr-tanstack`. The website server checks each event and forwards it to the resolver with its own
+`@id-resolver/tanstack`. The website server checks each event and forwards it to the resolver with its own
 server-held token.
 
 * It is not needed for company resolution. The server adapter works without it.
@@ -53,20 +53,20 @@ Treat what this collector produces as **indicative, aggregate telemetry, never a
 
 ## Install
 
-Until the package is published, install the packed tarball (`npm pack -w @salescrusader/idr-collector`) or use a
+Until the package is published, install the packed tarball (`npm pack -w @id-resolver/collector`) or use a
 workspace path. Bundle it into your own client JavaScript. It is then served from your own origin
 (`script-src 'self'`). There is no CDN or third-party host. For a site without a bundler, the build also writes a
-self-hostable `dist/idr-collector.min.js` (exported as `@salescrusader/idr-collector/idr-collector.min.js`).
+self-hostable `dist/idr-collector.min.js` (exported as `@id-resolver/collector/idr-collector.min.js`).
 
 ## Use
 
-Add the server route first (see the `createCollectorRoute` section of the `@salescrusader/idr-tanstack` README),
+Add the server route first (see the `createCollectorRoute` section of the `@id-resolver/tanstack` README),
 for example at `/idr/e`. Then start the collector once on the client:
 
 ```tsx
 // TanStack Start: src/routes/__root.tsx (client side only: useEffect does not run during SSR)
 import { useEffect } from "react";
-import { initCollector } from "@salescrusader/idr-collector";
+import { initCollector } from "@id-resolver/collector";
 
 function useIdrCollector() {
   useEffect(() => {
@@ -198,8 +198,8 @@ How this is verified:
 
 ```bash
 npm install --ignore-scripts                      # at the repository root
-npm run verify -w @salescrusader/idr-collector    # typecheck + tests (happy-dom, size budget, CSP scan, Chrome if present)
-npm run build -w @salescrusader/idr-collector     # dist/ (tsc) + dist/idr-collector.min.js (esbuild), prints the gzip size
+npm run verify -w @id-resolver/collector    # typecheck + tests (happy-dom, size budget, CSP scan, Chrome if present)
+npm run build -w @id-resolver/collector     # dist/ (tsc) + dist/idr-collector.min.js (esbuild), prints the gzip size
 ```
 
 Dev dependencies: `esbuild` (the build and the size test; already in the repository's lockfile through `tsx`),

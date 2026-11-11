@@ -82,9 +82,9 @@ describe("privacy static scan of the shipped bundle", () => {
 describe("package hygiene", () => {
   const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as Record<string, unknown>;
 
-  it("is the unpublished 0.1.0-dev.0 browser ESM package with zero runtime dependencies", () => {
-    expect(pkg["name"]).toBe("@salescrusader/idr-collector");
-    expect(pkg["version"]).toBe("0.1.0-dev.0");
+  it("is the unpublished 0.1.0-dev.1 browser ESM package with zero runtime dependencies", () => {
+    expect(pkg["name"]).toBe("@id-resolver/collector");
+    expect(pkg["version"]).toBe("0.1.0-dev.1");
     expect(pkg["private"]).toBe(true);
     expect(pkg["type"]).toBe("module");
     expect(pkg["sideEffects"]).toBe(false);

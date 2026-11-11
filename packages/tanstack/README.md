@@ -1,6 +1,6 @@
-# @salescrusader/idr-tanstack
+# @id-resolver/tanstack
 
-ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.1`, not published).
+ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.2`, not published).
 
 For each eligible **document request** the website's **server** reports one small, anonymous "entrance" to the
 resolver (`entrance.v1`). It never touches the page response, sets no cookie, adds no script and sends nothing from the
@@ -19,11 +19,11 @@ Optional: `createCollectorRoute` is the first-party route for the browser collec
 
 ## Install
 
-The package is not published yet. Until it is, install the packed tarball (`npm pack -w @salescrusader/idr-tanstack`
+The package is not published yet. Until it is, install the packed tarball (`npm pack -w @id-resolver/tanstack`
 from this repository) or a workspace path. Then:
 
 ```bash
-npm install @salescrusader/idr-tanstack
+npm install @id-resolver/tanstack
 ```
 
 ## Server-only environment variables
@@ -42,7 +42,7 @@ in the page, in logs or in analytics.
 
 ```ts
 import { createStart, createMiddleware } from "@tanstack/react-start";
-import { createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+import { createIdrServerMiddleware } from "@id-resolver/tanstack";
 
 const idr = createMiddleware().server(
   // A function: read at the first request, when Workers bindings exist.
@@ -193,7 +193,7 @@ Where you know your routes, add your own mapper. The default still runs after it
 is never sent raw:
 
 ```ts
-import { compileRouteTemplates } from "@salescrusader/idr-tanstack";
+import { compileRouteTemplates } from "@id-resolver/tanstack";
 
 createIdrServerMiddleware({
   // ...
@@ -276,7 +276,7 @@ normal mock lookup.)
 
 ```js
 // check-idr.mjs   run: node --env-file=.env.local check-idr.mjs   (never commit the env file)
-import { checkConnectivity } from "@salescrusader/idr-tanstack";
+import { checkConnectivity } from "@id-resolver/tanstack";
 const r = await checkConnectivity({
   resolverUrl: process.env.IDR_RESOLVER_URL, token: process.env.IDR_RESOLVER_TOKEN,
   websiteId: process.env.IDR_WEBSITE_ID, trustPolicy: { mode: "none" },
@@ -302,7 +302,7 @@ it **before** the entrance middleware, with the same resolver URL, token and web
 
 ```ts
 import { createStart, createMiddleware } from "@tanstack/react-start";
-import { createBotVisitMiddleware, createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+import { createBotVisitMiddleware, createIdrServerMiddleware } from "@id-resolver/tanstack";
 
 const resolver = () => ({
   resolverUrl: process.env.IDR_RESOLVER_URL ?? "",
@@ -354,7 +354,7 @@ shared `config_invalid`, `no_background_context` and `overload`.
 
 ## Browser events: `createCollectorRoute` (optional)
 
-The optional browser collector (`@salescrusader/idr-collector`) sends a closed set of page events to a
+The optional browser collector (`@id-resolver/collector`) sends a closed set of page events to a
 **first-party route on your own site**. `createCollectorRoute` is that route. It checks each event and forwards it
 to the resolver's `POST /v1/events` (contract `event.v1`, `docs/contracts/event.v1.md`) with the server-held token,
 on the same non-blocking path as the entrance middleware. Browser events are stored with `origin=browser` and are
@@ -374,7 +374,7 @@ billing decisions.
 ```ts
 // src/routes/idr.e.ts  ->  POST /idr/e   (the same path as the collector's `endpoint` and `collectorPath`)
 import { createFileRoute } from "@tanstack/react-router";
-import { createCollectorRoute } from "@salescrusader/idr-tanstack";
+import { createCollectorRoute } from "@id-resolver/tanstack";
 
 export const Route = createFileRoute("/idr/e")({
   server: {
@@ -516,7 +516,7 @@ trustPolicy)`, `isEligible(request, rules, collectorPath?)` (`collectorPath` def
 
 ```bash
 npm install --ignore-scripts                     # at the repository root (registers the workspace)
-npm run verify -w @salescrusader/idr-tanstack    # typecheck + tests
+npm run verify -w @id-resolver/tanstack    # typecheck + tests
 ```
 
 The bundle-safety test builds `verification/cf-lifecycle` (its own lockfile; install it with

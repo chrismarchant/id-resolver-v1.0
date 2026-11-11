@@ -23,9 +23,9 @@ does not change the wire.
 ## Flow
 
 ```
-Browser (@salescrusader/idr-collector)
+Browser (@id-resolver/collector)
   ── POST same-origin first-party route (no credentials, no cookies needed) ──▶
-Website server (@salescrusader/idr-tanstack createCollectorRoute)
+Website server (@id-resolver/tanstack createCollectorRoute)
   checks Origin and Sec-Fetch-Site, size, rate, replay window, vocabulary and consent policy
   normalises page_key with the site's page-key mapper; drops every other field
   ── POST /v1/events with the server-held website token (non-blocking) ──▶
