@@ -10,6 +10,7 @@
 // CF-Connecting-IP or X-Real-IP carrying the visitor's IP). Nothing here supports a D4 transport-isolation claim;
 // the staging test T5 on the real edge decides (docs/staging/CLOUDFLARE_TEST_SITE.md, section 4).
 import http from "node:http";
+import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,10 +34,13 @@ const sink = http.createServer((req, res) => {
 });
 if (SINK_MODE !== "down") await new Promise((r) => sink.listen(SINK_PORT, "127.0.0.1", r));
 
+// The build stamps today's date as the Worker's compatibility date; the pinned workerd binary only accepts dates up to
+// its own release, so run the Worker at the date the pinned workerd package declares (see test/hygiene.test.ts).
+const WORKERD_DATE = TARGET === "node" ? "" : createRequire(import.meta.url)("workerd").compatibilityDate;
 const cmd =
   TARGET === "node"
     ? ["node", [".output/server/index.mjs"]]
-    : ["npx", ["wrangler", "dev", "-c", ".output/server/wrangler.json", "--port", String(APP_PORT), "--ip", "127.0.0.1", "--local", "--var", "IDR_ENV_PROBE:present"]];
+    : ["npx", ["wrangler", "dev", "-c", ".output/server/wrangler.json", "--compatibility-date", WORKERD_DATE, "--port", String(APP_PORT), "--ip", "127.0.0.1", "--local", "--var", "IDR_ENV_PROBE:present"]];
 const wr = spawn(cmd[0], cmd[1], {
   stdio: ["ignore", "pipe", "pipe"],
   detached: true,
