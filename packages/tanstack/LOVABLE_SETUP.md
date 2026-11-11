@@ -7,14 +7,14 @@ or into any file**: add it only through Lovable's secrets/environment UI for ser
 Add server-side visit reporting to this TanStack Start project. Keep it minimal and do not touch any route, component,
 styling, head/meta, or analytics code.
 
-1. Install the package: <PACKAGE_SOURCE>   (for example "@salescrusader/idr-tanstack" once published, or the tarball
+1. Install the package: <PACKAGE_SOURCE>   (for example "@id-resolver/tanstack" once published, or the tarball
    URL I give you). It has no dependencies.
 
 2. Open src/start.ts. Keep every existing request middleware and add these two to the end of the requestMiddleware
    array, bots first, then idr:
 
    import { createMiddleware } from "@tanstack/react-start";
-   import { createBotVisitMiddleware, createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+   import { createBotVisitMiddleware, createIdrServerMiddleware } from "@id-resolver/tanstack";
 
    const bots = createMiddleware().server(
      createBotVisitMiddleware(() => ({
@@ -44,7 +44,7 @@ styling, head/meta, or analytics code.
    no logging of IP addresses, headers or the token. Do not wrap or modify the value returned by next().
 
 5. Run the build and confirm: pages render exactly as before, the production build succeeds, and
-   "IDR_RESOLVER_TOKEN" and "@salescrusader/idr-tanstack" do not appear in any file under the client output
+   "IDR_RESOLVER_TOKEN" and "@id-resolver/tanstack" do not appear in any file under the client output
    (for example grep the built client assets). Report the diff.
 ```
 

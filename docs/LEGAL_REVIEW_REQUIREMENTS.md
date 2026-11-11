@@ -13,7 +13,7 @@
 ```
 Visitor's browser
   │  (1) page request: the network address (IP) reaches the website's host/CDN as for any web page
-  │  (2) optional: browser events (@salescrusader/idr-collector), same-origin, consent-gated
+  │  (2) optional: browser events (@id-resolver/collector), same-origin, consent-gated
   ▼
 Client website (TanStack Start), hosted by the client or its host (for example Cloudflare)
   │  server adapter: picks the trusted client IP, builds an entrance (entrance.v1)

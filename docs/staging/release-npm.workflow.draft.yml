@@ -1,5 +1,5 @@
-# DRAFT, NOT ACTIVE. Proposed npm release workflow for @salescrusader/idr-collector and
-# @salescrusader/idr-tanstack (owner decision D5). It lives under docs/staging/ on purpose: GitHub runs only files
+# DRAFT, NOT ACTIVE. Proposed npm release workflow for @id-resolver/collector and
+# @id-resolver/tanstack (owner decision D5). It lives under docs/staging/ on purpose: GitHub runs only files
 # in .github/workflows/. Activating it is an owner decision that needs the prerequisites in docs/NPM_PUBLISHING.md
 # (npm org and 2FA, a trusted publisher per package pointing at this file name and the environment below, the
 # GitHub environment with the owner as required reviewer, a tag ruleset). To activate: copy it to
@@ -62,8 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$TAG" in
-            idr-collector-v*) ws="@salescrusader/idr-collector"; dir="packages/collector"; v="${TAG#idr-collector-v}" ;;
-            idr-tanstack-v*)  ws="@salescrusader/idr-tanstack";  dir="packages/tanstack";  v="${TAG#idr-tanstack-v}" ;;
+            idr-collector-v*) ws="@id-resolver/collector"; dir="packages/collector"; v="${TAG#idr-collector-v}" ;;
+            idr-tanstack-v*)  ws="@id-resolver/tanstack";  dir="packages/tanstack";  v="${TAG#idr-tanstack-v}" ;;
             *) echo "unexpected tag"; exit 1 ;;
           esac
           [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "the tag does not end in a semver"; exit 1; }
@@ -150,10 +150,10 @@ jobs:
           node -e '
             const j = JSON.parse(require("fs").readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"))[0];
             const allow = {
-              "@salescrusader/idr-collector": [/^(README\.md|LICENSE|package\.json)$/, /^dist\/(index|vocabulary)\.(js|d\.ts)$/, /^dist\/idr-collector\.min\.js$/],
-              "@salescrusader/idr-tanstack": [/^(README\.md|LICENSE|LOVABLE_SETUP\.md|package\.json)$/, /^dist\/[a-z-]+\.(js|d\.ts)$/],
+              "@id-resolver/collector": [/^(README\.md|LICENSE|package\.json)$/, /^dist\/(index|vocabulary)\.(js|d\.ts)$/, /^dist\/idr-collector\.min\.js$/],
+              "@id-resolver/tanstack": [/^(README\.md|LICENSE|LOVABLE_SETUP\.md|package\.json)$/, /^dist\/[a-z-]+\.(js|d\.ts)$/],
             }[j.name];
-            const budget = { "@salescrusader/idr-collector": 20000, "@salescrusader/idr-tanstack": 60000 }[j.name];
+            const budget = { "@id-resolver/collector": 20000, "@id-resolver/tanstack": 60000 }[j.name];
             const bad = j.files.map((f) => f.path).filter((p) => !allow.some((re) => re.test(p)));
             const problems = [];
             if (j.name !== process.env.WS) problems.push("name");

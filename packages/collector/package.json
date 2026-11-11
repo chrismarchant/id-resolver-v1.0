@@ -1,6 +1,6 @@
 {
-  "name": "@salescrusader/idr-collector",
-  "version": "0.1.0-dev.0",
+  "name": "@id-resolver/collector",
+  "version": "0.1.0-dev.1",
   "private": true,
   "description": "ID Resolver V1 optional browser collector: consent-gated, closed-vocabulary events sent to the website's own first-party route. No identifiers, no cookies, no storage, no form values.",
   "license": "UNLICENSED",

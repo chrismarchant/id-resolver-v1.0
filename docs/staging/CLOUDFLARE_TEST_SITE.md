@@ -5,8 +5,8 @@ write it. Every provisioning and credential step below is an **owner action** an
 approval (see [README.md](README.md)). Placeholders such as `<STAGING_ZONE>` are filled in privately, never in
 this public repository.
 
-Purpose: run the server adapter (`@salescrusader/idr-tanstack`) and the browser collector
-(`@salescrusader/idr-collector`) on the **Cloudflare production edge**, which the Gate 2 and Gate 4 work could only
+Purpose: run the server adapter (`@id-resolver/tanstack`) and the browser collector
+(`@id-resolver/collector`) on the **Cloudflare production edge**, which the Gate 2 and Gate 4 work could only
 emulate with local workerd (`packages/tanstack/verification/RESULTS.md`, "Not verified here"). The test site is
 disposable: it exists for the test runs and is torn down afterwards (section 9).
 
@@ -65,7 +65,7 @@ paid enrichment (the development resolver uses the mock provider only, owner dec
   environment-driven files in Appendix A. It lives outside this repository (a private scratch directory or a
   private repository of the owner), because it holds deployment configuration.
 * **Packages under test.** Until D5 publication, the tarballs of the commit under test:
-  `npm pack -w @salescrusader/idr-tanstack` and `npm pack -w @salescrusader/idr-collector`, installed with
+  `npm pack -w @id-resolver/tanstack` and `npm pack -w @id-resolver/collector`, installed with
   `npm install ./<tarball>`. Record the commit and the SHA-256 of each tarball with the results.
 * **Build.** `npm ci --ignore-scripts && npm run build` produces `.output/` and
   `.output/server/wrangler.json` (`compatibility_flags: ["nodejs_compat"]`, `no_bundle: true`). Before deploying,
@@ -378,7 +378,7 @@ Placeholders only. These files replace the probe's `src/start.ts`, `src/routes/i
 
 ```ts
 import { createStart, createMiddleware } from "@tanstack/react-start";
-import { createIdrServerMiddleware } from "@salescrusader/idr-tanstack";
+import { createIdrServerMiddleware } from "@id-resolver/tanstack";
 
 const idr = createMiddleware().server(
   createIdrServerMiddleware(() => ({
@@ -425,7 +425,7 @@ the stand-in for a consent platform):
 
 ```ts
 import { createFileRoute } from "@tanstack/react-router";
-import { createCollectorRoute } from "@salescrusader/idr-tanstack";
+import { createCollectorRoute } from "@id-resolver/tanstack";
 
 export const Route = createFileRoute("/idr/e")({
   server: {
@@ -451,7 +451,7 @@ which only the site's hooks read, never the collector):
 ```tsx
 import { useEffect, useState } from "react";
 import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
-import { initCollector } from "@salescrusader/idr-collector";
+import { initCollector } from "@id-resolver/collector";
 
 const listeners = new Set<(granted: boolean) => void>();
 const granted = () => /(?:^|;\s*)staging_consent=granted(?:;|$)/.test(document.cookie);

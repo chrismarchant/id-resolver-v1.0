@@ -10,7 +10,7 @@ this public repository.
 |---|---|
 | [CLOUDFLARE_TEST_SITE.md](CLOUDFLARE_TEST_SITE.md) | disposable Cloudflare (and optionally Lovable-hosted) test site: infrastructure, **G4-I8**, test plan T1 to T12, acceptance, teardown, cost |
 | [SUPABASE_HOSTED_TEST.md](SUPABASE_HOSTED_TEST.md) | disposable hosted Supabase project: infrastructure, SQL apply method, test plan H0 to H15 mapped to the local limitations, acceptance, teardown, cost |
-| [../NPM_PUBLISHING.md](../NPM_PUBLISHING.md) | npm publication requirements for `@salescrusader/idr-collector` and `@salescrusader/idr-tanstack` (D5), readiness checklist, `npm pack` contents |
+| [../NPM_PUBLISHING.md](../NPM_PUBLISHING.md) | npm publication requirements for `@id-resolver/collector` and `@id-resolver/tanstack` (D5), readiness checklist, `npm pack` contents |
 | [release-npm.workflow.draft.yml](release-npm.workflow.draft.yml) | the proposed release workflow, a **draft** outside `.github/workflows/` (it cannot run) |
 | [acceptance/](acceptance/README.md) | acceptance scripts: `cf-site-check.mjs`, `canary-sink.mjs`, `supabase-hosted-check.mjs`, `self-test.mjs` |
 

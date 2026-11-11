@@ -5,7 +5,7 @@ token or trusted publisher was created or used, and no registry credential exist
 repository. `npm pack --dry-run` was run locally without authentication (section 5). Every step marked **owner**
 needs the owner's separate approval.
 
-D5: the server adapter `@salescrusader/idr-tanstack` and the collector `@salescrusader/idr-collector` are published
+D5: the server adapter `@id-resolver/tanstack` and the collector `@id-resolver/collector` are published
 to public npm under an owner-controlled scope.
 
 ## 1. Sources
@@ -25,7 +25,7 @@ directly and unauthenticated with `npm view` on 3 Nov 2026.
 | npm's 2025 hardening: classic tokens deprecated and revoked; publishing access to "disallow tokens" pushed towards trusted publishing or 2FA-enforced local publishing; granular write tokens limited in lifetime (7 or 90 days, sources differ); TOTP 2FA to be replaced by FIDO/WebAuthn | https://www.helpnetsecurity.com/2025/09/23/npm-publishing-security-improvements/ (secondary), https://github.com/npm/documentation/pull/2006 | 3 Nov 2026 | SEARCH-ONLY |
 | whether a trusted publisher can be configured **before** a package's first version exists | none found | — | UNVERIFIED (see 2.4) |
 | npm 11.21.1 (published 15 Oct 2026) supports Node `^20.17.0 \|\| >=22.9.0`; npm `latest` is 12.2.1; Node 22.23.4 bundles npm 10.9.9 | `npm view npm` | 3 Nov 2026 | REGISTRY / local |
-| `@salescrusader/idr-collector` and `@salescrusader/idr-tanstack` do not exist on the registry (404) | `npm view` | 3 Nov 2026 | REGISTRY. Whether the `@salescrusader` **scope** is already owned, and by whom, needs an authenticated check by the owner |
+| `@id-resolver/collector` and `@id-resolver/tanstack` do not exist on the registry (404) | `npm view` | 3 Nov 2026 | REGISTRY. Whether the `@id-resolver` **scope** is already owned, and by whom, needs an authenticated check by the owner |
 
 ## 2. Prerequisites (owner actions)
 
@@ -33,7 +33,7 @@ directly and unauthenticated with `npm view` on 3 Nov 2026.
 
 1. The owner's npm account, with two-factor authentication using a **security key or passkey** (WebAuthn), not
    TOTP (npm is moving away from TOTP, SEARCH-ONLY).
-2. The npm organisation **`salescrusader`** (scope `@salescrusader`), owned by the owner. If the scope is already
+2. The npm organisation **`id-resolver`** (scope `@id-resolver`), owned by the owner. If the scope is already
    taken by someone else, D5 needs a new scope name before anything else.
 3. Organisation settings: require 2FA for every member; members limited to the owner (and, if wanted, one backup
    owner account held by the owner). No automation user and no long-lived token.
@@ -136,7 +136,7 @@ metadata of the version lists an attestation (`npm view <package>@<version> dist
 Run after `npm run build -w <package>` (version `0.1.0-dev.0`, commit `a316310`, Node 22.23.4, npm 10.9.9). No
 `.npmrc` and no auth token were present.
 
-`@salescrusader/idr-collector`: 7 files, 11,905 bytes packed, 34,981 unpacked.
+`@id-resolver/collector`: 7 files, 11,905 bytes packed, 34,981 unpacked.
 
 | bytes | path |
 |---|---|
@@ -148,7 +148,7 @@ Run after `npm run build -w <package>` (version `0.1.0-dev.0`, commit `a316310`,
 | 723 | dist/vocabulary.js |
 | 1134 | package.json |
 
-`@salescrusader/idr-tanstack`: 33 files, 38,496 bytes packed, 118,986 unpacked: `LOVABLE_SETUP.md` (2244),
+`@id-resolver/tanstack`: 33 files, 38,496 bytes packed, 118,986 unpacked: `LOVABLE_SETUP.md` (2244),
 `README.md` (24354), `package.json` (998), and `dist/<module>.js` + `dist/<module>.d.ts` for each of `build`,
 `collector-route`, `config`, `connectivity`, `delivery`, `eligibility`, `index`, `ip`, `middleware`, `payload`,
 `runtime`, `schedule`, `trust`, `types`, `vocabulary` (largest: `collector-route.js` 13805, `payload.js` 13586).
@@ -162,7 +162,7 @@ What should not ship, or is missing:
 
 ## 6. Owner actions, in order
 
-1. Decide the licence (blocking) and confirm the scope `@salescrusader` is the owner's.
+1. Decide the licence (blocking) and confirm the scope `@id-resolver` is the owner's.
 2. Create or confirm the npm organisation; 2FA with a security key; org 2FA requirement.
 3. GitHub: environment `npm-release`, tag ruleset.
 4. Approve a release-preparation change (by a cell): `private` removed, licence, `repository`, `publishConfig`,
