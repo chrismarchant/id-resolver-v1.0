@@ -73,6 +73,11 @@ test("parseBotVisitsPage: keeps exactly the five columns and refuses anything ou
   const range = { from: "2026-11-09", to: "2026-11-09" };
   const ok = parseBotVisitsPage(botPage([{ ...visit("2026-11-09T10:00:00.000Z"), extra: "dropped" }]), "example-website", range);
   assert.deepEqual(ok, { items: [visit("2026-11-09T10:00:00.000Z")], nextCursor: null });
+  // The AI split (resolver migration 0014): ai_search and ai_assistant load as they are.
+  for (const [bot_name, bot_category] of [["OAI-SearchBot", "ai_search"], ["ChatGPT-User", "ai_assistant"]]) {
+    const v = visit("2026-11-09T11:00:00.000Z", { bot_name, bot_category, user_agent_family: bot_name });
+    assert.deepEqual(parseBotVisitsPage(botPage([v]), "example-website", range).items, [v]);
+  }
   const bad = [
     botPage([visit("2026-11-08T23:59:59.999Z")]),
     botPage([visit("2026-11-10T00:00:00.000Z")]),

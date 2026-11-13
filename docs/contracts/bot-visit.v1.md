@@ -49,7 +49,7 @@ digits, `_` and `-`, without the version). The resolver refuses any other field.
 | `occurred_at` | RFC 3339 UTC, within 300 s of resolver time (else `400`); stored as `observed_at` |
 | `page_key` | the normalised path, the same rule as entrances (1-256 characters, starts with `/`, no `?`, `#`, whitespace or control characters) |
 | `bot_name` | `^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`, a name from the website's list |
-| `bot_category` | one of `ai_crawler`, `search_engine`, `seo_tool`, `social_preview`, `monitoring`, `other` |
+| `bot_category` | one of `ai_crawler`, `ai_search`, `ai_assistant`, `search_engine`, `seo_tool`, `social_preview`, `monitoring`, `other` (`ai_search` and `ai_assistant` since resolver migration 0014; website packages before `0.1.0-dev.3` send `ai_crawler` for every AI bot, which stays valid) |
 | `user_agent_family` | `^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$` |
 
 Any other field is `400`. The resolver checks shapes and the category set only:

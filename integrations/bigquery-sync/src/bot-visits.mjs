@@ -15,7 +15,7 @@ export const BOT_VISITS_PATH = "/v1/reporting/bot-visits";
 export const BOT_VISITS_PAGE_SIZE = DAILY_PAGE_SIZE;
 export const BOT_VISITS_SETTLE_MINUTES = DAILY_SETTLE_MINUTES;
 
-const CATEGORIES = new Set(["ai_crawler", "search_engine", "seo_tool", "social_preview", "monitoring", "other"]);
+const CATEGORIES = new Set(["ai_crawler", "ai_search", "ai_assistant", "search_engine", "seo_tool", "social_preview", "monitoring", "other"]);
 const BOT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
 const FAMILY_RE = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/;
 const PAGE_KEY_RE = /^\/[^?#\s\u0000-\u001f\u007f]*$/;
@@ -25,7 +25,7 @@ export const BOT_VISITS_SCHEMA = [
   { name: "observed_at", type: "TIMESTAMP", mode: "REQUIRED", description: "When the bot requested the page (UTC)" },
   { name: "page_key", type: "STRING", mode: "REQUIRED", description: "Page path only (no query string); identifiers replaced as for company visits" },
   { name: "bot_name", type: "STRING", mode: "REQUIRED", description: "Bot name from the website's bot list, e.g. GPTBot, Googlebot, Generic crawler" },
-  { name: "bot_category", type: "STRING", mode: "REQUIRED", description: "ai_crawler, search_engine, seo_tool, social_preview, monitoring or other" },
+  { name: "bot_category", type: "STRING", mode: "REQUIRED", description: "ai_crawler, ai_search, ai_assistant, search_engine, seo_tool, social_preview, monitoring or other" },
   { name: "user_agent_family", type: "STRING", mode: "REQUIRED", description: "The product token that identified the bot, without its version" },
   { name: "synced_at", type: "TIMESTAMP", mode: "REQUIRED", description: "When this sync run wrote the row (UTC)" },
 ];

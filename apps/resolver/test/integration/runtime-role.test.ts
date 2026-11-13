@@ -643,7 +643,7 @@ describe("upgrade, re-run and rollback", () => {
     const wm0008 = (await owner.query("SELECT pruned_through_id::text AS id FROM feed_retention_watermarks")).rows[0].id as string;
     expect(BigInt(wm0008)).toBeGreaterThan(BigInt(pruned.id));
     const up = await provisionTestRuntimeRole(scratch.url);
-    expect(up.applied).toEqual(["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql"]);
+    expect(up.applied).toEqual(["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql", "0014_bot_visit_ai_categories.sql"]);
     const pro = await owner.query("SELECT prosecdef, proconfig FROM pg_proc WHERE proname = 'feed_record_observation_deletes'");
     expect(pro.rows[0]).toEqual({ prosecdef: true, proconfig: ["search_path=public, pg_temp"] });
     expect((await owner.query("SELECT id::text FROM company_observations")).rows).toEqual([{ id: kept.id }]);
@@ -674,7 +674,7 @@ describe("upgrade, re-run and rollback", () => {
     // Its migrate finds nothing to apply; its startup check passes (the database is ahead, which is reported, not refused).
     expect((await applyMigrations(owner, undefined, { dir: oldDir })).applied).toEqual([]);
     const status = await migrationStatus(owner, undefined, { dir: oldDir });
-    expect(status).toEqual({ pending: [], unknown: ["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql"] });
+    expect(status).toEqual({ pending: [], unknown: ["0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql", "0014_bot_visit_ai_categories.sql"] });
     await assertSchemaCurrent(owner, undefined, { dir: oldDir });
     // Its runtime paths, as the owner: writes, retention (watermark), erasure, the kill switch.
     const db = createDb({ databaseUrl: scratch.url, ssl: "disable", max: 2 });

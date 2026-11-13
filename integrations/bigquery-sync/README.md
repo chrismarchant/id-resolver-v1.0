@@ -79,13 +79,55 @@ The view `<dataset>.daily_activity_rates` adds `resolution_rate` (companies iden
 | `observed_at` | TIMESTAMP | when the bot requested the page (UTC) |
 | `page_key` | STRING | path only, identifiers replaced as for company visits |
 | `bot_name` | STRING | from the website's bot list, e.g. `GPTBot`, `Googlebot`, `Generic crawler` |
-| `bot_category` | STRING | `ai_crawler`, `search_engine`, `seo_tool`, `social_preview`, `monitoring` or `other` |
+| `bot_category` | STRING | `ai_crawler`, `ai_search`, `ai_assistant`, `search_engine`, `seo_tool`, `social_preview`, `monitoring` or `other` (rows from before resolver migration 0014 carry `ai_crawler` for every AI bot; see the `bot_visits_classified` view) |
 | `user_agent_family` | STRING | the product token that identified the bot, without its version, e.g. `Googlebot-Image` |
 | `synced_at` | TIMESTAMP | when the sync wrote the row |
 
 No IP address, full user agent or cookie exists anywhere in this path.
 
 This table is loaded **daily**, not every run. The first run after 00:15 UTC (visits can reach the resolver up to five minutes late) checks the table's last-modified time (metadata only, no query) and, when the table has not been written since midnight UTC, reads the last `BQ_BOT_VISITS_DAYS` complete UTC days and replaces each of those day partitions (`WRITE_TRUNCATE` into `bot_visits$YYYYMMDD`). Later runs that day skip the step. Re-loading a day replaces it, so nothing is duplicated, and days older than the window are never touched: the table keeps the full history, beyond the resolver's retention window. When a day had no bot visits nothing is written, and the step is simply tried again on the next run. A resolver without the route (HTTP 404) skips the step; any other failure fails the run after the other two tables were replaced.
+
+## Bot analytics
+
+Three views over `<dataset>.bot_visits`, created (and kept up to date) by `deploy/setup-cloud-run.sh`. They cost
+nothing until queried and read the table at query time, so they are always current with the last daily load.
+
+| view | one row per | use |
+|---|---|---|
+| `bot_visits_classified` | bot visit | the table plus `visit_date`, `is_ai` (any of the three AI categories) and `is_discovery_file` (`/robots.txt`, `/llms.txt`, `/llms-full.txt`, `/sitemap*.xml`). Rows stored before resolver migration 0014 carry `ai_crawler` for every AI bot; this view gives ChatGPT-User, Claude-User and Perplexity-User `ai_assistant`, and OAI-SearchBot and PerplexityBot `ai_search`, as newer rows carry themselves |
+| `bot_visits_daily` | day, category and bot | `visits`, distinct `pages`, `discovery_file_visits` |
+| `bot_visits_pages` | page | `visits`, `ai_visits`, `ai_assistant_visits`, `ai_search_visits`, `ai_crawler_visits`, `search_engine_visits`, distinct `bots`, `first_visit`, `last_visit` (all time) |
+
+Example: which pages did people ask AI assistants about in the last 30 days?
+
+```sql
+SELECT page_key, bot_name, COUNT(*) AS visits
+FROM `<project>.idr.bot_visits_classified`
+WHERE bot_category = 'ai_assistant' AND visit_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+GROUP BY page_key, bot_name
+ORDER BY visits DESC;
+```
+
+**Dashboard (Looker Studio, free).** Open this link with `<project>` replaced. It creates a new report connected to
+`bot_visits_classified`:
+
+```
+https://lookerstudio.google.com/reporting/create?r.reportName=Bot%20analytics&ds.ds0.connector=bigQuery&ds.ds0.type=TABLE&ds.ds0.projectId=<project>&ds.ds0.datasetId=idr&ds.ds0.tableId=bot_visits_classified
+```
+
+(Or: Looker Studio, Create, Report, BigQuery, the project, `idr`, `bot_visits_classified`.) Then add:
+
+1. a date range control on `visit_date`, and drop-down controls on `bot_category` and `is_ai`;
+2. a time series: dimension `visit_date`, breakdown `bot_category`, metric Record Count (bot visits over time);
+3. a bar chart or table: dimension `bot_name`, metric Record Count, sorted descending (which bots);
+4. a table: dimension `page_key`, metric Record Count, with a filter `is_ai` = true (pages AI bots read);
+5. a table: dimensions `page_key` and `bot_name`, filter `bot_category` = `ai_assistant` (pages people asked an AI about);
+6. a table: dimensions `page_key` and `bot_name`, filter `is_discovery_file` = true (who reads robots.txt, llms.txt
+   and the sitemap).
+
+Looker Studio queries BigQuery as the person viewing the report; viewers need read access to the dataset (BigQuery
+Data Viewer) and the right to run queries in the project (BigQuery Job User), or the report owner shares it with the
+owner's credentials.
 
 ## Browser events
 
@@ -130,7 +172,7 @@ SOURCE_COMMIT=<40-character commit> bash setup-cloud-run.sh
 It:
 
 - enables the APIs;
-- creates the dataset, the four tables and the `daily_activity_rates` view when missing (existing data is kept);
+- creates the dataset and the four tables when missing (existing data is kept), and creates or replaces the views `daily_activity_rates`, `bot_visits_classified`, `bot_visits_daily` and `bot_visits_pages`;
 - creates the service account `idr-bigquery-sync`, with BigQuery Job User on the project and BigQuery Data Editor on the dataset only;
 - stores the reporting token in Secret Manager, typed with hidden input;
 - deploys the job from the pinned commit;
