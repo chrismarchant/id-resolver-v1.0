@@ -21,7 +21,7 @@
  * leave this module. The user agent itself is never returned, stored or logged.
  */
 
-export const BOT_CATEGORIES = ["ai_crawler", "search_engine", "seo_tool", "social_preview", "monitoring", "other"] as const;
+export const BOT_CATEGORIES = ["ai_crawler", "ai_search", "ai_assistant", "search_engine", "seo_tool", "social_preview", "monitoring", "other"] as const;
 export type BotCategory = (typeof BOT_CATEGORIES)[number];
 
 export interface KnownBot {
@@ -30,42 +30,91 @@ export interface KnownBot {
   readonly category: BotCategory;
 }
 
+/**
+ * The three AI categories follow the split the AI companies themselves document (and Cloudflare Radar uses):
+ * `ai_crawler` collects pages to train or build models, `ai_search` indexes pages so an AI answer engine can cite
+ * them, and `ai_assistant` fetches one page because a person asked an AI tool about it just now.
+ */
 export const KNOWN_BOTS: readonly KnownBot[] = [
-  // AI crawlers, assistants and AI training opt-out agents
+  // AI crawlers: model training and data collection, and the robots.txt control tokens for that use
   { name: "GPTBot", category: "ai_crawler" },
-  { name: "OAI-SearchBot", category: "ai_crawler" },
-  { name: "ChatGPT-User", category: "ai_crawler" },
   { name: "ClaudeBot", category: "ai_crawler" },
-  { name: "Claude-User", category: "ai_crawler" },
-  { name: "PerplexityBot", category: "ai_crawler" },
-  { name: "Perplexity-User", category: "ai_crawler" },
+  { name: "anthropic-ai", category: "ai_crawler" },
   { name: "Google-Extended", category: "ai_crawler" },
   { name: "Applebot-Extended", category: "ai_crawler" },
+  { name: "Google-CloudVertexBot", category: "ai_crawler" },
   { name: "CCBot", category: "ai_crawler" },
   { name: "Bytespider", category: "ai_crawler" },
   { name: "Meta-ExternalAgent", category: "ai_crawler" },
+  { name: "FacebookBot", category: "ai_crawler" },
   { name: "Amazonbot", category: "ai_crawler" },
+  { name: "cohere-training-data-crawler", category: "ai_crawler" },
+  { name: "cohere-ai", category: "ai_crawler" },
+  { name: "Diffbot", category: "ai_crawler" },
+  { name: "AI2Bot", category: "ai_crawler" },
+  { name: "Timpibot", category: "ai_crawler" },
+  { name: "ImagesiftBot", category: "ai_crawler" },
+  // AI search: indexing for AI answer engines
+  { name: "OAI-SearchBot", category: "ai_search" },
+  { name: "Claude-SearchBot", category: "ai_search" },
+  { name: "PerplexityBot", category: "ai_search" },
+  { name: "YouBot", category: "ai_search" },
+  // AI assistants: a single fetch because a person asked an AI tool about the page
+  { name: "ChatGPT-User", category: "ai_assistant" },
+  { name: "Claude-User", category: "ai_assistant" },
+  { name: "Perplexity-User", category: "ai_assistant" },
+  { name: "Meta-ExternalFetcher", category: "ai_assistant" },
+  { name: "MistralAI-User", category: "ai_assistant" },
+  { name: "DuckAssistBot", category: "ai_assistant" },
+  { name: "Google-NotebookLM", category: "ai_assistant" },
   // Search engines
   { name: "Googlebot", category: "search_engine" },
+  { name: "Google-InspectionTool", category: "search_engine" },
+  { name: "GoogleOther", category: "search_engine" },
   { name: "Bingbot", category: "search_engine" },
   { name: "DuckDuckBot", category: "search_engine" },
   { name: "YandexBot", category: "search_engine" },
   { name: "Applebot", category: "search_engine" },
+  { name: "Baiduspider", category: "search_engine" },
+  { name: "PetalBot", category: "search_engine" },
+  { name: "SeznamBot", category: "search_engine" },
+  { name: "MojeekBot", category: "search_engine" },
+  { name: "Slurp", category: "search_engine" },
   // SEO tools
   { name: "AhrefsBot", category: "seo_tool" },
+  { name: "AhrefsSiteAudit", category: "seo_tool" },
   { name: "SemrushBot", category: "seo_tool" },
+  { name: "SiteAuditBot", category: "seo_tool" },
   { name: "MJ12bot", category: "seo_tool" },
   { name: "DotBot", category: "seo_tool" },
+  { name: "rogerbot", category: "seo_tool" },
+  { name: "BLEXBot", category: "seo_tool" },
+  { name: "DataForSeoBot", category: "seo_tool" },
+  { name: "serpstatbot", category: "seo_tool" },
+  { name: "Screaming Frog SEO Spider", category: "seo_tool" },
+  { name: "Barkrowler", category: "seo_tool" },
   // Link previews
   { name: "facebookexternalhit", category: "social_preview" },
   { name: "LinkedInBot", category: "social_preview" },
+  // Before Twitterbot: Telegram's agent reads "TelegramBot (like TwitterBot)".
+  { name: "TelegramBot", category: "social_preview" },
   { name: "Twitterbot", category: "social_preview" },
   { name: "Slackbot", category: "social_preview" },
   { name: "WhatsApp", category: "social_preview" },
   { name: "Discordbot", category: "social_preview" },
-  // Uptime monitoring
+  { name: "Pinterestbot", category: "social_preview" },
+  { name: "redditbot", category: "social_preview" },
+  { name: "Embedly", category: "social_preview" },
+  { name: "SkypeUriPreview", category: "social_preview" },
+  { name: "Mastodon", category: "social_preview" },
+  // Uptime and performance monitoring
   { name: "UptimeRobot", category: "monitoring" },
   { name: "Pingdom", category: "monitoring" },
+  { name: "StatusCake", category: "monitoring" },
+  { name: "Site24x7", category: "monitoring" },
+  { name: "Better Uptime", category: "monitoring" },
+  { name: "Chrome-Lighthouse", category: "monitoring" },
+  { name: "GTmetrix", category: "monitoring" },
   // Anything else that calls itself a bot, crawler or spider (matched by token suffix, see matchBot)
   { name: "Generic bot", category: "other" },
   { name: "Generic crawler", category: "other" },

@@ -42,7 +42,7 @@ step "Enabling APIs"
 gcloud services enable run.googleapis.com cloudscheduler.googleapis.com secretmanager.googleapis.com \
   cloudbuild.googleapis.com artifactregistry.googleapis.com bigquery.googleapis.com iam.googleapis.com
 
-step "Dataset, tables and view (created when missing; existing data is kept)"
+step "Dataset, tables and views (tables created when missing, existing data kept; views replaced)"
 DS="\`${PROJECT}.${BQ_DATASET}\`"
 bq query --quiet --nouse_legacy_sql --location="$BQ_LOCATION" "
 CREATE SCHEMA IF NOT EXISTS ${DS} OPTIONS (location = '${BQ_LOCATION}');
@@ -83,6 +83,50 @@ FROM (
   SELECT *, outcome_qualified + outcome_no_match + outcome_excluded + outcome_unknown + outcome_pending
     + outcome_ineligible + outcome_disabled + outcome_uncertain + outcome_unavailable AS outcomes
   FROM \`${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}\`);
+-- Bot analytics (README, section Bot analytics). Rows stored before the resolver's migration 0014 carry ai_crawler
+-- for every AI bot; the classified view gives them the AI split the website package now reports itself.
+CREATE OR REPLACE VIEW \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}_classified\` AS
+SELECT
+  *,
+  bot_category IN ('ai_crawler', 'ai_search', 'ai_assistant') AS is_ai,
+  page_key IN ('/robots.txt', '/llms.txt', '/llms-full.txt')
+    OR (STARTS_WITH(page_key, '/sitemap') AND ENDS_WITH(page_key, '.xml')) AS is_discovery_file
+FROM (
+  SELECT
+    observed_at,
+    DATE(observed_at) AS visit_date,
+    page_key,
+    bot_name,
+    CASE
+      WHEN bot_category = 'ai_crawler' AND bot_name IN ('ChatGPT-User', 'Claude-User', 'Perplexity-User') THEN 'ai_assistant'
+      WHEN bot_category = 'ai_crawler' AND bot_name IN ('OAI-SearchBot', 'PerplexityBot') THEN 'ai_search'
+      ELSE bot_category
+    END AS bot_category,
+    user_agent_family,
+    synced_at
+  FROM \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}\`);
+CREATE OR REPLACE VIEW \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}_daily\` AS
+SELECT
+  visit_date, bot_category, bot_name,
+  COUNT(*) AS visits,
+  COUNT(DISTINCT page_key) AS pages,
+  COUNTIF(is_discovery_file) AS discovery_file_visits
+FROM \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}_classified\`
+GROUP BY visit_date, bot_category, bot_name;
+CREATE OR REPLACE VIEW \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}_pages\` AS
+SELECT
+  page_key,
+  COUNT(*) AS visits,
+  COUNTIF(is_ai) AS ai_visits,
+  COUNTIF(bot_category = 'ai_assistant') AS ai_assistant_visits,
+  COUNTIF(bot_category = 'ai_search') AS ai_search_visits,
+  COUNTIF(bot_category = 'ai_crawler') AS ai_crawler_visits,
+  COUNTIF(bot_category = 'search_engine') AS search_engine_visits,
+  COUNT(DISTINCT bot_name) AS bots,
+  MIN(observed_at) AS first_visit,
+  MAX(observed_at) AS last_visit
+FROM \`${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE}_classified\`
+GROUP BY page_key;
 " >/dev/null
 
 step "Service account"
@@ -149,4 +193,4 @@ else
 fi
 
 step "Done"
-echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}; once a day it loads ${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_EVENTS_TABLE}."
+echo "Job ${JOB} runs ${SCHEDULE} (UTC) in ${REGION} and replaces ${PROJECT}.${BQ_DATASET}.${BQ_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_ACTIVITY_TABLE}; once a day it loads ${PROJECT}.${BQ_DATASET}.${BQ_BOT_VISITS_TABLE} and ${PROJECT}.${BQ_DATASET}.${BQ_EVENTS_TABLE}. Bot analytics views: ${BQ_BOT_VISITS_TABLE}_classified, ${BQ_BOT_VISITS_TABLE}_daily, ${BQ_BOT_VISITS_TABLE}_pages."

@@ -1,6 +1,6 @@
 {
   "name": "@id-resolver/tanstack",
-  "version": "0.1.0-dev.2",
+  "version": "0.1.0-dev.3",
   "private": true,
   "description": "ID Resolver V1 server adapter for TanStack Start: reports eligible document entrances to the resolver from the website server, without altering the page response.",
   "license": "UNLICENSED",

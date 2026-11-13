@@ -1,6 +1,6 @@
 # @id-resolver/tanstack
 
-ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.2`, not published).
+ID Resolver V1 server adapter for TanStack Start (version `0.1.0-dev.3`, not published).
 
 For each eligible **document request** the website's **server** reports one small, anonymous "entrance" to the
 resolver (`entrance.v1`). It never touches the page response, sets no cookie, adds no script and sends nothing from the
@@ -320,14 +320,21 @@ add one entry there (the resolver needs no change).
 
 | category | names |
 |---|---|
-| `ai_crawler` | GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-User, PerplexityBot, Perplexity-User, Google-Extended, Applebot-Extended, CCBot, Bytespider, Meta-ExternalAgent, Amazonbot |
-| `search_engine` | Googlebot, Bingbot, DuckDuckBot, YandexBot, Applebot |
-| `seo_tool` | AhrefsBot, SemrushBot, MJ12bot, DotBot |
-| `social_preview` | facebookexternalhit, LinkedInBot, Twitterbot, Slackbot, WhatsApp, Discordbot |
-| `monitoring` | UptimeRobot, Pingdom |
+| `ai_crawler` | GPTBot, ClaudeBot, anthropic-ai, Google-Extended, Applebot-Extended, Google-CloudVertexBot, CCBot, Bytespider, Meta-ExternalAgent, FacebookBot, Amazonbot, cohere-training-data-crawler, cohere-ai, Diffbot, AI2Bot, Timpibot, ImagesiftBot |
+| `ai_search` | OAI-SearchBot, Claude-SearchBot, PerplexityBot, YouBot |
+| `ai_assistant` | ChatGPT-User, Claude-User, Perplexity-User, Meta-ExternalFetcher, MistralAI-User, DuckAssistBot, Google-NotebookLM |
+| `search_engine` | Googlebot, Google-InspectionTool, GoogleOther, Bingbot, DuckDuckBot, YandexBot, Applebot, Baiduspider, PetalBot, SeznamBot, MojeekBot, Slurp |
+| `seo_tool` | AhrefsBot, AhrefsSiteAudit, SemrushBot, SiteAuditBot, MJ12bot, DotBot, rogerbot, BLEXBot, DataForSeoBot, serpstatbot, Screaming Frog SEO Spider, Barkrowler |
+| `social_preview` | facebookexternalhit, LinkedInBot, TelegramBot, Twitterbot, Slackbot, WhatsApp, Discordbot, Pinterestbot, redditbot, Embedly, SkypeUriPreview, Mastodon |
+| `monitoring` | UptimeRobot, Pingdom, StatusCake, Site24x7, Better Uptime, Chrome-Lighthouse, GTmetrix |
 | `other` | Generic bot, Generic crawler, Generic spider: any other product token ending in "bot", "crawler" or "spider" |
 
-Names match case-insensitively on a token boundary, in list order (so `Applebot-Extended` is tried before `Applebot`).
+The three AI categories follow the split the AI companies document: `ai_crawler` collects pages to train or build
+models, `ai_search` indexes pages so an AI answer engine can cite them, and `ai_assistant` fetches one page because a
+person asked an AI tool about it just then. Before version `0.1.0-dev.3` every AI bot was reported as `ai_crawler`;
+the resolver accepts both (migration 0014), and the BigQuery view `bot_visits_classified` relabels the older rows.
+
+Names match case-insensitively on a token boundary, in list order (so `Applebot-Extended` is tried before `Applebot`, and `TelegramBot` before `Twitterbot`, because Telegram's agent reads "TelegramBot (like TwitterBot)").
 `Google-Extended` and `Applebot-Extended` are robots.txt control tokens: Google and Apple crawl as `Googlebot` and
 `Applebot`, so those two entries normally match nothing. `matchBot(userAgent)` is exported for tests and tooling.
 

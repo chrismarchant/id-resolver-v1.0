@@ -152,6 +152,17 @@ describe("bot-visit.v1", () => {
       ]);
     });
 
+    it.each([
+      ["ai_search", "OAI-SearchBot"],
+      ["ai_assistant", "ChatGPT-User"],
+      ["ai_crawler", "GPTBot"],
+    ])("accepts and stores the AI category %s (0014)", async (category, name) => {
+      const r = await post(visit({ bot_name: name, bot_category: category, user_agent_family: name }));
+      expect(r.statusCode).toBe(200);
+      expect(r.json()).toEqual({ version: "1", recorded: true });
+      expect((await rows()).map((x) => [x["bot_name"], x["bot_category"]])).toEqual([[name, category]]);
+    });
+
     it("never reaches the runner, the cache, the usage counters or any company table", async () => {
       expect((await post(visit())).statusCode).toBe(200);
       expect(runner.jobs).toEqual([]);
@@ -358,6 +369,8 @@ describe("bot-visit.v1", () => {
         return db.pool.query(`INSERT INTO bot_visits (${keys.join(", ")}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(", ")})`, Object.values(v));
       };
       await expect(insert({})).resolves.toBeDefined();
+      await expect(insert({ bot_category: "ai_search" })).resolves.toBeDefined();
+      await expect(insert({ bot_category: "ai_assistant" })).resolves.toBeDefined();
       for (const over of [{ bot_category: "scraper" }, { page_key: "/a?b=c" }, { bot_name: "a/b" }, { user_agent_family: "GPTBot/1.2" }, { visit_id: "x" }]) {
         await expect(insert(over)).rejects.toThrow();
       }

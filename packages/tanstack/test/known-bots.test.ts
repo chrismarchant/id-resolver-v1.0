@@ -10,11 +10,13 @@ describe("KNOWN_BOTS: the one bot list", () => {
     const byCategory: Record<string, string[]> = {};
     for (const b of KNOWN_BOTS) (byCategory[b.category] ??= []).push(b.name);
     expect(byCategory).toEqual({
-      ai_crawler: ["GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "Claude-User", "PerplexityBot", "Perplexity-User", "Google-Extended", "Applebot-Extended", "CCBot", "Bytespider", "Meta-ExternalAgent", "Amazonbot"],
-      search_engine: ["Googlebot", "Bingbot", "DuckDuckBot", "YandexBot", "Applebot"],
-      seo_tool: ["AhrefsBot", "SemrushBot", "MJ12bot", "DotBot"],
-      social_preview: ["facebookexternalhit", "LinkedInBot", "Twitterbot", "Slackbot", "WhatsApp", "Discordbot"],
-      monitoring: ["UptimeRobot", "Pingdom"],
+      ai_crawler: ["GPTBot", "ClaudeBot", "anthropic-ai", "Google-Extended", "Applebot-Extended", "Google-CloudVertexBot", "CCBot", "Bytespider", "Meta-ExternalAgent", "FacebookBot", "Amazonbot", "cohere-training-data-crawler", "cohere-ai", "Diffbot", "AI2Bot", "Timpibot", "ImagesiftBot"],
+      ai_search: ["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "YouBot"],
+      ai_assistant: ["ChatGPT-User", "Claude-User", "Perplexity-User", "Meta-ExternalFetcher", "MistralAI-User", "DuckAssistBot", "Google-NotebookLM"],
+      search_engine: ["Googlebot", "Google-InspectionTool", "GoogleOther", "Bingbot", "DuckDuckBot", "YandexBot", "Applebot", "Baiduspider", "PetalBot", "SeznamBot", "MojeekBot", "Slurp"],
+      seo_tool: ["AhrefsBot", "AhrefsSiteAudit", "SemrushBot", "SiteAuditBot", "MJ12bot", "DotBot", "rogerbot", "BLEXBot", "DataForSeoBot", "serpstatbot", "Screaming Frog SEO Spider", "Barkrowler"],
+      social_preview: ["facebookexternalhit", "LinkedInBot", "TelegramBot", "Twitterbot", "Slackbot", "WhatsApp", "Discordbot", "Pinterestbot", "redditbot", "Embedly", "SkypeUriPreview", "Mastodon"],
+      monitoring: ["UptimeRobot", "Pingdom", "StatusCake", "Site24x7", "Better Uptime", "Chrome-Lighthouse", "GTmetrix"],
       other: ["Generic bot", "Generic crawler", "Generic spider"],
     });
     expect(new Set(KNOWN_BOTS.map((b) => b.name.toLowerCase())).size).toBe(KNOWN_BOTS.length);
@@ -30,12 +32,12 @@ describe("KNOWN_BOTS: the one bot list", () => {
 describe("matchBot", () => {
   it.each([
     ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)", "GPTBot", "ai_crawler", "GPTBot"],
-    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot", "OAI-SearchBot", "ai_crawler", "OAI-SearchBot"],
-    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot", "ChatGPT-User", "ai_crawler", "ChatGPT-User"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot", "OAI-SearchBot", "ai_search", "OAI-SearchBot"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot", "ChatGPT-User", "ai_assistant", "ChatGPT-User"],
     ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@example.com)", "ClaudeBot", "ai_crawler", "ClaudeBot"],
-    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-User/1.0; +claude-user@example.com)", "Claude-User", "ai_crawler", "Claude-User"],
-    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)", "PerplexityBot", "ai_crawler", "PerplexityBot"],
-    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)", "Perplexity-User", "ai_crawler", "Perplexity-User"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-User/1.0; +claude-user@example.com)", "Claude-User", "ai_assistant", "Claude-User"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)", "PerplexityBot", "ai_search", "PerplexityBot"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Perplexity-User/1.0; +https://perplexity.ai/perplexity-user)", "Perplexity-User", "ai_assistant", "Perplexity-User"],
     ["CCBot/2.0 (https://commoncrawl.org/faq/)", "CCBot", "ai_crawler", "CCBot"],
     ["Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Bytespider; spider-feedback@example.com)", "Bytespider", "ai_crawler", "Bytespider"],
     ["meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)", "Meta-ExternalAgent", "ai_crawler", "meta-externalagent"],
@@ -61,10 +63,50 @@ describe("matchBot", () => {
     ["Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)", "Discordbot", "social_preview", "Discordbot"],
     ["Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)", "UptimeRobot", "monitoring", "UptimeRobot"],
     ["Pingdom.com_bot_version_1.4_(http://www.pingdom.com/)", "Pingdom", "monitoring", "Pingdom"],
+    // Added with the AI split (ai_crawler, ai_search, ai_assistant) and the longer list.
+    ["Mozilla/5.0 (compatible; anthropic-ai/1.0)", "anthropic-ai", "ai_crawler", "anthropic-ai"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Google-CloudVertexBot; +https://cloud.google.com/)", "Google-CloudVertexBot", "ai_crawler", "Google-CloudVertexBot"],
+    ["Mozilla/5.0 (compatible; FacebookBot/1.0; +https://developers.facebook.com/docs/sharing/webmasters/facebookbot/)", "FacebookBot", "ai_crawler", "FacebookBot"],
+    ["cohere-training-data-crawler/1.0", "cohere-training-data-crawler", "ai_crawler", "cohere-training-data-crawler"],
+    ["cohere-ai", "cohere-ai", "ai_crawler", "cohere-ai"],
+    ["Mozilla/5.0 (compatible; Diffbot/0.1; +http://www.diffbot.com)", "Diffbot", "ai_crawler", "Diffbot"],
+    ["Mozilla/5.0 (compatible; AI2Bot; +https://www.allenai.org/crawler)", "AI2Bot", "ai_crawler", "AI2Bot"],
+    ["Timpibot/0.8 (+http://www.timpi.io)", "Timpibot", "ai_crawler", "Timpibot"],
+    ["Mozilla/5.0 (compatible; ImagesiftBot; +imagesift.com)", "ImagesiftBot", "ai_crawler", "ImagesiftBot"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-SearchBot/1.0; +claude-searchbot@example.com)", "Claude-SearchBot", "ai_search", "Claude-SearchBot"],
+    ["Mozilla/5.0 (compatible; YouBot/1.0; +https://about.you.com/youbot/)", "YouBot", "ai_search", "YouBot"],
+    ["meta-externalfetcher/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)", "Meta-ExternalFetcher", "ai_assistant", "meta-externalfetcher"],
+    ["Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; MistralAI-User/1.0; +https://docs.mistral.ai/robots)", "MistralAI-User", "ai_assistant", "MistralAI-User"],
+    ["DuckAssistBot/1.2; (+http://duckduckgo.com/duckassistbot.html)", "DuckAssistBot", "ai_assistant", "DuckAssistBot"],
+    ["Google-NotebookLM", "Google-NotebookLM", "ai_assistant", "Google-NotebookLM"],
+    ["Mozilla/5.0 (compatible; Google-InspectionTool/1.0;)", "Google-InspectionTool", "search_engine", "Google-InspectionTool"],
+    ["Mozilla/5.0 (compatible; GoogleOther)", "GoogleOther", "search_engine", "GoogleOther"],
+    ["Mozilla/5.0 (compatible; SeznamBot/4.0; +https://o-seznam.cz/napoveda/vyhledavani/en/seznambot-crawler/)", "SeznamBot", "search_engine", "SeznamBot"],
+    ["Mozilla/5.0 (compatible; MojeekBot/0.11; +https://www.mojeek.com/bot.html)", "MojeekBot", "search_engine", "MojeekBot"],
+    ["Mozilla/5.0 (compatible; Yahoo! Slurp; http://help.yahoo.com/help/us/ysearch/slurp)", "Slurp", "search_engine", "Slurp"],
+    ["Mozilla/5.0 (compatible; AhrefsSiteAudit/6.1; +http://ahrefs.com/robot/site-audit)", "AhrefsSiteAudit", "seo_tool", "AhrefsSiteAudit"],
+    ["Mozilla/5.0 (compatible; SiteAuditBot/0.97; +http://www.semrush.com/bot.html)", "SiteAuditBot", "seo_tool", "SiteAuditBot"],
+    ["rogerbot/1.2 (https://moz.com/help/guides/moz-procedures/what-is-rogerbot, rogerbot-crawler@example.com)", "rogerbot", "seo_tool", "rogerbot"],
+    ["Mozilla/5.0 (compatible; BLEXBot/1.0; +https://help.seranking.com/en/blex-crawler)", "BLEXBot", "seo_tool", "BLEXBot"],
+    ["Mozilla/5.0 (compatible; DataForSeoBot/1.0; +https://dataforseo.com/dataforseo-bot)", "DataForSeoBot", "seo_tool", "DataForSeoBot"],
+    ["serpstatbot/2.1 (advanced backlink tracking bot; https://serpstatbot.com/; abuse@example.com)", "serpstatbot", "seo_tool", "serpstatbot"],
+    ["Screaming Frog SEO Spider/21.0", "Screaming Frog SEO Spider", "seo_tool", "Screaming"],
+    ["Mozilla/5.0 (compatible; Barkrowler/0.9; +https://babbar.tech/crawler)", "Barkrowler", "seo_tool", "Barkrowler"],
+    ["TelegramBot (like TwitterBot)", "TelegramBot", "social_preview", "TelegramBot"],
+    ["Mozilla/5.0 (compatible; Pinterestbot/1.0; +http://www.pinterest.com/bot.html)", "Pinterestbot", "social_preview", "Pinterestbot"],
+    ["Mozilla/5.0 (compatible; redditbot/1.0; +http://www.reddit.com/feedback)", "redditbot", "social_preview", "redditbot"],
+    ["Mozilla/5.0 (compatible; Embedly/0.2; +http://support.embed.ly/)", "Embedly", "social_preview", "Embedly"],
+    ["Mozilla/5.0 (Windows NT 6.1; WOW64) SkypeUriPreview Preview/0.5", "SkypeUriPreview", "social_preview", "SkypeUriPreview"],
+    ["http.rb/5.1.1 (Mastodon/4.2.0; +https://mastodon.example/)", "Mastodon", "social_preview", "Mastodon"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 StatusCake", "StatusCake", "monitoring", "StatusCake"],
+    ["Site24x7", "Site24x7", "monitoring", "Site24x7"],
+    ["Better Uptime Bot Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36", "Better Uptime", "monitoring", "Better"],
+    ["Mozilla/5.0 (Linux; Android 11; moto g power (2022)) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36 Chrome-Lighthouse", "Chrome-Lighthouse", "monitoring", "Chrome-Lighthouse"],
+    ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36 GTmetrix", "GTmetrix", "monitoring", "GTmetrix"],
     // Anything else that calls itself a bot, crawler or spider.
-    ["Mozilla/5.0 (Linux; Android 7.0;) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; PetalBot;+https://webmaster.petalsearch.com/site/petalbot)", "Generic bot", "other", "PetalBot"],
+    ["Mozilla/5.0 (Linux; Android 7.0;) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; PetalBot;+https://webmaster.petalsearch.com/site/petalbot)", "PetalBot", "search_engine", "PetalBot"],
     ["AdsBot-Google (+http://www.google.com/adsbot.html)", "Generic bot", "other", "AdsBot-Google"],
-    ["Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)", "Generic spider", "other", "Baiduspider"],
+    ["Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)", "Baiduspider", "search_engine", "Baiduspider"],
     ["Mozilla/5.0 (compatible; Seekport Crawler; http://seekport.com/)", "Generic crawler", "other", "Crawler"],
   ])("%s", (ua, name, category, family) => {
     const m = matchBot(ua);
@@ -83,6 +125,7 @@ describe("matchBot", () => {
     ["Facebook app browser", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [FBAN/FBIOS;FBAV/470.0]"],
     ["Slack desktop", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Slack/4.41.97 Chrome/130.0 Electron/33.0.0 Safari/537.36"],
     ["Cubot phone", "Mozilla/5.0 (Linux; Android 12; CUBOT KINGKONG 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"],
+    ["Pinterest app", "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 [Pinterest/iOS]"],
     ["Cubot phone (underscore model)", "Mozilla/5.0 (Linux; Android 10; CUBOT_X30) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36"],
   ])("a human browser (%s) is not a bot", (_label, ua) => {
     expect(matchBot(ua)).toBeNull();
@@ -98,6 +141,11 @@ describe("matchBot", () => {
     expect(matchBot("Applebot/0.1")?.botName).toBe("Applebot");
     expect(matchBot("Claude-User/1.0")?.botName).toBe("Claude-User");
     expect(matchBot("ClaudeBot/1.0")?.botName).toBe("ClaudeBot");
+    expect(matchBot("Claude-SearchBot/1.0")?.botName).toBe("Claude-SearchBot");
+    expect(matchBot("meta-externalagent/1.1")?.botCategory).toBe("ai_crawler");
+    expect(matchBot("meta-externalfetcher/1.1")?.botCategory).toBe("ai_assistant");
+    expect(matchBot("DuckAssistBot/1.2")?.botName).toBe("DuckAssistBot");
+    expect(matchBot("DuckDuckBot/1.1")?.botName).toBe("DuckDuckBot");
   });
 
   it("returns null for a missing or empty user agent, and never returns the user agent itself", () => {
