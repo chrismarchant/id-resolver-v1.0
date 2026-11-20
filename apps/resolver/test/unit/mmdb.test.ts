@@ -45,8 +45,8 @@ describe("MmdbReader: lookups", () => {
       const miss = r.lookup("203.0.113.200");
       expect(miss.record).toBeNull();
       expect(miss.prefixLength).toBe(25);
-      expect(r.lookup("192.0.3.1").record).toBeNull();
-      expect(r.lookup("2001:db9::1").record).toBeNull();
+      expect(r.lookup("10.0.0.1").record).toBeNull();
+      expect(r.lookup("fd00::1").record).toBeNull();
       expect(r.lookup("::1").record).toBeNull();
     } finally {
       r.close();
