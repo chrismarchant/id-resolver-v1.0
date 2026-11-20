@@ -245,6 +245,24 @@ export interface ReportingEventsResponse {
   next_cursor: string | null;
 }
 
+/** One UTC day of GET /v1/reporting/source-shadow (contract docs/contracts/source-shadow.v1.md). Counts only. */
+export interface ReportingSourceShadowDay {
+  /** YYYY-MM-DD (UTC). */
+  date: string;
+  /** Counter name -> count; a counter without a row that day is absent (zero). */
+  metrics: Record<string, number>;
+}
+
+export interface ReportingSourceShadowResponse {
+  version: typeof REPORTING_API_VERSION;
+  scope: ReportingScope;
+  /** Inclusive UTC calendar dates as requested (at most 31 days). */
+  from: string;
+  to: string;
+  /** Days with any counter, in date order; a day missing here had none. */
+  days: ReportingSourceShadowDay[];
+}
+
 export interface ReportingSummaryResponse {
   version: typeof REPORTING_API_VERSION;
   scope: ReportingScope;

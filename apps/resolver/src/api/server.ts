@@ -33,7 +33,7 @@ import {
   type ErrorCode,
   type ErrorResponse,
 } from "../contracts/api.js";
-import type { ReportingRepository } from "../contracts/db.js";
+import type { ReportingRepository, ShadowRepository } from "../contracts/db.js";
 import type { BotVisitRepository } from "../contracts/bot-visit.js";
 import type { EventRepository } from "../contracts/event.js";
 import { RunnerOverloadedError, RunnerStoppedError, type ResolutionOutcome, type Runner } from "../contracts/runtime.js";
@@ -61,6 +61,8 @@ export interface ServerDeps {
   events?: EventRepository;
   /** Bot visit store (bot-visit.v1). POST /v1/bot-visits is registered only with it and BOT_VISITS_ENABLED; GET /v1/reporting/bot-visits only with it and reporting. */
   botVisits?: BotVisitRepository;
+  /** Source comparison counters (source-shadow.v1). GET /v1/reporting/source-shadow is registered with it and reporting. */
+  sourceShadow?: Pick<ShadowRepository, "report">;
   now?: () => number;
 }
 
@@ -353,6 +355,8 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       ...(deps.botVisits ? { botVisits: deps.botVisits } : {}),
       // Read-only listing of browser_events, whether or not POST /v1/events is enabled.
       ...(deps.events ? { events: deps.events } : {}),
+      // Daily counters of the watch-only source comparison, whether or not SHADOW_SOURCES_MODE is on.
+      ...(deps.sourceShadow ? { sourceShadow: deps.sourceShadow } : {}),
     });
   }
 

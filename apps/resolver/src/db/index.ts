@@ -4,6 +4,7 @@ import type {
   CompanyRepository,
   ControlsRepository,
   ReportingRepository,
+  ShadowRepository,
   UsageRepository,
 } from "../contracts/db.js";
 import type { BotVisitRepository } from "../contracts/bot-visit.js";
@@ -17,6 +18,7 @@ import { createControlsRepository } from "./controls-repo.js";
 import { createEventRepository } from "./event-repo.js";
 import { createPool, type DbCredentials, type DbTlsInput, type Pool } from "./pool.js";
 import { createReportingRepository } from "./reporting-repo.js";
+import { createShadowRepository } from "./shadow-repo.js";
 import { createUsageRepository } from "./usage-repo.js";
 
 const PING_TIMEOUT_MS = 1_000;
@@ -33,6 +35,8 @@ export interface Db {
   events: EventRepository;
   /** Bot and crawler visits (bot-visit.v1): statements on bot_visits only. */
   botVisits: BotVisitRepository;
+  /** Watch-only source comparison counters (migration 0015): statements on source_shadow_counts only. */
+  shadow: ShadowRepository;
   /** SELECT 1 with a 1 s timeout; false on any error. */
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -56,6 +60,7 @@ export function createDb(opts: { databaseUrl: string; ssl: DbTlsInput; credentia
     reporting: createReportingRepository(pool, logger),
     events: createEventRepository(pool, logger),
     botVisits: createBotVisitRepository(pool, logger),
+    shadow: createShadowRepository(pool, logger),
     async ping() {
       let timer: NodeJS.Timeout | undefined;
       try {

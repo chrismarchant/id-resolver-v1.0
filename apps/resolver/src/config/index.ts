@@ -4,12 +4,16 @@
  * Secrets are read once and never logged; `describeConfig()` returns only
  * non-secret values.
  */
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import { IDENTIFIER_PATTERN } from "../contracts/api.js";
 import { EVENT_CONSENT_MODES } from "../contracts/event.js";
 import { parseCaCert, parseTlsPins, SSL_MODES, type DbTlsConfig } from "../db/tls.js";
 import { DEFAULT_RUNTIME_ROLE, RUNTIME_PASSWORD_PATTERN, RUNTIME_ROLE_PATTERN } from "../db/runtime-role.js";
 import { HOSTING_RANGES_MODES } from "../ip/hosting-ranges.js";
+
+export const SHADOW_SOURCES_MODES = ["off", "on"] as const;
 
 const intInRange = (min: number, max: number, def: number) =>
   z.coerce.number().int().min(min).max(max).default(def);
@@ -153,14 +157,50 @@ export const ConfigSchema = z.object({
    * enforce: a match is answered excluded with no provider call.
    */
   HOSTING_RANGES_MODE: z.enum(HOSTING_RANGES_MODES).default("off"),
+
+  // Watch-only source comparison (src/shadow/, RUNTIME.md "Source comparison"; contract source-shadow.v1).
+  /**
+   * off (default): nothing is loaded, no request is sent. on: every cache miss is also looked up in the
+   * configured sources below and daily aggregate counts are stored; resolution outcomes never change.
+   */
+  SHADOW_SOURCES_MODE: z.enum(SHADOW_SOURCES_MODES).default("off"),
+  /** Secret. ipapi.is key; unset (empty) = the source is not used. At least 8 characters when set. */
+  IPAPI_IS_API_KEY: z.string().max(512).default(""),
+  /** Secret. IPLocate key; unset (empty) = the source is not used. At least 8 characters when set. */
+  IPLOCATE_API_KEY: z.string().max(512).default(""),
+  /** Requests per UTC day, reserved atomically in the database (free tiers allow 1,000 a day). 0 = none. */
+  SHADOW_IPAPI_DAILY_LIMIT: intInRange(0, 100_000, 900),
+  SHADOW_IPLOCATE_DAILY_LIMIT: intInRange(0, 100_000, 900),
+  /** Per-source HTTP timeout. */
+  SHADOW_TIMEOUT_MS: intInRange(200, 10_000, 2_000),
+  /** Addresses looked up at once; more wait in a queue of SHADOW_QUEUE_MAX, beyond which they are dropped (counted). */
+  SHADOW_CONCURRENCY: intInRange(1, 32, 4),
+  SHADOW_QUEUE_MAX: intInRange(1, 10_000, 200),
+  /** IPNetDB prefix database (downloaded weekly, looked up locally). Only used when SHADOW_SOURCES_MODE=on. */
+  IPNETDB_ENABLED: boolFromString(true),
+  IPNETDB_MANIFEST_URL: z.string().url().max(512).default("https://ipnetdb.com/latest.json"),
+  /** Where the database file (about 200 MB) is downloaded; the loader only ever touches its own files here. */
+  IPNETDB_DIR: z.string().min(1).max(1024).default(join(tmpdir(), "ipnetdb")),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
 
+/** Shortest accepted key for an extra source (a shorter value is a mistake, not a key). */
+export const SHADOW_KEY_MIN_LENGTH = 8;
+
 /** Minimum shutdown time beyond one request deadline, so in-flight jobs can settle before the process exits. */
 export const SHUTDOWN_DRAIN_MARGIN_MS = 500;
 
-export const SECRET_KEYS = ["RESOLVER_AUTH_TOKEN", "REPORTING_AUTH_TOKEN", "IP_HMAC_SECRET", "ENRICH_API_KEY", "DATABASE_URL", "DATABASE_RUNTIME_PASSWORD"] as const;
+export const SECRET_KEYS = [
+  "RESOLVER_AUTH_TOKEN",
+  "REPORTING_AUTH_TOKEN",
+  "IP_HMAC_SECRET",
+  "ENRICH_API_KEY",
+  "DATABASE_URL",
+  "DATABASE_RUNTIME_PASSWORD",
+  "IPAPI_IS_API_KEY",
+  "IPLOCATE_API_KEY",
+] as const;
 
 /** Kept out of describeConfig (not secret, but large and of no use in a log line). */
 const UNLOGGED_KEYS = ["DATABASE_CA_CERT"] as const;
@@ -218,7 +258,29 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (cfg.SHUTDOWN_GRACE_MS < cfg.REQUEST_DEADLINE_MS + SHUTDOWN_DRAIN_MARGIN_MS) {
     throw new ConfigError(`invalid configuration: SHUTDOWN_GRACE_MS must be at least REQUEST_DEADLINE_MS + ${SHUTDOWN_DRAIN_MARGIN_MS}`);
   }
+  for (const k of ["IPAPI_IS_API_KEY", "IPLOCATE_API_KEY"] as const) {
+    if (cfg[k].length > 0 && cfg[k].length < SHADOW_KEY_MIN_LENGTH) {
+      throw new ConfigError(`invalid configuration: ${k} must be at least ${SHADOW_KEY_MIN_LENGTH} characters when set (leave it unset to not use the source)`);
+    }
+  }
+  if (new URL(cfg.IPNETDB_MANIFEST_URL).protocol !== "https:") {
+    throw new ConfigError("invalid configuration: IPNETDB_MANIFEST_URL must use https");
+  }
   return cfg;
+}
+
+export interface ShadowSourcesState {
+  mode: "on" | "off";
+  ipapi: "active" | "no_key" | "off";
+  iplocate: "active" | "no_key" | "off";
+  ipnetdb: "enabled" | "disabled" | "off";
+}
+
+/** Which extra sources the comparison uses (names and states only, never a key). */
+export function shadowSourcesState(cfg: Config): ShadowSourcesState {
+  if (cfg.SHADOW_SOURCES_MODE !== "on") return { mode: "off", ipapi: "off", iplocate: "off", ipnetdb: "off" };
+  const key = (v: string) => (v.length >= SHADOW_KEY_MIN_LENGTH ? "active" : "no_key");
+  return { mode: "on", ipapi: key(cfg.IPAPI_IS_API_KEY), iplocate: key(cfg.IPLOCATE_API_KEY), ipnetdb: cfg.IPNETDB_ENABLED ? "enabled" : "disabled" };
 }
 
 /** The variables the database TLS policy reads (shared by the service, migrate and the ops commands). */
@@ -362,5 +424,10 @@ export function describeConfig(cfg: Config): Record<string, string | number | bo
     out[k] = v as string | number | boolean | string[];
   }
   out["REPORTING_ENABLED"] = cfg.REPORTING_AUTH_TOKEN !== undefined;
+  // Which extra sources are configured, never their keys.
+  const shadow = shadowSourcesState(cfg);
+  out["SHADOW_IPAPI"] = shadow.ipapi;
+  out["SHADOW_IPLOCATE"] = shadow.iplocate;
+  out["SHADOW_IPNETDB"] = shadow.ipnetdb;
   return out;
 }
