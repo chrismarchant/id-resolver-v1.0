@@ -116,7 +116,8 @@ async function main(): Promise<void> {
     ipnetdb = config.IPNETDB_ENABLED ? createIpnetdbLoader({ manifestUrl: config.IPNETDB_MANIFEST_URL, dir: config.IPNETDB_DIR, logger }) : undefined;
     shadow = createShadowRunner({
       scope: { installationId: config.INSTALLATION_ID, websiteId: config.WEBSITE_ID },
-      repo: db.shadow,
+      // Unlogged repository: the runner reports its own failures as shadow_write_failed, never as db_error.
+      repo: db.shadowCounters,
       logger,
       ...(ipapi ? { ipapi } : {}),
       ...(iplocate ? { iplocate } : {}),

@@ -2,21 +2,29 @@
  * Runner for the watch-only source comparison (SHADOW_SOURCES_MODE=on).
  *
  * The pipeline calls observe() once per cache miss. observe() is synchronous,
- * O(1) and never throws: it drops a repeat of an address already measured
- * this UTC day (`dropped_duplicate`) or an address arriving while the queue is
- * full (`dropped_overload`), and otherwise queues the address and hands back
- * a handle through which the pipeline later reports what Enrich did.
+ * O(1) and never throws, and it only records the address in memory: no file
+ * read, database query or request starts on the caller's stack (the queue is
+ * worked from a setImmediate callback). It drops a repeat of an address
+ * already measured this UTC day (`dropped_duplicate`) or an address arriving
+ * while SHADOW_QUEUE_MAX addresses are already being measured (queued, looked
+ * up, or waiting for Enrich's result or their counter write:
+ * `dropped_overload`), and otherwise queues the address and hands back a
+ * handle through which the pipeline later reports what Enrich did. So the work
+ * held in memory is bounded whatever the sources or the database do.
  *
  * Up to SHADOW_CONCURRENCY workers take queued addresses. For each one: the
  * daily quota of each configured API source is reserved atomically in the
  * database (not reserved: verdict `quota`, no request is sent); the sources
  * are asked in parallel, each bounded by SHADOW_TIMEOUT_MS; IPNetDB is looked
- * up locally. The worker slot is then free; the comparison waits for the
- * pipeline's Enrich result (at most 30 s, then `not_called`/`unknown`),
- * computes the counters (src/shadow/compare.ts) and writes them in one
- * statement. Database work goes through SHADOW_DB_MAX_IN_FLIGHT connections at
- * most (the pool is sized for them in src/main.ts), so the comparison never
- * takes a connection a resolution job needs.
+ * up from its file (asynchronous reads). The worker slot is then free; the
+ * comparison waits for the pipeline's Enrich result (at most 30 s, then
+ * `not_called`/`unknown`), computes the counters (src/shadow/compare.ts) and
+ * writes them in one statement. Database work goes through
+ * SHADOW_DB_MAX_IN_FLIGHT connections at most (the pool is sized for them in
+ * src/main.ts), so the comparison never takes a connection a resolution job
+ * needs. The repository it is given should not log (src/db/index.ts
+ * `shadowCounters`): its failures are this runner's `shadow_write_failed`,
+ * never the resolution path's `db_error`.
  *
  * Deduplication: a Set of fingerprint hex strings per UTC day, cleared at the
  * day change, at most `dedupMax` (50,000) entries; when full it stops adding
@@ -54,16 +62,18 @@ const DROP_FLUSH_MS = 5_000;
 
 export interface ShadowRunnerOptions {
   scope: { installationId: string; websiteId: string };
+  /** Counter store; build it without a logger (its failures are logged here as shadow_write_failed). */
   repo: ShadowRepository;
   logger: Logger;
   /** Undefined: the source has no key (verdict `disabled`, nothing sent). */
   ipapi?: ApiSourceAdapter;
   iplocate?: ApiSourceAdapter;
-  /** Undefined: IPNETDB_ENABLED=false (verdict `disabled`). */
-  ipnetdb?: { lookup(canonicalIp: string): IpnetdbResult };
+  /** Undefined: IPNETDB_ENABLED=false (verdict `disabled`). Never rejects (src/shadow/ipnetdb.ts). */
+  ipnetdb?: { lookup(canonicalIp: string): Promise<IpnetdbResult> };
   limits: Record<ApiSource, number>;
   timeoutMs: number;
   concurrency: number;
+  /** Addresses being measured at once (queued, looked up, waiting for Enrich or for the write); more are dropped. */
   queueMax: number;
   now?: () => Date;
   completeTimeoutMs?: number;
@@ -74,7 +84,8 @@ export interface ShadowRunnerOptions {
 export interface ShadowRunner extends ShadowObserver {
   /** Stops accepting, then waits for queued and running comparisons and writes, at most `timeoutMs`; aborts the rest. */
   drain(timeoutMs: number): Promise<{ drained: boolean; pending: number }>;
-  stats(): { queued: number; running: number; pending: number; dedup: number };
+  /** queued: not started; running: asking the sources; inFlight: accepted and not yet written (bounded by queueMax). */
+  stats(): { queued: number; running: number; inFlight: number; pending: number; dedup: number };
 }
 
 /** UTC calendar date (YYYY-MM-DD). */
@@ -115,8 +126,11 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
   const waiting = new Set<Task>();
   /** Every comparison not yet written, and every drop flush in progress. */
   const pending = new Set<Promise<void>>();
+  /** Accepted addresses not yet written (queued, running, waiting for Enrich or the write): at most queueMax. */
+  let inFlight = 0;
   let running = 0;
   let stopped = false;
+  let pumpScheduled = false;
 
   let dedupDay = "";
   const dedup = new Set<string>();
@@ -128,13 +142,15 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
   let dbActive = 0;
   const dbWaiters: Array<() => void> = [];
   const db = async <T>(fn: () => Promise<T>): Promise<T> => {
+    // A freed slot is handed straight to the next waiter, so the count never exceeds the bound.
     if (dbActive >= SHADOW_DB_MAX_IN_FLIGHT) await new Promise<void>((r) => dbWaiters.push(r));
-    dbActive += 1;
+    else dbActive += 1;
     try {
       return await fn();
     } finally {
-      dbActive -= 1;
-      dbWaiters.shift()?.();
+      const next = dbWaiters.shift();
+      if (next) next();
+      else dbActive -= 1;
     }
   };
 
@@ -150,10 +166,9 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
     if (dropTimer) clearTimeout(dropTimer);
     dropTimer = null;
     for (const [day, counts] of drops) {
-      const metrics: ShadowMetric[] = [];
-      for (const [m, n] of counts) for (let i = 0; i < n; i += 1) metrics.push(m);
+      const deltas = Object.fromEntries(counts) as Partial<Record<ShadowMetric, number>>;
       track(
-        db(() => repo.increment(scopeFor(day), metrics)).catch(() => {
+        db(() => repo.increment(scopeFor(day), deltas)).catch(() => {
           logger.warn("shadow_write_failed", { category: "drop_counters" });
         }),
       );
@@ -194,17 +209,20 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
     return apiVerdict(outcome);
   };
 
+  const lookIpnetdb = async (ip: string): Promise<IpnetdbResult> => {
+    if (!opts.ipnetdb) return { verdict: "disabled" };
+    try {
+      return await opts.ipnetdb.lookup(ip);
+    } catch {
+      return { verdict: "unavailable" };
+    }
+  };
+
   const lookups = async (task: Task): Promise<Sources> => {
     const scope = scopeFor(task.day);
     const ip = task.ip;
     task.ip = "";
-    let ipnetdb: IpnetdbResult;
-    try {
-      ipnetdb = opts.ipnetdb ? opts.ipnetdb.lookup(ip) : { verdict: "disabled" };
-    } catch {
-      ipnetdb = { verdict: "unavailable" };
-    }
-    const [ipapi, iplocate] = await Promise.all([ask(opts.ipapi, "ipapi", scope, ip), ask(opts.iplocate, "iplocate", scope, ip)]);
+    const [ipnetdb, ipapi, iplocate] = await Promise.all([lookIpnetdb(ip), ask(opts.ipapi, "ipapi", scope, ip), ask(opts.iplocate, "iplocate", scope, ip)]);
     return { ipapi, iplocate, ipnetdb };
   };
 
@@ -233,6 +251,7 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
   };
 
   const pump = (): void => {
+    pumpScheduled = false;
     // After an aborted drain nothing new starts.
     while (!controller.signal.aborted && running < opts.concurrency && queueHead < queue.length) {
       const task = queue[queueHead]!;
@@ -246,7 +265,7 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
       const looked = lookups(task);
       void looked.then(noop, noop).finally(() => {
         running -= 1;
-        pump();
+        schedulePump();
       });
       track(
         looked
@@ -258,9 +277,18 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
             if (task.timer) clearTimeout(task.timer);
             task.timer = null;
             waiting.delete(task);
+            inFlight -= 1;
           }),
       );
     }
+  };
+
+  /** The queue is worked from a fresh macrotask, never on the stack that queued an address. */
+  const schedulePump = (): void => {
+    if (pumpScheduled || controller.signal.aborted) return;
+    if (queueHead >= queue.length) return;
+    pumpScheduled = true;
+    setImmediate(pump);
   };
 
   const queued = () => queue.length - queueHead;
@@ -278,7 +306,7 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
         countDrop(day, "dropped_duplicate");
         return null;
       }
-      if (queued() >= opts.queueMax) {
+      if (inFlight >= opts.queueMax) {
         countDrop(day, "dropped_overload");
         return null;
       }
@@ -298,8 +326,9 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
       task.timer = setTimeout(() => complete(UNKNOWN), completeTimeoutMs);
       task.timer.unref();
       waiting.add(task);
+      inFlight += 1;
       queue.push(task);
-      pump();
+      schedulePump();
       return {
         complete(summary: EnrichSummary): void {
           try {
@@ -328,18 +357,20 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
     }
     waiting.clear();
     const until = Date.now() + Math.max(0, timeoutMs);
-    while (pending.size > 0 && Date.now() < until) {
+    // Queued addresses not started yet are not in `pending`: wait for the queue too.
+    while ((pending.size > 0 || queued() > 0) && Date.now() < until) {
       let t: NodeJS.Timeout | undefined;
-      await Promise.race([Promise.all([...pending]), new Promise<void>((r) => (t = setTimeout(r, Math.max(1, until - Date.now()))))]);
+      await Promise.race([Promise.all([...pending]), new Promise<void>((r) => (t = setTimeout(r, Math.max(1, Math.min(50, until - Date.now())))))]);
       clearTimeout(t);
     }
-    const drained = pending.size === 0;
+    const drained = pending.size === 0 && queued() === 0;
     if (!drained) {
       controller.abort();
       for (let i = queueHead; i < queue.length; i += 1) {
         const task = queue[i];
         if (task?.timer) clearTimeout(task.timer);
       }
+      inFlight -= queued();
       queue.length = 0;
       queueHead = 0;
     }
@@ -349,6 +380,6 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
   return {
     observe,
     drain,
-    stats: () => ({ queued: queued(), running, pending: pending.size, dedup: dedup.size }),
+    stats: () => ({ queued: queued(), running, inFlight, pending: pending.size, dedup: dedup.size }),
   };
 }

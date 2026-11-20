@@ -35,8 +35,13 @@ export interface Db {
   events: EventRepository;
   /** Bot and crawler visits (bot-visit.v1): statements on bot_visits only. */
   botVisits: BotVisitRepository;
-  /** Watch-only source comparison counters (migration 0015): statements on source_shadow_counts only. */
+  /** Watch-only source comparison counters (migration 0015): statements on source_shadow_counts only. For the reporting route. */
   shadow: ShadowRepository;
+  /**
+   * The same counters for the comparison runner, WITHOUT the logger: a failed background counter write is the
+   * runner's shadow_write_failed, never a db_error line that would look like a resolution database failure.
+   */
+  shadowCounters: ShadowRepository;
   /** SELECT 1 with a 1 s timeout; false on any error. */
   ping(): Promise<boolean>;
   close(): Promise<void>;
@@ -61,6 +66,7 @@ export function createDb(opts: { databaseUrl: string; ssl: DbTlsInput; credentia
     events: createEventRepository(pool, logger),
     botVisits: createBotVisitRepository(pool, logger),
     shadow: createShadowRepository(pool, logger),
+    shadowCounters: createShadowRepository(pool),
     async ping() {
       let timer: NodeJS.Timeout | undefined;
       try {

@@ -81,8 +81,9 @@ export interface TableGrant {
  *  - deployment_controls is SELECT only: the service reads the kill switch;
  *    engaging or releasing it (ops:kill-switch) is an owner operation.
  *  - source_shadow_counts (the watch-only source comparison's daily counters,
- *    0015) is SELECT, INSERT and UPDATE: the service adds to counters and
- *    reserves daily source quota by upsert; nothing deletes them (no DELETE).
+ *    0015) is SELECT, INSERT and UPDATE (count) only: the service adds to
+ *    counters and reserves daily source quota by upsert, which changes nothing
+ *    but the count; nothing deletes them (no DELETE).
  */
 export const RUNTIME_GRANTS: Readonly<Record<string, TableGrant>> = {
   schema_migrations: { select: true },
@@ -97,7 +98,7 @@ export const RUNTIME_GRANTS: Readonly<Record<string, TableGrant>> = {
   feed_retention_watermarks: { select: true },
   browser_events: { select: true, insert: true, update: ["id"], delete: true },
   bot_visits: { select: true, insert: true, update: ["id"], delete: true },
-  source_shadow_counts: { select: true, insert: true, update: true },
+  source_shadow_counts: { select: true, insert: true, update: ["count"] },
 };
 
 /** USAGE (nextval) on the sequences behind the tables the runtime role inserts into; false = none. */
