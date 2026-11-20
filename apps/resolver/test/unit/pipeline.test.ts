@@ -9,6 +9,7 @@ import { canonicaliseIp } from "../../src/ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../../src/ip/fingerprint.js";
 import { createMemoryLogger } from "../../src/log/index.js";
 import { createMockProvider, type MockScript } from "../../src/provider/mock.js";
+import type { EnrichSummary, ShadowObserveContext, ShadowObserver } from "../../src/shadow/types.js";
 import { createFakeRepositories } from "../helpers/fakes.js";
 
 const SECRET = "0123456789abcdef".repeat(4);
@@ -988,5 +989,179 @@ describe("runJob: activity counters (GET /v1/reporting/activity)", () => {
     await Promise.all(deferred);
     expect(o.status).toBe("no_match");
     expect(t.logger.entries.some((l) => l["event"] === "db_error" && l["category"] === "usage_activity")).toBe(true);
+  });
+});
+
+describe("runJob: watch-only source comparison (SHADOW_SOURCES_MODE)", () => {
+  interface Observed {
+    ip: string;
+    key: string;
+    context: ShadowObserveContext | undefined;
+  }
+  function recordingShadow(mode: { throwOnObserve?: boolean; throwOnComplete?: boolean; returnNull?: boolean } = {}) {
+    const observed: Observed[] = [];
+    const completions: EnrichSummary[] = [];
+    const shadow: ShadowObserver = {
+      observe(ip, key, context) {
+        if (mode.throwOnObserve) throw new Error(`shadow down ${ip}`);
+        // The pipeline zeroes the fingerprint after the job: copy it now, as the real runner does.
+        observed.push({ ip, key: Buffer.isBuffer(key) ? key.toString("hex") : key, context });
+        if (mode.returnNull) return null;
+        return {
+          complete(s) {
+            completions.push(s);
+            if (mode.throwOnComplete) throw new Error("shadow down");
+          },
+        };
+      },
+    };
+    return { shadow, observed, completions };
+  }
+  const withShadow = (t: ReturnType<typeof setup>, s: ReturnType<typeof recordingShadow>): PipelineDeps => ({ ...t.deps, shadow: s.shadow });
+
+  it("observes a cache miss with the canonical address and its fingerprint, and reports Enrich's result once", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+    const s = recordingShadow();
+    const o = await runJob(withShadow(t, s), t.config, job());
+    expect(o).toMatchObject({ status: "qualified", source: "provider" });
+    expect(s.observed).toEqual([{ ip: IP, key: keyFor(t.config).ipFingerprint.toString("hex"), context: { hostingRangeMatched: false } }]);
+    expect(s.completions).toEqual([{ kind: "resolved", domain: "example.com", usageType: "COM", status: "qualified", organisationName: "Example Ltd" }]);
+  });
+
+  it("IPv6 is observed in canonical form", async () => {
+    const t = setup();
+    const s = recordingShadow();
+    await runJob(withShadow(t, s), t.config, job("2001:DB8:0:0::99"));
+    expect(s.observed.map((x) => x.ip)).toEqual(["2001:db8::99"]);
+  });
+
+  it("cache hits, pending lookups, ineligible and invalid addresses are not observed", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+    await runJob(t.deps, t.config, job());
+    const s = recordingShadow();
+    const deps = withShadow(t, s);
+    expect(await runJob(deps, t.config, job())).toMatchObject({ source: "cache" });
+    expect(await runJob(deps, t.config, job("10.0.0.1"))).toMatchObject({ status: "ineligible" });
+    expect(await runJob(deps, t.config, job("not-an-ip"))).toMatchObject({ status: "ineligible" });
+    const pendingIp = "203.0.113.90";
+    const config = makeConfig({ policy: { pending_wait_ms: 50, pending_poll_ms: 10 } });
+    await t.repos.cache.reserve(keyFor(config, pendingIp), { leaseMs: 10_000 });
+    expect(await runJob(deps, config, job(pendingIp))).toMatchObject({ status: "pending" });
+    expect(s.observed).toEqual([]);
+    expect(s.completions).toEqual([]);
+  });
+
+  it("is not observed when HOSTING_RANGES_MODE=enforce excludes the address first; shadow mode passes the match on", async () => {
+    const m = { generatedAt: "2026-11-09", prefixCount: 1, lookup: (c: string) => (c === IP ? ("aws" as const) : null) };
+    const t = setup({ [IP]: { outcome: resolved("host.example", "DCH") } });
+    const enforce = recordingShadow();
+    await runJob({ ...withShadow(t, enforce), hostingRanges: m }, makeConfig({ policy: { hosting_ranges_mode: "enforce" } }), job());
+    expect(enforce.observed).toEqual([]);
+    const shadow = recordingShadow();
+    await runJob({ ...withShadow(t, shadow), hostingRanges: m }, makeConfig({ policy: { hosting_ranges_mode: "shadow" } }), job());
+    expect(shadow.observed.map((x) => x.context)).toEqual([{ hostingRangeMatched: true }]);
+  });
+
+  it.each<[string, () => { t: ReturnType<typeof setup>; config: PipelineConfig; j?: ResolutionJob }, EnrichSummary]>([
+    ["no domain", () => ({ t: setup({ [IP]: { outcome: { kind: "no_domain", creditsReported: 0 } } }), config: makeConfig() }), { kind: "no_domain" }],
+    [
+      "excluded domain",
+      () => ({ t: setup({ [IP]: { outcome: resolved("isp.example", "ISP") } }), config: makeConfig() }),
+      { kind: "resolved", domain: "isp.example", usageType: "ISP", status: "excluded", organisationName: "Example Ltd" },
+    ],
+    [
+      "unknown usage type",
+      () => ({ t: setup({ [IP]: { outcome: resolved("example.org", null) } }), config: makeConfig() }),
+      { kind: "resolved", domain: "example.org", usageType: null, status: "unknown", organisationName: "Example Ltd" },
+    ],
+    ["provider error", () => ({ t: setup({ [IP]: { outcome: { kind: "error", category: "server", retryAfterMs: null } } }), config: makeConfig() }), { kind: "error", category: "server" }],
+    [
+      "provider timeout",
+      () => ({ t: setup({ [IP]: { outcome: resolved("example.com", "COM"), delayMs: 2_000 } }), config: makeConfig({ provider: { timeout_ms: 250 } }) }),
+      { kind: "timeout" },
+    ],
+    ["provider disabled", () => ({ t: setup(), config: makeConfig({ provider: { mode: "disabled" } }) }), { kind: "not_called", reason: "provider_disabled" }],
+    ["call cap", () => ({ t: setup(), config: makeConfig({ policy: { period_call_cap: 0 } }) }), { kind: "not_called", reason: "cap_exhausted" }],
+    ["resolved cap", () => ({ t: setup(), config: makeConfig({ policy: { period_resolved_cap: 0 } }) }), { kind: "not_called", reason: "cap_exhausted" }],
+    ["too little time left for a provider call", () => ({ t: setup(), config: makeConfig(), j: job(IP, 600) }), { kind: "not_called", reason: "deadline_exceeded" }],
+  ])("%s -> complete() once with the matching summary", async (_label, make, expected) => {
+    const { t, config, j } = make();
+    const s = recordingShadow();
+    await runJob(withShadow(t, s), config, j ?? job());
+    expect(s.observed).toHaveLength(1);
+    expect(s.completions).toEqual([expected]);
+  });
+
+  it("kill switch, database error, deadline abort and internal errors -> not_called with the reason", async () => {
+    const kill = setup();
+    await kill.repos.controls.setEnrichmentEnabled(kill.config.installation_id, false, "test");
+    const s1 = recordingShadow();
+    await runJob(withShadow(kill, s1), kill.config, job());
+    expect(s1.completions).toEqual([{ kind: "not_called", reason: "kill_switch" }]);
+
+    const db = setup();
+    db.repos.usage.failures.reserveProviderAttempt = true;
+    const s2 = recordingShadow();
+    expect(await runJob(withShadow(db, s2), db.config, job())).toMatchObject({ reason: "database_error" });
+    expect(s2.completions).toEqual([{ kind: "not_called", reason: "database_error" }]);
+
+    const abort = setup();
+    const controller = new AbortController();
+    const isEnabled = abort.repos.controls.isEnrichmentEnabled.bind(abort.repos.controls);
+    abort.repos.controls.isEnrichmentEnabled = async (id: string) => {
+      controller.abort();
+      return isEnabled(id);
+    };
+    const s3 = recordingShadow();
+    await runJob(withShadow(abort, s3), abort.config, { ...job(), signal: controller.signal });
+    expect(s3.completions).toEqual([{ kind: "not_called", reason: "deadline_exceeded" }]);
+
+    // A repository that throws synchronously is still a database error.
+    const syncDb = setup();
+    syncDb.repos.controls.isEnrichmentEnabled = () => {
+      throw new Error("sync");
+    };
+    const s4 = recordingShadow();
+    await runJob(withShadow(syncDb, s4), syncDb.config, job());
+    expect(s4.completions).toEqual([{ kind: "not_called", reason: "database_error" }]);
+
+    // A provider adapter breaking its never-throw contract is an internal error.
+    const internal = setup();
+    const provider: ProviderAdapter = {
+      name: "throwing",
+      lookup: () => {
+        throw new Error("adapter bug");
+      },
+    };
+    const s5 = recordingShadow();
+    expect(await runJob({ ...withShadow(internal, s5), provider }, internal.config, job())).toMatchObject({ reason: "internal_error" });
+    expect(s5.completions).toEqual([{ kind: "not_called", reason: "internal_error" }]);
+  });
+
+  it("a database failure after the provider answered still reports what Enrich said", async () => {
+    const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+    t.repos.cache.failures.commit = true;
+    const s = recordingShadow();
+    expect(await runJob(withShadow(t, s), t.config, job())).toMatchObject({ status: "unavailable", reason: "database_error" });
+    expect(s.completions).toEqual([{ kind: "resolved", domain: "example.com", usageType: "COM", status: "qualified", organisationName: "Example Ltd" }]);
+  });
+
+  it.each([
+    ["observe throws", { throwOnObserve: true }],
+    ["complete throws", { throwOnComplete: true }],
+    ["observe declines (null)", { returnNull: true }],
+  ])("%s: the outcome, the counters and the job's logs are identical to running without it", async (_label, mode) => {
+    const run = async (shadow?: ReturnType<typeof recordingShadow>) => {
+      const t = setup({ [IP]: { outcome: resolved("example.com", "COM") } });
+      const o = await runJob(shadow ? withShadow(t, shadow) : t.deps, t.config, job());
+      const logs = t.logger.entries.map(({ time: _time, duration_ms: _d, ...rest }) => rest);
+      const snap = await t.snapshot();
+      return { o, logs, snap, cache: t.repos.cache.inspect(keyFor(t.config))?.status };
+    };
+    const without = await run();
+    const s = recordingShadow(mode);
+    const withIt = await run(s);
+    expect(withIt).toEqual(without);
+    if (mode.throwOnComplete) expect(s.completions).toHaveLength(1);
   });
 });

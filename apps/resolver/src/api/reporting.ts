@@ -19,6 +19,11 @@
  * when a bot visit store is supplied: one date range of at most
  * BOT_VISITS_MAX_RANGE_DAYS, keyset-paginated on (observed_at, id).
  *
+ * The watch-only source comparison's daily counters (source-shadow.v1,
+ * GET /v1/reporting/source-shadow) are registered when a counter store is
+ * supplied (always, from src/main.ts): one date range of at most
+ * SOURCE_SHADOW_MAX_RANGE_DAYS, counts only.
+ *
  * The observation feed (reporting-feed.v1, GET /v1/reporting/observations) is
  * registered only when `feed.cursorKey` is supplied: its cursors are
  * integrity-protected (HMAC) positions, see encodeFeedCursor below.
@@ -41,6 +46,7 @@ import {
   type ReportingBrowserEvent,
   type ReportingEventsResponse,
   type ReportingScope,
+  type ReportingSourceShadowResponse,
   type ReportingSummaryResponse,
   type ResolutionStatus,
 } from "../contracts/api.js";
@@ -51,6 +57,7 @@ import type {
   ObservationItem,
   ObservationsCursor,
   ReportingRepository,
+  ShadowRepository,
   UsageCounter,
   UsagePeriodActivity,
 } from "../contracts/db.js";
@@ -80,6 +87,9 @@ export const REPORTING_PREFIX = "/v1/reporting";
 export const FEED_ROUTE = `${REPORTING_PREFIX}/observations`;
 export const BOT_VISITS_REPORTING_ROUTE = `${REPORTING_PREFIX}/bot-visits`;
 export const EVENTS_REPORTING_ROUTE = `${REPORTING_PREFIX}/events`;
+export const SOURCE_SHADOW_REPORTING_ROUTE = `${REPORTING_PREFIX}/source-shadow`;
+/** Longest range GET /v1/reporting/source-shadow serves (inclusive days). */
+export const SOURCE_SHADOW_MAX_RANGE_DAYS = 31;
 
 export interface ReportingFeedOptions {
   /** 32-byte key for the cursor MAC; derive it with deriveFeedCursorKey from a server-only secret. */
@@ -99,6 +109,8 @@ export interface ReportingDeps {
   botVisits?: BotVisitRepository;
   /** Enables GET /v1/reporting/events (browser events, read-only). Absent: the route does not exist. */
   events?: Pick<EventRepository, "list">;
+  /** Enables GET /v1/reporting/source-shadow (daily counters of the watch-only source comparison). */
+  sourceShadow?: Pick<ShadowRepository, "report">;
 }
 
 export function activityPeriodWire(p: UsagePeriodActivity): ReportingActivityPeriod {
@@ -555,6 +567,31 @@ export function registerReportingRoutes(app: FastifyInstance, deps: ReportingDep
           next_cursor: more && last ? encodeEventsCursor(last) : null,
         };
         logger.info("request_completed", { route, http_status: 200, count: body.items.length });
+        return reply.code(200).send(body);
+      } catch {
+        return dbFailed(reply, route);
+      }
+    });
+  }
+
+  if (deps.sourceShadow) {
+    const sourceShadow = deps.sourceShadow;
+    app.get(SOURCE_SHADOW_REPORTING_ROUTE, async (req, reply) => {
+      const route = SOURCE_SHADOW_REPORTING_ROUTE;
+      const q = ActivityQuerySchema.safeParse(req.query ?? {});
+      if (!q.success) return rejected(reply, route, "invalid_request", 400);
+      const range = dateRange(q.data.from, q.data.to);
+      if (!range || range.to.getTime() - range.from.getTime() > SOURCE_SHADOW_MAX_RANGE_DAYS * DAY_MS) return rejected(reply, route, "invalid_request", 400);
+      try {
+        const days = await sourceShadow.report(scope.installation_id, scope.website_id, q.data.from, q.data.to);
+        const body: ReportingSourceShadowResponse = {
+          version: REPORTING_API_VERSION,
+          scope,
+          from: q.data.from,
+          to: q.data.to,
+          days: days.map((d) => ({ date: d.date, metrics: { ...d.metrics } as Record<string, number> })),
+        };
+        logger.info("request_completed", { route, http_status: 200, count: body.days.length });
         return reply.code(200).send(body);
       } catch {
         return dbFailed(reply, route);

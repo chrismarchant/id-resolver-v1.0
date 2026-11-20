@@ -11,8 +11,9 @@
 import { z } from "zod";
 import type { ProviderAdapter, ProviderErrorCategory, ProviderOutcome } from "../contracts/provider.js";
 import { canonicaliseDomain, canonicaliseOrganisationName, canonicaliseUsageType, sameOrganisation } from "../resolution/qualify.js";
+import { BodyTooLargeError, DEFAULT_MAX_BODY_BYTES, readCappedText } from "./http.js";
 
-export const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
+export { DEFAULT_MAX_BODY_BYTES };
 const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 
 export interface EnrichAdapterOptions {
@@ -71,29 +72,6 @@ function statusCategory(status: number): ProviderErrorCategory {
   if (status === 402) return "credits";
   if (status === 429) return "rate_limited";
   return "server";
-}
-
-async function readCappedText(res: Response, maxBytes: number): Promise<string> {
-  const declared = Number(res.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    await res.body?.cancel().catch(() => undefined);
-    throw new MalformedBody();
-  }
-  if (!res.body) return "";
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maxBytes) {
-      await reader.cancel().catch(() => undefined);
-      throw new MalformedBody();
-    }
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks).toString("utf8");
 }
 
 function interpret(text: string): ProviderOutcome {
@@ -159,7 +137,7 @@ export function createEnrichAdapter(opts: EnrichAdapterOptions): ProviderAdapter
         return interpret(await readCappedText(res, maxBytes));
       } catch (err) {
         if (signal.aborted) return { kind: "timeout" };
-        if (err instanceof MalformedBody) return { kind: "error", category: "malformed", retryAfterMs: null };
+        if (err instanceof MalformedBody || err instanceof BodyTooLargeError) return { kind: "error", category: "malformed", retryAfterMs: null };
         return { kind: "error", category: "network", retryAfterMs: null };
       }
     },
