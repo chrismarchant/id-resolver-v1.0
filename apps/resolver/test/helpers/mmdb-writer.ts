@@ -21,8 +21,8 @@ import ipaddr from "ipaddr.js";
 
 export class Typed {
   constructor(
-    readonly type: "uint16" | "uint32" | "uint64" | "uint128" | "int32" | "double" | "float",
-    readonly value: number | bigint,
+    readonly type: "uint16" | "uint32" | "uint64" | "uint128" | "int32" | "double" | "float" | "raw",
+    readonly value: number | bigint | Buffer,
   ) {}
 }
 
@@ -34,7 +34,19 @@ export const mmdbType = {
   int32: (v: number) => new Typed("int32", v),
   double: (v: number) => new Typed("double", v),
   float: (v: number) => new Typed("float", v),
+  /** Bytes written verbatim into the data section (hand-made, possibly hostile, encodings). */
+  raw: (b: Buffer) => new Typed("raw", b),
 };
+
+/** Control byte(s) of a field: for hand-made encodings with mmdbType.raw. Types: 2 string, 7 map, 11 array, ... */
+export function encodeControl(type: number, size: number): Buffer {
+  return control(type, size);
+}
+
+/** A 4-byte pointer (no bias) to `target`, an offset in the data section. */
+export function encodePointer(target: number): Buffer {
+  return pointer(target, 3);
+}
 
 export type MmdbValue = string | number | boolean | Buffer | Typed | MmdbValue[] | { [key: string]: MmdbValue };
 
@@ -142,6 +154,7 @@ class Encoder {
     if (typeof v === "number") return this.write(Number.isSafeInteger(v) && v >= 0 && v <= 0xffffffff ? new Typed("uint32", v) : new Typed("double", v));
     if (Buffer.isBuffer(v)) return this.push(Buffer.concat([control(4, v.length), v]));
     if (v instanceof Typed) {
+      if (v.type === "raw") return this.push(v.value as Buffer);
       switch (v.type) {
         case "double": {
           const b = Buffer.alloc(8);
@@ -160,7 +173,7 @@ class Encoder {
         }
         default: {
           const type = { uint16: 5, uint32: 6, uint64: 9, uint128: 10 }[v.type];
-          const b = minimalBytes(BigInt(v.value));
+          const b = minimalBytes(BigInt(v.value as number | bigint));
           return this.push(Buffer.concat([control(type, b.length), b]));
         }
       }
