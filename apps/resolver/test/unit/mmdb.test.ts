@@ -32,24 +32,24 @@ const NETWORKS: MmdbWriteOptions["networks"] = [
 describe("MmdbReader: lookups", () => {
   it.each([24, 28, 32] as const)("record size %i: IPv4 and IPv6 records with their prefix lengths, not-found addresses", (recordSize) => {
     const { path } = write({ recordSize, networks: NETWORKS });
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
       expect(r.metadata).toMatchObject({ recordSize, ipVersion: 6, databaseType: "IPNetDB-Test", binaryFormatMajorVersion: 2, buildEpoch: 1_700_000_000 });
-      const a = r.lookup("192.0.2.77");
+      const a = await r.lookup("192.0.2.77");
       expect(a.prefixLength).toBe(24);
       expect(a.record).toMatchObject({ prefix: "192.0.2.0/24", prefix_entity: "Example Corp Ltd", as_entity: "Example Transit Inc", as: 64496, prefix_bogon: false, prefix_origins: [64496] });
-      expect(r.lookup("198.51.100.1")).toMatchObject({ prefixLength: 24, record: { prefix_entity: "Example Hosting LLC", as: 64497 } });
-      expect(r.lookup("203.0.113.5")).toMatchObject({ prefixLength: 25, record: { prefix_bogon: true, as: 64498 } });
-      expect(r.lookup("2001:db8:1234::1")).toMatchObject({ prefixLength: 32, record: { prefix: "2001:db8::/32", as: 64499 } });
+      expect(await r.lookup("198.51.100.1")).toMatchObject({ prefixLength: 24, record: { prefix_entity: "Example Hosting LLC", as: 64497 } });
+      expect(await r.lookup("203.0.113.5")).toMatchObject({ prefixLength: 25, record: { prefix_bogon: true, as: 64498 } });
+      expect(await r.lookup("2001:db8:1234::1")).toMatchObject({ prefixLength: 32, record: { prefix: "2001:db8::/32", as: 64499 } });
       // Outside every network: the record is null; the prefix length is how far the tree went.
-      const miss = r.lookup("203.0.113.200");
+      const miss = await r.lookup("203.0.113.200");
       expect(miss.record).toBeNull();
       expect(miss.prefixLength).toBe(25);
-      expect(r.lookup("10.0.0.1").record).toBeNull();
-      expect(r.lookup("fd00::1").record).toBeNull();
-      expect(r.lookup("::1").record).toBeNull();
+      expect(await r.lookup("10.0.0.1").record).toBeNull();
+      expect(await r.lookup("fd00::1").record).toBeNull();
+      expect(await r.lookup("::1").record).toBeNull();
     } finally {
-      r.close();
+      await r.close();
     }
   });
 
@@ -74,9 +74,9 @@ describe("MmdbReader: lookups", () => {
       zero: mmdbType.uint32(0),
     };
     const { path } = write({ networks: [{ network: "198.51.100.0/24", record }] });
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
-      const got = r.lookup("198.51.100.9").record as Record<string, unknown>;
+      const got = await r.lookup("198.51.100.9").record as Record<string, unknown>;
       expect(got).toEqual({
         text: "Grüße, example",
         flag_true: true,
@@ -97,7 +97,7 @@ describe("MmdbReader: lookups", () => {
         zero: 0,
       });
     } finally {
-      r.close();
+      await r.close();
     }
   });
 
@@ -109,36 +109,36 @@ describe("MmdbReader: lookups", () => {
   ])("follows %s to shared strings", (_label, opts) => {
     const { path, build } = write({ recordSize: 32, networks: NETWORKS, ...opts });
     expect(build.pointers).toBeGreaterThan(20);
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
       // The later records' keys and repeated values are all pointers to the first record's strings.
-      expect(r.lookup("2001:db8::5").record).toMatchObject({ prefix_entity: "Example Corp Ltd", as_entity: "Example Transit Inc", allocation_cc: "XA", as: 64499 });
-      expect(r.lookup("198.51.100.200").record).toMatchObject({ prefix_entity: "Example Hosting LLC", as_entity: "Example Hosting LLC" });
+      expect(await r.lookup("2001:db8::5").record).toMatchObject({ prefix_entity: "Example Corp Ltd", as_entity: "Example Transit Inc", allocation_cc: "XA", as: 64499 });
+      expect(await r.lookup("198.51.100.200").record).toMatchObject({ prefix_entity: "Example Hosting LLC", as_entity: "Example Hosting LLC" });
     } finally {
-      r.close();
+      await r.close();
     }
   });
 
   it("an ip_version 4 database answers IPv4 and refuses IPv6", () => {
     const { path } = write({ ipVersion: 4, recordSize: 24, networks: NETWORKS.slice(0, 3) });
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
-      expect(r.lookup("192.0.2.1")).toMatchObject({ prefixLength: 24, record: { as: 64496 } });
-      expect(r.lookup("203.0.113.1")).toMatchObject({ prefixLength: 25 });
-      expect(() => r.lookup("2001:db8::1")).toThrow(MmdbError);
+      expect(await r.lookup("192.0.2.1")).toMatchObject({ prefixLength: 24, record: { as: 64496 } });
+      expect(await r.lookup("203.0.113.1")).toMatchObject({ prefixLength: 25 });
+      expect(() => await r.lookup("2001:db8::1")).toThrow(MmdbError);
     } finally {
-      r.close();
+      await r.close();
     }
   });
 
   it("keeps a bounded page cache over thousands of lookups", () => {
     const { path } = write({ networks: NETWORKS, padding: 2_000_000 });
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
-      for (let i = 0; i < 2_000; i += 1) r.lookup(`192.0.2.${i % 256}`);
+      for (let i = 0; i < 2_000; i += 1) await r.lookup(`192.0.2.${i % 256}`);
       expect((r as unknown as { pages: Map<number, Buffer> }).pages.size).toBeLessThanOrEqual(PAGE_CACHE_PAGES);
     } finally {
-      r.close();
+      await r.close();
     }
   });
 });
@@ -157,13 +157,13 @@ describe("MmdbReader: refusals", () => {
 
   it("refuses lookups after close and non-addresses, with fixed messages", () => {
     const r = MmdbReader.open(write({ networks: NETWORKS }).path);
-    expect(() => r.lookup("not an address")).toThrow(/not an address/);
-    r.close();
-    r.close();
+    expect(() => await r.lookup("not an address")).toThrow(/not an address/);
+    await r.close();
+    await r.close();
     expect(r.closed).toBe(true);
     let message = "";
     try {
-      r.lookup("192.0.2.1");
+      await r.lookup("192.0.2.1");
     } catch (e) {
       message = (e as Error).message;
     }
@@ -180,11 +180,11 @@ describe("MmdbReader: refusals", () => {
       if (v > nodeCount) file.writeUInt32BE(nodeCount + 16 + 10_000_000, off);
     }
     writeFileSync(path, file);
-    const r = MmdbReader.open(path);
+    const r = await MmdbReader.open(path);
     try {
-      expect(() => r.lookup("192.0.2.1")).toThrow(/outside the data section/);
+      expect(() => await r.lookup("192.0.2.1")).toThrow(/outside the data section/);
     } finally {
-      r.close();
+      await r.close();
     }
   });
 });

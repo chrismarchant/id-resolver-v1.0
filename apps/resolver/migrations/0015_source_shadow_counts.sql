@@ -12,7 +12,7 @@
 -- the per-source daily request reservation (`<source>_requests`, only while
 -- below the configured limit). Read by GET /v1/reporting/source-shadow. Not
 -- pruned by observation retention (counts only, like usage_periods). The
--- runtime role gets SELECT, INSERT and UPDATE, no DELETE (src/db/runtime-role.ts).
+-- runtime role gets SELECT, INSERT and UPDATE of count only, no DELETE (src/db/runtime-role.ts).
 
 CREATE TABLE IF NOT EXISTS source_shadow_counts (
   installation_id  text    NOT NULL CHECK (installation_id ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
