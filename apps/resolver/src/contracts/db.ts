@@ -6,6 +6,7 @@
  */
 import type { Acquisition, ResolutionStatus } from "./api.js";
 import type { FeedPage, FeedPosition } from "./reporting-feed.js";
+import type { ApiSource, ShadowMetric, ShadowScope } from "../shadow/types.js";
 
 export const CACHE_STATUSES = [
   "pending", // reservation held; lease_expires_at governs ownership
@@ -332,6 +333,37 @@ export interface ReportingRepository {
    * cursor whose tag does not verify, where nothing is served.
    */
   feedWatermark(scope: ObservationScope): Promise<FeedPosition | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Watch-only source comparison (SHADOW_SOURCES_MODE, migration 0015). Daily
+// aggregate counts only: no address, fingerprint, name or domain.
+// ---------------------------------------------------------------------------
+
+/** Counter increments by metric (positive whole numbers). */
+export type ShadowCounts = Readonly<Partial<Record<ShadowMetric, number>>>;
+
+/** One UTC day of counters, as the reporting route returns them. Metrics without a row are absent (zero). */
+export interface ShadowDayCounts {
+  /** YYYY-MM-DD (UTC). */
+  date: string;
+  metrics: Partial<Record<ShadowMetric, number>>;
+}
+
+export interface ShadowRepository {
+  /**
+   * Atomically counts one request of `source` for the day in `<source>_requests`
+   * if, and only if, that count is below `limit`; true when counted. One
+   * statement: concurrent callers can never take more than `limit` in a day.
+   */
+  reserveSourceRequest(scope: ShadowScope, source: ApiSource, limit: number): Promise<boolean>;
+  /**
+   * Adds to the day's counters in one statement: 1 for each listed metric (a metric listed n times adds n),
+   * or, given counts, that many (positive whole numbers) for each metric.
+   */
+  increment(scope: ShadowScope, metrics: readonly ShadowMetric[] | ShadowCounts): Promise<void>;
+  /** Days in [from, to] (inclusive YYYY-MM-DD) that have any counter, in date order. */
+  report(installationId: string, websiteId: string, from: string, to: string): Promise<ShadowDayCounts[]>;
 }
 
 export function usagePeriodKey(period: "day" | "month", now: Date): string {

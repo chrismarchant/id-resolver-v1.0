@@ -21,12 +21,15 @@ import type {
   RecordObservationInput,
   RecordObservationResult,
   ReservationResult,
+  ShadowDayCounts,
+  ShadowRepository,
   UsageCounter,
   UsageRepository,
   UsageScope,
   UsageSnapshot,
 } from "../../src/contracts/db.js";
 import { USAGE_COUNTERS } from "../../src/contracts/db.js";
+import type { ApiSource, ShadowMetric, ShadowScope } from "../../src/shadow/types.js";
 
 export type Clock = () => Date;
 const realClock: Clock = () => new Date();
@@ -365,6 +368,71 @@ export class FakeActivityRepository implements ActivityRepository {
       }
     }
     return n;
+  }
+}
+
+/** Source comparison counters (mirrors src/db/shadow-repo.ts): one number per scope, day and metric. */
+export class FakeShadowRepository implements ShadowRepository {
+  readonly counts = new Map<string, number>();
+  readonly calls = { reserveSourceRequest: 0, increment: 0, report: 0 };
+  failures: Failures<"reserveSourceRequest" | "increment" | "report"> = {};
+  /** Delays every increment (to hold writes in flight). */
+  incrementDelayMs = 0;
+
+  private key(scope: ShadowScope, metric: string): string {
+    return `${scope.installationId}|${scope.websiteId}|${scope.day}|${metric}`;
+  }
+
+  /** The count of `metric` on `day` (any scope), 0 when absent. */
+  get(day: string, metric: ShadowMetric): number {
+    let n = 0;
+    for (const [k, v] of this.counts) if (k.endsWith(`|${day}|${metric}`)) n += v;
+    return n;
+  }
+
+  /** Every counter of `day` as metric -> count. */
+  day(day: string): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [k, v] of this.counts) {
+      const parts = k.split("|");
+      if (parts[2] === day) out[parts[3]!] = (out[parts[3]!] ?? 0) + v;
+    }
+    return out;
+  }
+
+  async reserveSourceRequest(scope: ShadowScope, source: ApiSource, limit: number): Promise<boolean> {
+    await Promise.resolve();
+    this.calls.reserveSourceRequest++;
+    failIf(this.failures, "reserveSourceRequest");
+    const k = this.key(scope, `${source}_requests`);
+    const c = this.counts.get(k) ?? 0;
+    if (c >= limit) return false;
+    this.counts.set(k, c + 1);
+    return true;
+  }
+
+  async increment(scope: ShadowScope, metrics: readonly ShadowMetric[] | Readonly<Partial<Record<ShadowMetric, number>>>): Promise<void> {
+    await Promise.resolve();
+    this.calls.increment++;
+    failIf(this.failures, "increment");
+    if (this.incrementDelayMs > 0) await new Promise((r) => setTimeout(r, this.incrementDelayMs));
+    const entries: Array<[string, number]> = Array.isArray(metrics) ? (metrics as readonly ShadowMetric[]).map((m) => [m, 1]) : Object.entries(metrics);
+    for (const [m, n] of entries) this.counts.set(this.key(scope, m), (this.counts.get(this.key(scope, m)) ?? 0) + n);
+  }
+
+  async report(installationId: string, websiteId: string, from: string, to: string): Promise<ShadowDayCounts[]> {
+    await Promise.resolve();
+    this.calls.report++;
+    failIf(this.failures, "report");
+    const days = new Map<string, Record<string, number>>();
+    for (const [k, v] of this.counts) {
+      const [inst, site, day, metric] = k.split("|") as [string, string, string, string];
+      if (inst !== installationId || site !== websiteId || day < from || day > to) continue;
+      const d = days.get(day) ?? {};
+      d[metric] = v;
+      days.set(day, d);
+    }
+    return [...days.keys()].sort().map((date) => ({ date, metrics: days.get(date)! }));
   }
 }
 

@@ -45,6 +45,7 @@ import { canonicaliseIp } from "../ip/canonical.js";
 import { computeFingerprint, decodeSecret } from "../ip/fingerprint.js";
 import type { HostingRangeMatcher, HostingRangeProvider } from "../ip/hosting-ranges.js";
 import type { Logger } from "../log/index.js";
+import type { EnrichSummary, ShadowHandle, ShadowObserver } from "../shadow/types.js";
 import { qualify } from "./qualify.js";
 
 export interface PipelineDeps {
@@ -57,6 +58,12 @@ export interface PipelineDeps {
   logger: Logger;
   /** Published cloud and crawler ranges, loaded at start-up when HOSTING_RANGES_MODE is not off. */
   hostingRanges?: HostingRangeMatcher;
+  /**
+   * Watch-only source comparison (SHADOW_SOURCES_MODE=on, src/shadow/runner.ts). Told about every cache
+   * miss and, through the handle, what Enrich did. It can never change the outcome: every call into it is
+   * synchronous, guarded and unlogged here.
+   */
+  shadow?: ShadowObserver;
   sleep?: (ms: number) => Promise<void>;
   /**
    * Receives database operations that exceeded their budget and are still
@@ -227,6 +234,20 @@ function planFor(p: ProviderOutcome, policy: PipelineConfig["policy"], checkedAt
   }
 }
 
+/** What Enrich did, for the watch-only source comparison (in memory only; never logged or stored). */
+export function enrichSummaryFor(p: ProviderOutcome, status: ResolutionOutcome["status"]): EnrichSummary {
+  switch (p.kind) {
+    case "resolved":
+      return { kind: "resolved", domain: p.domain, usageType: p.usageType, status, organisationName: p.organisationName };
+    case "no_domain":
+      return { kind: "no_domain" };
+    case "timeout":
+      return { kind: "timeout" };
+    case "error":
+      return { kind: "error", category: p.category };
+  }
+}
+
 export async function runJob(
   deps: PipelineDeps,
   config: PipelineConfig,
@@ -308,7 +329,19 @@ export async function runJob(
   // The provider whose published range holds the address (HOSTING_RANGES_MODE shadow or enforce).
   // Logged by name only; the address itself never leaves this function.
   let hostingRange: HostingRangeProvider | null = null;
+  // Watch-only source comparison: the handle for this cache miss and what Enrich did (set on every path after the miss).
+  let shadowHandle: ShadowHandle | null = null;
+  let enrichSummary: EnrichSummary | null = null;
   const finish = (o: ResolutionOutcome): ResolutionOutcome => {
+    if (shadowHandle) {
+      const handle = shadowHandle;
+      shadowHandle = null;
+      try {
+        handle.complete(enrichSummary ?? { kind: "not_called", reason: "internal_error" });
+      } catch {
+        // A comparison failure never changes the job.
+      }
+    }
     logger.info("job_finished", {
       status: o.status,
       ...(o.reason ? { reason: o.reason } : {}),
@@ -442,13 +475,25 @@ export async function runJob(
     token = reservation.token;
     logger.debug("cache_lookup", { outcome: "miss" });
 
+    // 3b. Watch-only source comparison: every cache miss, before the provider mode, kill switch and cap,
+    //     so the measurement does not depend on Enrich being enabled. Synchronous; never changes the job.
+    if (deps.shadow) {
+      try {
+        shadowHandle = deps.shadow.observe(ip.canonical, fingerprint, { hostingRangeMatched: hostingRange !== null });
+      } catch {
+        shadowHandle = null;
+      }
+    }
+
     // 4. Provider mode and runtime kill switch.
     if (config.provider.mode === "disabled") {
+      enrichSummary = { kind: "not_called", reason: "provider_disabled" };
       await release();
       return finish(outcome("disabled", "provider_disabled"));
     }
     checkpoint();
     if (!(await repo(() => controls.isEnrichmentEnabled(config.installation_id)))) {
+      enrichSummary = { kind: "not_called", reason: "kill_switch" };
       await release();
       return finish(outcome("disabled", "kill_switch"));
     }
@@ -463,8 +508,9 @@ export async function runJob(
       resolved_cap: policy.period_resolved_cap,
     });
     if (allowance !== "reserved") {
-      await release();
       const capped = allowance === "cap_exhausted" || allowance === "resolved_cap_exhausted";
+      enrichSummary = { kind: "not_called", reason: capped ? "cap_exhausted" : "kill_switch" };
+      await release();
       return finish(outcome("disabled", capped ? "cap_exhausted" : "kill_switch"));
     }
 
@@ -479,6 +525,7 @@ export async function runJob(
       ),
     );
     if (!(timeoutMs >= MIN_PROVIDER_TIMEOUT_MS)) {
+      enrichSummary = { kind: "not_called", reason: "deadline_exceeded" };
       await release();
       return finish(outcome("unavailable", "deadline_exceeded"));
     }
@@ -500,6 +547,7 @@ export async function runJob(
     // 8. Qualify, persist (fenced), count.
     const checkedAt = now();
     const plan = planFor(p, policy, checkedAt);
+    if (shadowHandle) enrichSummary = enrichSummaryFor(p, plan.result.status);
     // The fenced commit upserts the company itself, so a worker that lost its
     // lease never touches the shared companies row.
     const committed = await repo(() => cache.commitResolved(k, token!, { ...plan.commit, checkedAt }));
@@ -524,10 +572,12 @@ export async function runJob(
   } catch (err) {
     // Free the key for another worker only if nothing was dispatched.
     if (err instanceof DeadlineAbortError) {
+      enrichSummary ??= { kind: "not_called", reason: "deadline_exceeded" };
       if (!dispatched) await release().catch(() => undefined);
       return finish(outcome("unavailable", "deadline_exceeded"));
     }
     const isDb = err instanceof RepositoryError;
+    enrichSummary ??= { kind: "not_called", reason: isDb ? "database_error" : "internal_error" };
     logger.error(isDb ? "db_error" : "job_error", { category: isDb ? "repository" : "pipeline" });
     if (!dispatched) await release().catch(() => undefined);
     return finish(outcome("unavailable", isDb ? "database_error" : "internal_error"));

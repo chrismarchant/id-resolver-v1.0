@@ -41,6 +41,12 @@ export const LOG_EVENTS = [
   "bot_visit_prune",
   "config_override",
   "database_role_check",
+  // Watch-only source comparison (src/shadow/): categories, dates and counts only.
+  "shadow_sources",
+  "shadow_observed",
+  "shadow_write_failed",
+  "ipnetdb_loaded",
+  "ipnetdb_refresh_failed",
 ] as const;
 
 export type LogEvent = (typeof LOG_EVENTS)[number];
@@ -87,6 +93,15 @@ export const LOG_FIELDS = [
   "hosting_ranges_mode",
   "hosting_ranges_date",
   "usage_type",
+  // Watch-only source comparison: a mode, verdict categories, a file date and size; never an address, name or domain.
+  "mode",
+  "ipapi",
+  "iplocate",
+  "ipnetdb",
+  "enrich",
+  "waterfall",
+  "date",
+  "bytes",
 ] as const;
 
 export type LogField = (typeof LOG_FIELDS)[number];
