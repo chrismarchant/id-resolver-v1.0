@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryLogger } from "../../src/log/index.js";
 import { createShadowRunner, SHADOW_DB_MAX_IN_FLIGHT, utcDay, type ShadowRunner, type ShadowRunnerOptions } from "../../src/shadow/runner.js";
 import type { ApiSource, ApiSourceAdapter, ApiSourceOutcome, EnrichSummary, IpnetdbResult, ShadowMetric, ShadowScope } from "../../src/shadow/types.js";
+import { createShadowRepository } from "../../src/db/shadow-repo.js";
 import { FakeShadowRepository } from "../helpers/fakes.js";
 
 const IP_A = "203.0.113.10";
@@ -64,7 +65,7 @@ function setup(overrides: Partial<ShadowRunnerOptions> = {}) {
     ipapi,
     iplocate,
     ipnetdb: {
-      lookup(ip) {
+      async lookup(ip) {
         ipnetdbCalls.push(ip);
         return FOUND;
       },
@@ -260,8 +261,8 @@ describe("shadow runner: limits", () => {
     ]);
   });
 
-  it("drops (and counts) addresses beyond the queue while the workers are busy", async () => {
-    const t = setup({ concurrency: 1, queueMax: 1, timeoutMs: 60 });
+  it("drops (and counts) addresses beyond SHADOW_QUEUE_MAX in flight while the workers are busy", async () => {
+    const t = setup({ concurrency: 1, queueMax: 2, timeoutMs: 60 });
     t.ipapi.outcome = "hang";
     const first = t.runner.observe(IP_A, FP("a"));
     const second = t.runner.observe(IP_B, FP("b"));
@@ -269,7 +270,10 @@ describe("shadow runner: limits", () => {
     expect(first).not.toBeNull();
     expect(second).not.toBeNull();
     expect(third).toBeNull();
-    expect(t.runner.stats()).toMatchObject({ queued: 1, running: 1 });
+    // Nothing starts on the caller's stack; the queue is worked from the next macrotask.
+    expect(t.runner.stats()).toMatchObject({ queued: 2, running: 0, inFlight: 2 });
+    await new Promise((r) => setImmediate(r));
+    expect(t.runner.stats()).toMatchObject({ queued: 1, running: 1, inFlight: 2 });
     first!.complete({ kind: "no_domain" });
     second!.complete({ kind: "no_domain" });
     await settle(t.runner);
@@ -400,5 +404,93 @@ describe("shadow runner: drain and hygiene", () => {
     for (const needle of [IP_A, IP_B, IP_C, "2001:db8", FP("a").toString("hex"), FP("c").toString("hex"), "example.com", "example.org", "Example Corp", "Example Org", "Example Transit"]) {
       expect(text, needle).not.toContain(needle);
     }
+  });
+});
+
+describe("shadow runner: review hardening", () => {
+  it("observe() starts no I/O on the caller's stack: no file read, database query or request before the next macrotask", async () => {
+    const t = setup();
+    const repoCalls = () => t.repo.calls.reserveSourceRequest + t.repo.calls.increment;
+    const h = t.runner.observe(IP_A, FP("a"));
+    h!.complete({ kind: "no_domain" });
+    expect([t.ipnetdbCalls.length, repoCalls(), t.ipapi.calls.length, t.iplocate.calls.length]).toEqual([0, 0, 0, 0]);
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    expect([t.ipnetdbCalls.length, repoCalls(), t.ipapi.calls.length, t.iplocate.calls.length]).toEqual([0, 0, 0, 0]);
+    await new Promise((r) => setImmediate(r));
+    expect(t.ipnetdbCalls).toEqual([IP_A]);
+    expect(t.repo.calls.reserveSourceRequest).toBeGreaterThan(0);
+    await settle(t.runner);
+    expect(t.repo.get(day1, "observed")).toBe(1);
+  });
+
+  it("bounds the work held in memory with IPNetDB only and a slow database: beyond SHADOW_QUEUE_MAX in flight is dropped", async () => {
+    const repo = new FakeShadowRepository();
+    repo.incrementDelayMs = 150;
+    const logger = createMemoryLogger("debug");
+    let maxInFlight = 0;
+    const runner = createShadowRunner({
+      scope: { installationId: "inst-test", websiteId: "site-test" },
+      repo,
+      logger,
+      ipnetdb: { lookup: async () => FOUND },
+      limits: { ipapi: 100, iplocate: 100 },
+      timeoutMs: 1_000,
+      concurrency: 4,
+      queueMax: 3,
+      now: () => DAY1,
+      dropFlushMs: 10,
+    });
+    const handles = [];
+    for (let i = 0; i < 10; i += 1) {
+      handles.push(runner.observe(`198.51.100.${i + 1}`, `key-${i}`));
+      maxInFlight = Math.max(maxInFlight, runner.stats().inFlight);
+      await new Promise((r) => setImmediate(r));
+    }
+    for (const h of handles) h?.complete({ kind: "no_domain" });
+    expect(handles.filter((h) => h !== null)).toHaveLength(3);
+    expect(maxInFlight).toBe(3);
+    await settle(runner);
+    expect(repo.day(day1)).toMatchObject({ observed: 3, dropped_overload: 7, ipapi_disabled: 3, iplocate_disabled: 3, ipnetdb_found: 3 });
+    expect(runner.stats().inFlight).toBe(0);
+  });
+
+  it("a failing counter store built without a logger yields shadow_write_failed only, never db_error", async () => {
+    const failingPool = { query: () => Promise.reject(Object.assign(new Error("connection refused"), { code: "ECONNREFUSED" })) };
+    const repo = createShadowRepository(failingPool as never);
+    const logger = createMemoryLogger("debug");
+    const runner = createShadowRunner({
+      scope: { installationId: "inst-test", websiteId: "site-test" },
+      repo,
+      logger,
+      ipapi: adapter("ipapi"),
+      ipnetdb: { lookup: async () => FOUND },
+      limits: { ipapi: 100, iplocate: 100 },
+      timeoutMs: 1_000,
+      concurrency: 2,
+      queueMax: 10,
+      now: () => DAY1,
+      dropFlushMs: 10,
+    });
+    runner.observe(IP_A, FP("a"))!.complete({ kind: "no_domain" });
+    runner.observe(IP_A, FP("a"));
+    await settle(runner);
+    const events = logger.entries.map((e) => e["event"]);
+    expect(events).not.toContain("db_error");
+    expect(logger.entries.filter((e) => e["event"] === "shadow_write_failed").map((e) => e["category"]).sort()).toEqual(["counters", "drop_counters", "quota_reservation"]);
+  });
+
+  it("writes drop counters as counts, not one array entry per drop", async () => {
+    const t = setup({ dropFlushMs: 60_000 });
+    const calls: unknown[] = [];
+    const increment = t.repo.increment.bind(t.repo);
+    t.repo.increment = async (scope, metrics) => {
+      calls.push(metrics);
+      return increment(scope, metrics);
+    };
+    t.runner.observe(IP_A, FP("a"))!.complete({ kind: "no_domain" });
+    for (let i = 0; i < 25; i += 1) t.runner.observe(IP_A, FP("a"));
+    await t.runner.drain(1_000);
+    expect(calls).toContainEqual({ dropped_duplicate: 25 });
+    expect(t.repo.get(day1, "dropped_duplicate")).toBe(25);
   });
 });

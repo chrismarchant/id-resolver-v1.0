@@ -89,7 +89,7 @@ comparison of one address. Each address is measured at most once per UTC day
 | `enrich_call_needed` | Every other verdict. |
 | `enrich_agrees`, `enrich_disagrees` | Enrich qualified a company and ipapi.is or IPLocate named a business domain: the same domain (or one a subdomain of the other) every time, or not. |
 | `dropped_duplicate` | Visits of an address already measured that UTC day. |
-| `dropped_overload` | Addresses not measured because the queue (`SHADOW_QUEUE_MAX`) was full. |
+| `dropped_overload` | Addresses not measured because `SHADOW_QUEUE_MAX` addresses were already being measured (queued, looked up, or waiting for Enrich's result or the write). |
 
 Business claims are a `business` verdict from ipapi.is or IPLocate and
 Enrich's domain when it qualified. Vetoes are hosting, anonymous or mobile

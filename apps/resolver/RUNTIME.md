@@ -217,14 +217,19 @@ fingerprint, company name or domain from these sources is stored or logged.
   exclusions are not. Each address is measured once per UTC day (an in-memory
   set of fingerprints, cleared at midnight UTC, at most 50,000 entries; when
   full it stops adding rather than grow).
-* **Never in the way.** `observe()` is synchronous and cannot throw into the
-  job; the lookups run after it, in the background, at most
-  `SHADOW_CONCURRENCY` at once with a queue of `SHADOW_QUEUE_MAX` (beyond it an
-  address is dropped and counted). Each source is bounded by
-  `SHADOW_TIMEOUT_MS`, reads at most 64 KiB and never follows a redirect. The
-  counters use at most two database connections, added to the pool when the
-  mode is on. On shutdown queued comparisons get what is left of
-  `SHUTDOWN_GRACE_MS` after the jobs; the rest is abandoned.
+* **Never in the way.** `observe()` is synchronous, cannot throw into the job
+  and only records the address in memory: no file read, database query or
+  request starts on the job's stack (the queue is worked from the next
+  macrotask, and IPNetDB is read with asynchronous positional reads). At most
+  `SHADOW_CONCURRENCY` addresses are looked up at once and at most
+  `SHADOW_QUEUE_MAX` are being measured at once (queued, looked up, or waiting
+  for Enrich's result or the counter write); beyond that an address is dropped
+  and counted. Each source is bounded by `SHADOW_TIMEOUT_MS`, reads at most
+  64 KiB and never follows a redirect. The counters use at most two database
+  connections, added to the pool when the mode is on, and their failures are
+  logged as `shadow_write_failed`, never as the resolution path's `db_error`.
+  On shutdown queued comparisons get what is left of `SHUTDOWN_GRACE_MS` after
+  the jobs; the rest is abandoned.
 * **Quota.** A source is asked only after its daily request is reserved in
   the database (one statement, never past the limit across workers or
   instances); at the limit its verdict is `quota` and nothing is sent. The
@@ -237,13 +242,20 @@ fingerprint, company name or domain from these sources is stored or logged.
   `unavailable`. The download is streamed to `IPNETDB_DIR` (needs about
   400 MB free during a refresh) while its SHA-256 is computed; it is accepted
   only over https from `cdn.ipnetdb.net`, at most 400 MB, with exactly the
-  manifest's size and SHA-256. Anything else keeps the copy in use and logs
-  `ipnetdb_refresh_failed{category}`. The file is never loaded into memory:
-  lookups read the few bytes they need from disk. A check runs daily (hourly
-  while nothing is loaded) and downloads when the manifest is at least 7 days
-  newer than the loaded copy, or on a Monday (UTC) when it is newer at all.
-  Each process downloads its own copy at start (the directory is not reused
-  across restarts).
+  manifest's size and SHA-256 (and the size on disk is checked before use).
+  Anything else keeps the copy in use and logs
+  `ipnetdb_refresh_failed{category}`; a file refused for its content is not
+  downloaded again until the manifest names another. `IPNETDB_DIR` is created
+  with mode 0700 and refused (`unsafe_dir`) if it is a symbolic link, owned by
+  another user or writable by group or others. The file is never loaded into
+  memory: lookups read the few bytes they need from disk, asynchronously, with
+  a per-lookup decode budget (10,000 values, 1 MiB of text) so a damaged file
+  cannot make a lookup expand without bound. A check runs daily and downloads
+  when the manifest is at least 7 days newer than the loaded copy, or on a
+  Monday (UTC) when it is newer at all; while nothing is loaded it runs hourly,
+  backing off exponentially (up to daily) while it keeps failing. Each process
+  downloads its own copy at start (the directory is not reused across
+  restarts).
 * **Logs.** `shadow_sources{mode, ipapi, iplocate, ipnetdb}` at startup
   (`active`/`no_key`, `enabled`/`disabled`), `ipnetdb_loaded{date, bytes}`,
   `ipnetdb_refresh_failed{category}`, `shadow_write_failed{category}` and, at

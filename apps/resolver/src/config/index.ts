@@ -173,7 +173,7 @@ export const ConfigSchema = z.object({
   SHADOW_IPLOCATE_DAILY_LIMIT: intInRange(0, 100_000, 900),
   /** Per-source HTTP timeout. */
   SHADOW_TIMEOUT_MS: intInRange(200, 10_000, 2_000),
-  /** Addresses looked up at once; more wait in a queue of SHADOW_QUEUE_MAX, beyond which they are dropped (counted). */
+  /** Addresses looked up at once. SHADOW_QUEUE_MAX: addresses being measured at once (queued, looked up, waiting for Enrich or the write); more are dropped (counted). */
   SHADOW_CONCURRENCY: intInRange(1, 32, 4),
   SHADOW_QUEUE_MAX: intInRange(1, 10_000, 200),
   /** IPNetDB prefix database (downloaded weekly, looked up locally). Only used when SHADOW_SOURCES_MODE=on. */

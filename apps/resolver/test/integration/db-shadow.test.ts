@@ -64,6 +64,14 @@ describe("shadow counters repository", () => {
     await Promise.all(Array.from({ length: 25 }, () => db.shadow.increment(SCOPE, ["observed", "enrich_call_needed", "ipapi_none", "iplocate_none"])));
     expect(await count("observed")).toBe(28);
     expect(await count("enrich_call_needed")).toBe(25);
+    // Counts in one statement (the runner's drop counters).
+    await db.shadow.increment(SCOPE, { dropped_duplicate: 40, dropped_overload: 2 });
+    await db.shadow.increment(SCOPE, { dropped_duplicate: 1 });
+    expect(await count("dropped_duplicate")).toBe(41);
+    expect(await count("dropped_overload")).toBe(2);
+    await expect(db.shadow.increment(SCOPE, { dropped_duplicate: 0 })).rejects.toMatchObject({ code: "INVALID_DELTA" });
+    await expect(db.shadow.increment(SCOPE, { dropped_duplicate: 1.5 })).rejects.toMatchObject({ code: "INVALID_DELTA" });
+    await expect(db.shadow.increment(SCOPE, { ["example.com" as never]: 1 })).rejects.toMatchObject({ code: "INVALID_METRIC" });
   });
 
   it("refuses a metric outside the allowlist, a bad day or source before any statement", async () => {

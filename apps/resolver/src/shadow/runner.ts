@@ -360,7 +360,9 @@ export function createShadowRunner(opts: ShadowRunnerOptions): ShadowRunner {
     // Queued addresses not started yet are not in `pending`: wait for the queue too.
     while ((pending.size > 0 || queued() > 0) && Date.now() < until) {
       let t: NodeJS.Timeout | undefined;
-      await Promise.race([Promise.all([...pending]), new Promise<void>((r) => (t = setTimeout(r, Math.max(1, Math.min(50, until - Date.now())))))]);
+      // With nothing pending yet, yield a macrotask so the scheduled pump can start the queue.
+      const progress = pending.size > 0 ? Promise.all([...pending]) : new Promise<void>((r) => setImmediate(r));
+      await Promise.race([progress, new Promise<void>((r) => (t = setTimeout(r, Math.max(1, Math.min(50, until - Date.now())))))]);
       clearTimeout(t);
     }
     const drained = pending.size === 0 && queued() === 0;
