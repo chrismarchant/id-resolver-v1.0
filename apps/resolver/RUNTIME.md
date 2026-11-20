@@ -206,8 +206,8 @@ fingerprint, company name or domain from these sources is stored or logged.
 
 | source | how | configured by |
 | --- | --- | --- |
-| ipapi.is | `POST https://api.ipapi.is` with `{"q", "key"}` (the key never in a URL) | `IPAPI_IS_API_KEY`, `SHADOW_IPAPI_DAILY_LIMIT` |
-| IPLocate | `GET https://iplocate.io/api/lookup/<ip>` with the key in `X-API-Key` | `IPLOCATE_API_KEY`, `SHADOW_IPLOCATE_DAILY_LIMIT` |
+| ipapi.is | `POST https://de.ipapi.is` (Germany-only endpoint) with `{"q", "key"}` (the key never in a URL) | `IPAPI_IS_API_KEY`, `SHADOW_IPAPI_DAILY_LIMIT` |
+| IPLocate | `GET https://eu-api.iplocate.io/api/lookup/<ip>` (EU-only endpoint) with the key in `X-API-Key` | `IPLOCATE_API_KEY`, `SHADOW_IPLOCATE_DAILY_LIMIT` |
 | IPNetDB | a local copy of its prefix database, looked up from disk | `IPNETDB_ENABLED`, `IPNETDB_MANIFEST_URL`, `IPNETDB_DIR` |
 
 * **What is measured.** Every cache miss of an eligible address, right after

@@ -81,14 +81,14 @@ function assertClean(o: ApiSourceOutcome): void {
 }
 
 describe("ipapi.is adapter", () => {
-  it("POSTs {q, key} as JSON to https://api.ipapi.is (the key never in the URL), redirect refused", async () => {
+  it("POSTs {q, key} as JSON to https://de.ipapi.is (the key never in the URL), redirect refused", async () => {
     const f = fakeFetch(() => json(200, IPAPI_BUSINESS));
     const a = createIpapiAdapter({ apiKey: KEY, fetchImpl: f });
     const o = await lookup(a);
     expect(f.calls).toHaveLength(1);
     const call = f.calls[0]!;
     expect(call.url).toBe(IPAPI_URL);
-    expect(IPAPI_URL).toBe("https://api.ipapi.is");
+    expect(IPAPI_URL).toBe("https://de.ipapi.is");
     expect(call.url).not.toContain(KEY);
     expect(call.init.method).toBe("POST");
     expect(call.init.redirect).toBe("error");
@@ -179,7 +179,7 @@ describe("IPLocate adapter", () => {
     const o = await lookup(a);
     const call = f.calls[0]!;
     expect(call.url).toBe(`${IPLOCATE_BASE_URL}${IP}`);
-    expect(IPLOCATE_BASE_URL).toBe("https://iplocate.io/api/lookup/");
+    expect(IPLOCATE_BASE_URL).toBe("https://eu-api.iplocate.io/api/lookup/");
     expect(call.url).not.toContain(KEY);
     expect(call.init.method).toBe("GET");
     expect(call.init.redirect).toBe("error");

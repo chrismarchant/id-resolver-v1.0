@@ -1,9 +1,11 @@
 /**
  * IPLocate adapter (watch-only source comparison).
  *
- * GET https://iplocate.io/api/lookup/<ip> with the key in the X-API-Key header
- * (verified: the header is read; an invalid key is 401 {"error":"Invalid API
- * key"}), never in the URL. 429 is a quota error. The answer is reduced to an
+ * GET https://eu-api.iplocate.io/api/lookup/<ip>: IPLocate's EU endpoint, which
+ * only routes requests to servers in the European Union (the default endpoint
+ * picks the nearest server worldwide). The key goes in the X-API-Key header
+ * (verified on the EU endpoint: the header is read; an invalid key is 401
+ * {"error":"Invalid API key"}), never in the URL. 429 is a quota error. The answer is reduced to an
  * allowlist (company name, domain and type, the ASN type, the privacy flags
  * and whether a hosting object is present); location, the ASN's name, route
  * and registry, the hosting provider's name and the raw body are discarded
@@ -16,7 +18,8 @@ import { canonicaliseDomain, canonicaliseOrganisationName } from "../resolution/
 import { DEFAULT_MAX_BODY_BYTES, discardBody, readCappedText } from "../provider/http.js";
 import type { ApiSignals, ApiSourceAdapter, ApiSourceOutcome } from "./types.js";
 
-export const IPLOCATE_BASE_URL = "https://iplocate.io/api/lookup/";
+/** EU-only endpoint: visitor addresses are processed in the European Union. */
+export const IPLOCATE_BASE_URL = "https://eu-api.iplocate.io/api/lookup/";
 
 export interface IplocateAdapterOptions {
   apiKey: string;
