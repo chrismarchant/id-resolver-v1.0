@@ -6,13 +6,14 @@
  * stop(). Nothing is downloaded from the network.
  */
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createMemoryLogger } from "../../src/log/index.js";
-import { acceptedFileUrl, createIpnetdbLoader, IPNETDB_MAX_BYTES, shouldDownload, type IpnetdbLoader } from "../../src/shadow/ipnetdb.js";
-import { buildMmdb, ipnetdbRecord } from "../helpers/mmdb-writer.js";
+import { acceptedFileUrl, createIpnetdbLoader, IPNETDB_MAX_BYTES, nextCheckDelay, shouldDownload, type IpnetdbLoader } from "../../src/shadow/ipnetdb.js";
+import { DECODE_MAX_VALUES } from "../../src/shadow/mmdb.js";
+import { buildMmdb, encodeControl, encodePointer, ipnetdbRecord, mmdbType } from "../helpers/mmdb-writer.js";
 
 const MANIFEST_URL = "https://ipnetdb.example/latest.json";
 const FILE_URL = "https://cdn.ipnetdb.net/ipnetdb_prefix_latest.mmdb";
@@ -105,15 +106,15 @@ describe("IPNetDB loader", () => {
     const file = database("Example Corp Ltd");
     const s = server({ manifest: manifestFor(file, "2026-11-19"), file });
     const { loader, logger } = make(s);
-    expect(loader.lookup("192.0.2.10")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("192.0.2.10")).toEqual({ verdict: "unavailable" });
     expect(loader.loadedDate).toBeNull();
     expect(await loader.refresh()).toBe("loaded");
     expect(loader.loadedDate).toBe("2026-11-19");
-    expect(loader.lookup("192.0.2.10")).toEqual({ verdict: "found", prefixEntity: "Example Corp Ltd", asEntity: "Example Transit Inc", asn: 64496 });
-    expect(loader.lookup("2001:db8::1")).toMatchObject({ verdict: "found", asn: 64498 });
-    expect(loader.lookup("198.51.100.1")).toEqual({ verdict: "not_found" });
-    expect(loader.lookup("203.0.113.1")).toEqual({ verdict: "bogon" });
-    expect(loader.lookup("not an address")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("192.0.2.10")).toEqual({ verdict: "found", prefixEntity: "Example Corp Ltd", asEntity: "Example Transit Inc", asn: 64496 });
+    expect(await loader.lookup("2001:db8::1")).toMatchObject({ verdict: "found", asn: 64498 });
+    expect(await loader.lookup("198.51.100.1")).toEqual({ verdict: "not_found" });
+    expect(await loader.lookup("203.0.113.1")).toEqual({ verdict: "bogon" });
+    expect(await loader.lookup("not an address")).toEqual({ verdict: "unavailable" });
     const loaded = logger.entries.filter((e) => e["event"] === "ipnetdb_loaded");
     expect(loaded).toHaveLength(1);
     expect(loaded[0]).toMatchObject({ date: "2026-11-19", bytes: file.length });
@@ -140,7 +141,7 @@ describe("IPNetDB loader", () => {
     s.state.manifest = manifestFor(second, "2026-11-19");
     expect(await loader.refresh()).toBe("loaded");
     expect(loader.loadedDate).toBe("2026-11-19");
-    expect(loader.lookup("192.0.2.1")).toMatchObject({ prefixEntity: "Example Corp Two Ltd" });
+    expect(await loader.lookup("192.0.2.1")).toMatchObject({ prefixEntity: "Example Corp Two Ltd" });
     expect(readdirSync(dir)).toEqual([`prefix-2026-11-19-${sha(second).slice(0, 12)}.mmdb`]);
     expect(openFdsIn(dir) ?? 1).toBe(1);
   });
@@ -164,7 +165,7 @@ describe("IPNetDB loader", () => {
     expect(logger.entries.filter((e) => e["event"] === "ipnetdb_refresh_failed")).toEqual([expect.objectContaining({ category, level: "warn" })]);
     if (category === "too_large" || category === "host_refused") expect(s.fileCalls()).toBe(before);
     expect(loader.loadedDate).toBe("2026-11-12");
-    expect(loader.lookup("192.0.2.1")).toMatchObject({ verdict: "found", prefixEntity: "Example Corp Ltd" });
+    expect(await loader.lookup("192.0.2.1")).toMatchObject({ verdict: "found", prefixEntity: "Example Corp Ltd" });
     expect(readdirSync(dir)).toEqual([`prefix-2026-11-12-${sha(first).slice(0, 12)}.mmdb`]);
   });
 
@@ -174,7 +175,7 @@ describe("IPNetDB loader", () => {
     const { loader, logger } = make(s);
     expect(await loader.refresh()).toBe("failed");
     expect(logger.entries.find((e) => e["event"] === "ipnetdb_refresh_failed")).toMatchObject({ category: "invalid_file" });
-    expect(loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
     expect(readdirSync(dir)).toEqual([]);
   });
 
@@ -212,7 +213,7 @@ describe("IPNetDB loader", () => {
     expect(openFdsIn(dir) ?? 1).toBe(1);
     await loader.stop();
     expect(openFdsIn(dir) ?? 0).toBe(0);
-    expect(loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
     expect(readdirSync(dir)).toEqual([]);
     expect(await loader.refresh()).toBe("stopped");
   });
@@ -235,7 +236,7 @@ describe("IPNetDB loader", () => {
     const s = server({ manifest: manifestFor(file, "2026-11-19"), file });
     const { loader } = make(s);
     loader.start();
-    expect(loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
     for (let i = 0; i < 200 && loader.loadedDate === null; i += 1) await new Promise((r) => setTimeout(r, 5));
     expect(loader.loadedDate).toBe("2026-11-19");
     loader.start();
@@ -243,7 +244,105 @@ describe("IPNetDB loader", () => {
   });
 });
 
+describe("IPNetDB loader: directory, refused files, hostile files", () => {
+  it("creates IPNETDB_DIR with mode 0700", async () => {
+    const file = database("Example Corp Ltd");
+    const { loader } = make(server({ manifest: manifestFor(file, "2026-11-19"), file }));
+    expect(await loader.refresh()).toBe("loaded");
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it("refuses a directory others can write, and a symbolic link, before fetching anything", async () => {
+    const file = database("Example Corp Ltd");
+    mkdirSync(dir, { recursive: true });
+    chmodSync(dir, 0o777);
+    const s = server({ manifest: manifestFor(file, "2026-11-19"), file });
+    const { loader, logger } = make(s);
+    expect(await loader.refresh()).toBe("failed");
+    expect(logger.entries.find((e) => e["event"] === "ipnetdb_refresh_failed")).toMatchObject({ category: "unsafe_dir" });
+    expect(s.calls).toEqual([]);
+    await loader.stop();
+
+    const real = join(dir, "..", "real");
+    mkdirSync(real, { mode: 0o700 });
+    rmSync(dir, { recursive: true, force: true });
+    symlinkSync(real, dir);
+    const s2 = server({ manifest: manifestFor(file, "2026-11-19"), file });
+    const second = make(s2);
+    expect(await second.loader.refresh()).toBe("failed");
+    expect(second.logger.entries.find((e) => e["event"] === "ipnetdb_refresh_failed")).toMatchObject({ category: "unsafe_dir" });
+    expect(s2.calls).toEqual([]);
+  });
+
+  it("a file refused for its content is not downloaded again until the manifest changes; a network failure is retried", async () => {
+    const file = database("Example Corp Ltd");
+    const s = server({ manifest: manifestFor(file, "2026-11-19", { sha256: "e".repeat(64) }), file });
+    const { loader, logger } = make(s);
+    expect(await loader.refresh()).toBe("failed");
+    expect(s.fileCalls()).toBe(1);
+    expect(await loader.refresh()).toBe("skipped");
+    expect(await loader.refresh()).toBe("skipped");
+    expect(s.fileCalls()).toBe(1);
+    expect(logger.entries.filter((e) => e["event"] === "ipnetdb_refresh_failed")).toHaveLength(1);
+    // The manifest names a corrected file: downloaded at once.
+    s.state.manifest = manifestFor(file, "2026-11-19");
+    expect(await loader.refresh()).toBe("loaded");
+    expect(s.fileCalls()).toBe(2);
+
+    const net = server({ manifest: manifestFor(file, "2026-11-19"), file, fileStatus: 503 });
+    const other = createIpnetdbLoader({ manifestUrl: MANIFEST_URL, dir: join(dir, "..", "net"), logger: createMemoryLogger(), fetchImpl: net.fetchImpl, now: () => today });
+    try {
+      expect(await other.refresh()).toBe("failed");
+      expect(await other.refresh()).toBe("failed");
+      expect(net.fileCalls()).toBe(2);
+      net.state.fileStatus = 200;
+      expect(await other.refresh()).toBe("loaded");
+    } finally {
+      await other.stop();
+    }
+  });
+
+  it("refuses a file whose metadata exceeds the decode budget", async () => {
+    const file = buildMmdb({ networks: [{ network: "192.0.2.0/24", record: { a: "b" } }], metadata: { languages: Array.from({ length: DECODE_MAX_VALUES + 1 }, () => "en") } }).file;
+    const { loader, logger } = make(server({ manifest: manifestFor(file, "2026-11-19"), file }));
+    expect(await loader.refresh()).toBe("failed");
+    expect(logger.entries.find((e) => e["event"] === "ipnetdb_refresh_failed")).toMatchObject({ category: "invalid_file" });
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it("a record that would expand past the decode budget answers unavailable; the loader keeps serving others", async () => {
+    const head = encodeControl(11, 200);
+    const level = head.length + 200 * 5;
+    const parts: Buffer[] = [];
+    for (let l = 0; l < 3; l += 1) parts.push(head, ...Array.from({ length: 200 }, () => encodePointer((l + 1) * level)));
+    parts.push(head, ...Array.from({ length: 200 }, () => Buffer.concat([encodeControl(2, 1), Buffer.from("x")])));
+    const file = buildMmdb({
+      recordSize: 32,
+      networks: [
+        { network: "192.0.2.0/24", record: mmdbType.raw(Buffer.concat(parts)) },
+        { network: "198.51.100.0/24", record: ipnetdbRecord({ prefix: "198.51.100.0/24", prefixEntity: "Example Corp Ltd", asEntity: "Example Transit Inc", as: 64496 }) },
+      ],
+    }).file;
+    const { loader } = make(server({ manifest: manifestFor(file, "2026-11-19"), file }));
+    expect(await loader.refresh()).toBe("loaded");
+    expect(await loader.lookup("192.0.2.1")).toEqual({ verdict: "unavailable" });
+    expect(await loader.lookup("198.51.100.1")).toMatchObject({ verdict: "found", asn: 64496 });
+  });
+});
+
 describe("refresh decision", () => {
+  it("checks daily once loaded; hourly while nothing is loaded, doubling per consecutive failure up to daily", () => {
+    const H = 3_600_000;
+    const D = 24 * H;
+    expect(nextCheckDelay(true, 5, D, H)).toBe(D);
+    expect(nextCheckDelay(false, 0, D, H)).toBe(H);
+    expect(nextCheckDelay(false, 1, D, H)).toBe(H);
+    expect(nextCheckDelay(false, 2, D, H)).toBe(2 * H);
+    expect(nextCheckDelay(false, 4, D, H)).toBe(8 * H);
+    expect(nextCheckDelay(false, 6, D, H)).toBe(D);
+    expect(nextCheckDelay(false, 1_000, D, H)).toBe(D);
+  });
+
   const thursday = new Date("2026-11-19T12:00:00Z");
   const monday = new Date("2026-11-23T08:00:00Z");
   it.each([
