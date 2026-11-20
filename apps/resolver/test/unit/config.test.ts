@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { ConfigError, describeConfig, loadConfig, REMOVED_VARIABLES, scrubSecretEnv, SECRET_KEYS } from "../../src/config/index.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ConfigError, describeConfig, loadConfig, REMOVED_VARIABLES, scrubSecretEnv, SECRET_KEYS, shadowSourcesState } from "../../src/config/index.js";
 import { loadOpsConfig, loadRetentionDays } from "../../src/ops/env.js";
 import { testConfig, TEST_AUTH_TOKEN, TEST_HMAC_SECRET } from "../helpers/env.js";
 import { TEST_RUNTIME_PASSWORD } from "../helpers/runtime-role.js";
@@ -189,5 +191,86 @@ describe("single-process runtime variables (CHR-70)", () => {
     for (const k of SECRET_KEYS) expect(env[k], k).toBeUndefined();
     expect(env["PORT"]).toBe("8080");
     expect(cfg.IP_HMAC_SECRET).toBe(TEST_HMAC_SECRET);
+  });
+});
+
+describe("watch-only source comparison (SHADOW_SOURCES_MODE)", () => {
+  const IPAPI_KEY = "0123456789abcdef0123456789abcdef";
+  const IPLOCATE_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  it("is off by default with the documented defaults", () => {
+    const cfg = loadConfig(REQUIRED);
+    expect(cfg).toMatchObject({
+      SHADOW_SOURCES_MODE: "off",
+      IPAPI_IS_API_KEY: "",
+      IPLOCATE_API_KEY: "",
+      SHADOW_IPAPI_DAILY_LIMIT: 900,
+      SHADOW_IPLOCATE_DAILY_LIMIT: 900,
+      SHADOW_TIMEOUT_MS: 2_000,
+      SHADOW_CONCURRENCY: 4,
+      SHADOW_QUEUE_MAX: 200,
+      IPNETDB_ENABLED: true,
+      IPNETDB_MANIFEST_URL: "https://ipnetdb.com/latest.json",
+      IPNETDB_DIR: join(tmpdir(), "ipnetdb"),
+    });
+    expect(shadowSourcesState(cfg)).toEqual({ mode: "off", ipapi: "off", iplocate: "off", ipnetdb: "off" });
+    // Keys alone never switch it on.
+    expect(shadowSourcesState(loadConfig({ ...REQUIRED, IPAPI_IS_API_KEY: IPAPI_KEY })).mode).toBe("off");
+  });
+
+  it("on: a source is active only with a key; IPNetDB follows IPNETDB_ENABLED", () => {
+    expect(shadowSourcesState(loadConfig({ ...REQUIRED, SHADOW_SOURCES_MODE: "on" }))).toEqual({ mode: "on", ipapi: "no_key", iplocate: "no_key", ipnetdb: "enabled" });
+    const both = loadConfig({ ...REQUIRED, SHADOW_SOURCES_MODE: "on", IPAPI_IS_API_KEY: IPAPI_KEY, IPLOCATE_API_KEY: IPLOCATE_KEY, IPNETDB_ENABLED: "false" });
+    expect(shadowSourcesState(both)).toEqual({ mode: "on", ipapi: "active", iplocate: "active", ipnetdb: "disabled" });
+  });
+
+  it("the keys are secrets: never described, scrubbed from the environment, never in an error", () => {
+    expect(SECRET_KEYS).toContain("IPAPI_IS_API_KEY");
+    expect(SECRET_KEYS).toContain("IPLOCATE_API_KEY");
+    const env: NodeJS.ProcessEnv = { ...REQUIRED, SHADOW_SOURCES_MODE: "on", IPAPI_IS_API_KEY: IPAPI_KEY, IPLOCATE_API_KEY: IPLOCATE_KEY };
+    const cfg = loadConfig(env);
+    const described = describeConfig(cfg);
+    const text = JSON.stringify(described);
+    expect(text).not.toContain(IPAPI_KEY);
+    expect(text).not.toContain(IPLOCATE_KEY);
+    expect(described).toMatchObject({ SHADOW_SOURCES_MODE: "on", SHADOW_IPAPI: "active", SHADOW_IPLOCATE: "active", SHADOW_IPNETDB: "enabled", SHADOW_IPAPI_DAILY_LIMIT: 900 });
+    expect(described).not.toHaveProperty("IPAPI_IS_API_KEY");
+    expect(described).not.toHaveProperty("IPLOCATE_API_KEY");
+    scrubSecretEnv(env);
+    expect(env["IPAPI_IS_API_KEY"]).toBeUndefined();
+    expect(env["IPLOCATE_API_KEY"]).toBeUndefined();
+    expect(cfg.IPAPI_IS_API_KEY).toBe(IPAPI_KEY);
+    const message = errorOf(() => loadConfig({ ...REQUIRED, IPAPI_IS_API_KEY: "short7!" }));
+    expect(message).toContain("IPAPI_IS_API_KEY");
+    expect(message).not.toContain("short7!");
+    expect(errorOf(() => loadConfig({ ...REQUIRED, IPLOCATE_API_KEY: "x" }))).toContain("IPLOCATE_API_KEY");
+  });
+
+  it.each([
+    ["SHADOW_SOURCES_MODE", ["true", "shadow", "ON", ""]],
+    ["SHADOW_IPAPI_DAILY_LIMIT", ["-1", "100001", "1.5", "lots"]],
+    ["SHADOW_IPLOCATE_DAILY_LIMIT", ["-1", "100001"]],
+    ["SHADOW_TIMEOUT_MS", ["199", "10001"]],
+    ["SHADOW_CONCURRENCY", ["0", "33"]],
+    ["SHADOW_QUEUE_MAX", ["0", "10001"]],
+    ["IPNETDB_ENABLED", ["yes", "on"]],
+    ["IPNETDB_MANIFEST_URL", ["not a url", "http://ipnetdb.com/latest.json", "ftp://ipnetdb.com/latest.json"]],
+    ["IPNETDB_DIR", [""]],
+  ])("%s refuses out-of-range values", (name, values) => {
+    for (const v of values) expect(errorOf(() => loadConfig({ ...REQUIRED, [name]: v })), `${name}=${v}`).toContain(name);
+  });
+
+  it("accepts the bounds", () => {
+    const cfg = loadConfig({
+      ...REQUIRED,
+      SHADOW_SOURCES_MODE: "on",
+      SHADOW_IPAPI_DAILY_LIMIT: "0",
+      SHADOW_IPLOCATE_DAILY_LIMIT: "100000",
+      SHADOW_TIMEOUT_MS: "200",
+      SHADOW_CONCURRENCY: "32",
+      SHADOW_QUEUE_MAX: "10000",
+      IPNETDB_DIR: "/var/tmp/ipnetdb",
+    });
+    expect(cfg).toMatchObject({ SHADOW_IPAPI_DAILY_LIMIT: 0, SHADOW_IPLOCATE_DAILY_LIMIT: 100_000, SHADOW_TIMEOUT_MS: 200, SHADOW_CONCURRENCY: 32, SHADOW_QUEUE_MAX: 10_000, IPNETDB_DIR: "/var/tmp/ipnetdb" });
   });
 });

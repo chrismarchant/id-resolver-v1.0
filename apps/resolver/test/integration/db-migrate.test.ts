@@ -39,7 +39,7 @@ describe("migrations", () => {
        WHERE table_schema = 'public' ORDER BY table_name, ordinal_position`,
     );
     const tables = new Set(cols.rows.map((r) => r.table_name));
-    for (const t of ["companies", "ip_resolution_cache", "usage_periods", "deployment_controls", "schema_migrations", "company_observations", "company_scope_stats", "company_observation_refs", "browser_events", "bot_visits"]) {
+    for (const t of ["companies", "ip_resolution_cache", "usage_periods", "deployment_controls", "schema_migrations", "company_observations", "company_scope_stats", "company_observation_refs", "browser_events", "bot_visits", "source_shadow_counts"]) {
       expect(tables.has(t)).toBe(true);
     }
     for (const r of cols.rows) {
@@ -132,6 +132,38 @@ describe("migrations", () => {
     }
     expect(await insert({ event_id: "evt-migration-000000002", page_key: `/${"p".repeat(255)}`, consent: "not_required" })).toMatchObject({ rowCount: 1 });
     await pool.query("DELETE FROM browser_events");
+  });
+
+  it("0015 source_shadow_counts: counts only (no address, name or domain column), no foreign key or trigger, constraints refuse anything else", async () => {
+    const cols = await pool.query<{ column_name: string; data_type: string; is_nullable: string }>(
+      "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'source_shadow_counts' ORDER BY ordinal_position",
+    );
+    expect(cols.rows).toEqual([
+      { column_name: "installation_id", data_type: "text", is_nullable: "NO" },
+      { column_name: "website_id", data_type: "text", is_nullable: "NO" },
+      { column_name: "day", data_type: "date", is_nullable: "NO" },
+      { column_name: "metric", data_type: "text", is_nullable: "NO" },
+      { column_name: "count", data_type: "bigint", is_nullable: "NO" },
+    ]);
+    const fks = await pool.query("SELECT conname FROM pg_constraint WHERE contype = 'f' AND (conrelid = 'public.source_shadow_counts'::regclass OR confrelid = 'public.source_shadow_counts'::regclass)");
+    expect(fks.rows).toEqual([]);
+    expect((await pool.query("SELECT tgname FROM pg_trigger WHERE tgrelid = 'public.source_shadow_counts'::regclass")).rows).toEqual([]);
+    const insert = (values: [string, string, string, string, number]) =>
+      pool.query("INSERT INTO source_shadow_counts (installation_id, website_id, day, metric, count) VALUES ($1, $2, $3::date, $4, $5)", values);
+    await insert(["inst-test", "site-test", "2026-11-19", "observed", 1]);
+    for (const bad of [
+      ["Inst Test", "site-test", "2026-11-19", "observed", 1],
+      ["inst-test", "site_test", "2026-11-19", "observed", 1],
+      ["inst-test", "site-test", "2026-11-19", "Observed", 1],
+      ["inst-test", "site-test", "2026-11-19", "ipapi example.com", 1],
+      ["inst-test", "site-test", "2026-11-19", "", 1],
+      ["inst-test", "site-test", "2026-11-19", "m".repeat(65), 1],
+      ["inst-test", "site-test", "2026-11-19", "observed_two", -1],
+    ] as Array<[string, string, string, string, number]>) {
+      await expect(insert(bad), JSON.stringify(bad)).rejects.toMatchObject({ code: "23514" });
+    }
+    await expect(insert(["inst-test", "site-test", "2026-11-19", "observed", 1])).rejects.toMatchObject({ code: "23505" });
+    await pool.query("DELETE FROM source_shadow_counts");
   });
 
   it("two concurrent applyMigrations calls on a fresh database do not fail", async () => {
@@ -245,7 +277,7 @@ describe("privacy guard: no IP-bearing schema", () => {
 
       // Upgrade: 0003 then 0004 apply (then the additive V1 0005, which leaves existing rows' values unchanged).
       const upgrade = await applyMigrations(p);
-      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql", "0008_browser_events.sql", "0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql", "0014_bot_visit_ai_categories.sql"]);
+      expect(upgrade.applied).toEqual(["0003_observation_refs.sql", "0004_first_observation_identity.sql", "0005_observation_context_and_feed.sql", "0006_feed_tombstones_and_watermark.sql", "0007_feed_immutability_guards.sql", "0008_browser_events.sql", "0009_runtime_role_support.sql", "0010_provider_charge_slots.sql", "0011_activity_counters.sql", "0012_bot_visits.sql", "0013_browser_events_report_index.sql", "0014_bot_visit_ai_categories.sql", "0015_source_shadow_counts.sql"]);
       const identities = await p.query<{ website_id: string; company_id: string; first_observation_ref: string | null }>(
         "SELECT website_id, company_id, first_observation_ref FROM company_scope_stats ORDER BY website_id, company_id",
       );

@@ -15,7 +15,16 @@
  * Exit codes: 0 graceful stop; 1 startup failure or shutdown overrun;
  * 70 fatal fault (process_fatal); 137 (SIGKILL) event loop blocked.
  */
-import { loadConfig, describeConfig, ConfigError, scrubSecretEnv, resolveDatabaseTls, resolveRuntimeCredentials, configOverrides } from "./config/index.js";
+import {
+  loadConfig,
+  describeConfig,
+  ConfigError,
+  scrubSecretEnv,
+  resolveDatabaseTls,
+  resolveRuntimeCredentials,
+  configOverrides,
+  shadowSourcesState,
+} from "./config/index.js";
 import { createLogger } from "./log/index.js";
 import { createDb } from "./db/index.js";
 import { DbError, guarded } from "./db/pool.js";
@@ -31,6 +40,10 @@ import { buildPipelineConfig, createRunner, poolSizeFor } from "./runtime/runner
 import { createMaintenance } from "./runtime/maintenance.js";
 import { installProcessGuards } from "./runtime/process-guards.js";
 import { startEventLoopWatchdog } from "./runtime/watchdog.js";
+import { createIpapiAdapter } from "./shadow/ipapi.js";
+import { createIplocateAdapter } from "./shadow/iplocate.js";
+import { createIpnetdbLoader, type IpnetdbLoader } from "./shadow/ipnetdb.js";
+import { createShadowRunner, SHADOW_DB_MAX_IN_FLIGHT, type ShadowRunner } from "./shadow/runner.js";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -57,10 +70,17 @@ async function main(): Promise<void> {
   });
   // Dev-only overrides (names only): "active" relaxes a production control now, "inert" is set without effect.
   for (const o of configOverrides(config)) logger.warn("config_override", { variable: o.variable, outcome: o.state });
+  // Watch-only source comparison: which sources are in use (states only, never a key or a URL).
+  const shadowState = shadowSourcesState(config);
+  logger.info("shadow_sources", { mode: shadowState.mode, ipapi: shadowState.ipapi, iplocate: shadowState.iplocate, ipnetdb: shadowState.ipnetdb });
 
   // Browser-event writes (event.v1) and bot-visit writes (bot-visit.v1) get their own connections when
   // enabled, so they never compete with resolution jobs.
-  const eventWriteSlots = (config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0) + (config.BOT_VISITS_ENABLED ? BOT_VISIT_WRITES_MAX_IN_FLIGHT : 0);
+  // The source comparison's counter writes get their own connections too (SHADOW_DB_MAX_IN_FLIGHT, only when on).
+  const eventWriteSlots =
+    (config.EVENTS_ENABLED ? EVENT_WRITES_MAX_IN_FLIGHT : 0) +
+    (config.BOT_VISITS_ENABLED ? BOT_VISIT_WRITES_MAX_IN_FLIGHT : 0) +
+    (shadowState.mode === "on" ? SHADOW_DB_MAX_IN_FLIGHT : 0);
   // Role separation: with DATABASE_RUNTIME_PASSWORD the service logs in as the
   // least-privilege runtime role (same host and database as DATABASE_URL);
   // DATABASE_URL's own user (the owner) is used only by migrate and ops.
@@ -87,6 +107,28 @@ async function main(): Promise<void> {
   const schema = await assertSchemaCurrent(db.pool, logger);
   logger.info("migration_check", { outcome: schema.unknown.length > 0 ? "database_ahead" : "current", count: schema.unknown.length });
 
+  // Watch-only source comparison (SHADOW_SOURCES_MODE=on): off by default, and then nothing is built or loaded.
+  let shadow: ShadowRunner | undefined;
+  let ipnetdb: IpnetdbLoader | undefined;
+  if (shadowState.mode === "on") {
+    const ipapi = shadowState.ipapi === "active" ? createIpapiAdapter({ apiKey: config.IPAPI_IS_API_KEY }) : undefined;
+    const iplocate = shadowState.iplocate === "active" ? createIplocateAdapter({ apiKey: config.IPLOCATE_API_KEY }) : undefined;
+    ipnetdb = config.IPNETDB_ENABLED ? createIpnetdbLoader({ manifestUrl: config.IPNETDB_MANIFEST_URL, dir: config.IPNETDB_DIR, logger }) : undefined;
+    shadow = createShadowRunner({
+      scope: { installationId: config.INSTALLATION_ID, websiteId: config.WEBSITE_ID },
+      // Unlogged repository: the runner reports its own failures as shadow_write_failed, never as db_error.
+      repo: db.shadowCounters,
+      logger,
+      ...(ipapi ? { ipapi } : {}),
+      ...(iplocate ? { iplocate } : {}),
+      ...(ipnetdb ? { ipnetdb } : {}),
+      limits: { ipapi: config.SHADOW_IPAPI_DAILY_LIMIT, iplocate: config.SHADOW_IPLOCATE_DAILY_LIMIT },
+      timeoutMs: config.SHADOW_TIMEOUT_MS,
+      concurrency: config.SHADOW_CONCURRENCY,
+      queueMax: config.SHADOW_QUEUE_MAX,
+    });
+  }
+
   const pipelineConfig = buildPipelineConfig(config);
   const runner = createRunner({
     config: pipelineConfig,
@@ -98,6 +140,7 @@ async function main(): Promise<void> {
       activity: db.activity,
       provider: createProvider(pipelineConfig.provider),
       ...(hostingRanges ? { hostingRanges } : {}),
+      ...(shadow ? { shadow } : {}),
     },
     logger,
     capacity: config.MAX_CONCURRENT_JOBS,
@@ -105,7 +148,17 @@ async function main(): Promise<void> {
     // a job still running there means the process state can no longer be trusted.
     onStuck: () => guards.fatal("job_stuck"),
   });
-  const app = await buildServer({ config, logger, runner, ping: () => db.ping(), reporting: db.reporting, events: db.events, botVisits: db.botVisits });
+  const app = await buildServer({
+    config,
+    logger,
+    runner,
+    ping: () => db.ping(),
+    reporting: db.reporting,
+    events: db.events,
+    botVisits: db.botVisits,
+    // GET /v1/reporting/source-shadow is served whatever SHADOW_SOURCES_MODE says (no rows while off).
+    sourceShadow: db.shadow,
+  });
 
   // Expired cache rows, browser events and observation retention (the bounded
   // sync buffer, D3), drained in bounded batches within a per-run budget.
@@ -154,6 +207,9 @@ async function main(): Promise<void> {
     clearInterval(idleSweep);
     // Jobs that overran their deadline, and writes that outlived their budget, get the rest of the grace period.
     const drain = await runner.shutdown(Math.max(0, until - Date.now()));
+    // Then the source comparison's queued lookups and counter writes, within what is left; the rest is abandoned.
+    await shadow?.drain(Math.max(0, until - Date.now()));
+    await ipnetdb?.stop();
     await maintenanceStopped;
     await db.close();
     await watchdog.stop();
@@ -169,6 +225,8 @@ async function main(): Promise<void> {
   // First run now, without waiting one interval (a service restarted more often
   // than the interval would otherwise never prune); not awaited, never overlapping.
   maintenance.start(config.CACHE_PRUNE_INTERVAL_S * 1000);
+  // The IPNetDB download (about 200 MB) runs in the background after listen; lookups answer unavailable until it is loaded.
+  ipnetdb?.start();
 }
 
 /** Startup failure text: names variables, files or fixed codes, never a value, a host or a URL. */

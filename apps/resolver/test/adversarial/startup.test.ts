@@ -118,6 +118,22 @@ describe("service startup refusals", () => {
     expectNoSecrets(r.output, getTestDatabaseUrl());
   });
 
+  it("the source comparison is off by default; on, it names the sources in use without their keys and stops cleanly", async () => {
+    const off = await runService(baseEnv(), { stopAfterStart: true });
+    expect(off.started, off.output).toBe(true);
+    const offLine = off.output.split("\n").find((l) => l.includes('"event":"shadow_sources"'));
+    expect(JSON.parse(offLine!)).toMatchObject({ mode: "off", ipapi: "off", iplocate: "off", ipnetdb: "off" });
+    // IPNetDB disabled here: the test never downloads anything.
+    const key = "0123456789abcdef0123456789abcdef";
+    const on = await runService(baseEnv({ SHADOW_SOURCES_MODE: "on", IPAPI_IS_API_KEY: key, IPNETDB_ENABLED: "false" }), { stopAfterStart: true });
+    expect(on.started, on.output).toBe(true);
+    expect(on.code).toBe(0);
+    const onLine = on.output.split("\n").find((l) => l.includes('"event":"shadow_sources"'));
+    expect(JSON.parse(onLine!)).toMatchObject({ level: "info", mode: "on", ipapi: "active", iplocate: "no_key", ipnetdb: "disabled" });
+    expect(on.output).not.toContain(key);
+    expectNoSecrets(off.output + on.output, getTestDatabaseUrl());
+  });
+
   it("production refuses to run as the owner (no DATABASE_RUNTIME_PASSWORD) unless ALLOW_OWNER_DATABASE_ROLE=true, and then warns by name", async () => {
     const env = { DATABASE_RUNTIME_PASSWORD: undefined, DATABASE_RUNTIME_ROLE: undefined };
     const refused = await runService(baseEnv(env));
