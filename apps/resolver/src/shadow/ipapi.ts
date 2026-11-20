@@ -1,8 +1,10 @@
 /**
  * ipapi.is adapter (watch-only source comparison).
  *
- * POST https://api.ipapi.is with {"q": "<ip>", "key": "<key>"}: the key travels
- * in the body, never in a URL. The answer is reduced to an allowlist (company
+ * POST https://de.ipapi.is with {"q": "<ip>", "key": "<key>"}: the key travels
+ * in the body, never in a URL. de.ipapi.is is served from Germany only and
+ * never fails over to another country (ipapi.is DPA, section 6); the default
+ * api.ipapi.is may answer from the USA or Singapore. The answer is reduced to an allowlist (company
  * name, domain and type, the ASN type and the mobile, data-centre, VPN, proxy
  * and Tor flags); everything else (location, abuse contacts, the ASN's own
  * name and ranges, the raw body) is discarded here. Without a key ipapi.is
@@ -10,7 +12,7 @@
  * company. lookup() never throws, never follows a redirect, reads at most
  * 64 KiB and never logs.
  *
- * Errors (verified): an invalid key is HTTP 403 with error_code
+ * Errors (verified, also on de.ipapi.is): an invalid key is HTTP 403 with error_code
  * ERR_FORBIDDEN_INVALID_API_KEY; quota errors are HTTP 429 with
  * ERR_QUOTA_EXCEEDED or ERR_FREE_TIER_EXHAUSTED; ERR_UNEXPECTED_SERVER_ERROR
  * is a server error.
@@ -20,7 +22,8 @@ import { canonicaliseDomain, canonicaliseOrganisationName } from "../resolution/
 import { DEFAULT_MAX_BODY_BYTES, readCappedText } from "../provider/http.js";
 import type { ApiSignals, ApiSourceAdapter, ApiSourceOutcome } from "./types.js";
 
-export const IPAPI_URL = "https://api.ipapi.is";
+/** Germany-only endpoint: visitor addresses are processed in the EEA only. */
+export const IPAPI_URL = "https://de.ipapi.is";
 /** Error bodies are tiny; only error_code is read from them. */
 const ERROR_BODY_BYTES = 4 * 1024;
 const QUOTA_CODES = new Set(["ERR_QUOTA_EXCEEDED", "ERR_FREE_TIER_EXHAUSTED"]);
