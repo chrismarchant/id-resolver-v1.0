@@ -340,6 +340,9 @@ export interface ReportingRepository {
 // aggregate counts only: no address, fingerprint, name or domain.
 // ---------------------------------------------------------------------------
 
+/** Counter increments by metric (positive whole numbers). */
+export type ShadowCounts = Readonly<Partial<Record<ShadowMetric, number>>>;
+
 /** One UTC day of counters, as the reporting route returns them. Metrics without a row are absent (zero). */
 export interface ShadowDayCounts {
   /** YYYY-MM-DD (UTC). */
@@ -354,8 +357,11 @@ export interface ShadowRepository {
    * statement: concurrent callers can never take more than `limit` in a day.
    */
   reserveSourceRequest(scope: ShadowScope, source: ApiSource, limit: number): Promise<boolean>;
-  /** Adds 1 to each listed metric for the day (a metric listed n times adds n), in one statement. */
-  increment(scope: ShadowScope, metrics: readonly ShadowMetric[]): Promise<void>;
+  /**
+   * Adds to the day's counters in one statement: 1 for each listed metric (a metric listed n times adds n),
+   * or, given counts, that many (positive whole numbers) for each metric.
+   */
+  increment(scope: ShadowScope, metrics: readonly ShadowMetric[] | ShadowCounts): Promise<void>;
   /** Days in [from, to] (inclusive YYYY-MM-DD) that have any counter, in date order. */
   report(installationId: string, websiteId: string, from: string, to: string): Promise<ShadowDayCounts[]>;
 }

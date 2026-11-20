@@ -411,12 +411,13 @@ export class FakeShadowRepository implements ShadowRepository {
     return true;
   }
 
-  async increment(scope: ShadowScope, metrics: readonly ShadowMetric[]): Promise<void> {
+  async increment(scope: ShadowScope, metrics: readonly ShadowMetric[] | Readonly<Partial<Record<ShadowMetric, number>>>): Promise<void> {
     await Promise.resolve();
     this.calls.increment++;
     failIf(this.failures, "increment");
     if (this.incrementDelayMs > 0) await new Promise((r) => setTimeout(r, this.incrementDelayMs));
-    for (const m of metrics) this.counts.set(this.key(scope, m), (this.counts.get(this.key(scope, m)) ?? 0) + 1);
+    const entries: Array<[string, number]> = Array.isArray(metrics) ? (metrics as readonly ShadowMetric[]).map((m) => [m, 1]) : Object.entries(metrics);
+    for (const [m, n] of entries) this.counts.set(this.key(scope, m), (this.counts.get(this.key(scope, m)) ?? 0) + n);
   }
 
   async report(installationId: string, websiteId: string, from: string, to: string): Promise<ShadowDayCounts[]> {

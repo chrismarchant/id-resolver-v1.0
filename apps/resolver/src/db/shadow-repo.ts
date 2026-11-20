@@ -11,7 +11,7 @@
  * WHERE re-evaluated against the latest committed count, so concurrent callers
  * (several workers, several instances) never reserve more than the limit.
  */
-import type { ShadowDayCounts, ShadowRepository } from "../contracts/db.js";
+import type { ShadowCounts, ShadowDayCounts, ShadowRepository } from "../contracts/db.js";
 import type { Logger } from "../log/index.js";
 import { API_SOURCES, isShadowMetric, SHADOW_METRICS, type ApiSource, type ShadowMetric, type ShadowScope } from "../shadow/types.js";
 import { DbError, guarded, type Pool } from "./pool.js";
@@ -65,12 +65,20 @@ export function createShadowRepository(pool: Pick<Pool, "query">, logger?: Logge
       });
     },
 
-    async increment(scope: ShadowScope, metrics: readonly ShadowMetric[]): Promise<void> {
+    async increment(scope: ShadowScope, metrics: readonly ShadowMetric[] | ShadowCounts): Promise<void> {
       checkDay(scope.day);
       const counts = new Map<ShadowMetric, number>();
-      for (const m of metrics) {
-        if (!isShadowMetric(m)) throw new DbError("INVALID_METRIC");
-        counts.set(m, (counts.get(m) ?? 0) + 1);
+      if (Array.isArray(metrics)) {
+        for (const m of metrics as readonly unknown[]) {
+          if (!isShadowMetric(m)) throw new DbError("INVALID_METRIC");
+          counts.set(m, (counts.get(m) ?? 0) + 1);
+        }
+      } else {
+        for (const [m, n] of Object.entries(metrics)) {
+          if (!isShadowMetric(m)) throw new DbError("INVALID_METRIC");
+          if (!Number.isSafeInteger(n) || (n as number) < 1) throw new DbError("INVALID_DELTA");
+          counts.set(m, n as number);
+        }
       }
       if (counts.size === 0) return;
       const names = [...counts.keys()].sort();
